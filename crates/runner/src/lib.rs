@@ -223,16 +223,41 @@ pub fn main_with(game: Game, devices: Option<Box<dyn devices::Devices>>) -> Exit
     let mut input = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
-        match a.as_str() {
-            "--symbols" | "--config" => symbols.extend(it.next().map(PathBuf::from)),
-            "--local" => local = it.next().map(PathBuf::from).unwrap_or(local),
-            "--frames" => frames = it.next().and_then(|v| v.parse().ok()).unwrap_or(frames),
-            "--capture" => capture = it.next().map(PathBuf::from),
-            "--wav" => wav = it.next().map(PathBuf::from),
-            "--input" => input = it.next().map(PathBuf::from),
-            "--capture-every" => every = it.next().and_then(|v| v.parse().ok()).unwrap_or(every),
-            s => rom_path = Some(PathBuf::from(s)),
+        let flag = a.as_str();
+        if !flag.starts_with("--") {
+            rom_path = Some(PathBuf::from(a));
+            continue;
         }
+        let Some(v) = it.next() else {
+            eprintln!("error: {flag} needs a value");
+            return ExitCode::from(2);
+        };
+        let number = || v.parse::<u64>().ok();
+        match flag {
+            "--symbols" | "--config" => symbols.push(PathBuf::from(v)),
+            "--local" => local = PathBuf::from(v),
+            "--capture" => capture = Some(PathBuf::from(v)),
+            "--wav" => wav = Some(PathBuf::from(v)),
+            "--input" => input = Some(PathBuf::from(v)),
+            "--frames" | "--capture-every" => {
+                let Some(n) = number() else {
+                    eprintln!("error: {flag} needs a number, not {v:?}");
+                    return ExitCode::from(2);
+                };
+                if flag == "--frames" {
+                    frames = n;
+                } else {
+                    every = n;
+                }
+            }
+            _ => {
+                eprintln!("error: unknown option {flag}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    if devices.is_some() && (capture.is_some() || wav.is_some() || input.is_some()) {
+        eprintln!("warning: --capture, --wav and --input only apply to the default devices");
     }
     let Some(rom_path) = rom_path else {
         eprintln!(

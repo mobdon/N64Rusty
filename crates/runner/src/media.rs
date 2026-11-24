@@ -138,6 +138,14 @@ impl Media {
     }
 }
 
+/// The message of a caught panic.
+fn panic_text(p: &(dyn std::any::Any + Send)) -> String {
+    p.downcast_ref::<String>()
+        .cloned()
+        .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_default()
+}
+
 impl Devices for Media {
     fn rsp_task(&mut self, ctx: &mut Ctx, task: u32) {
         let kind = ctx.mem.read_u32(task);
@@ -150,12 +158,7 @@ impl Devices for Media {
             let len = ctx.mem.read_u32(task + TASK_DATA_SIZE);
             let (sound, mem) = (&mut self.sound, &mut ctx.mem);
             if let Err(e) = panic::catch_unwind(AssertUnwindSafe(|| sound.run(mem, list, len))) {
-                let msg = e
-                    .downcast_ref::<String>()
-                    .cloned()
-                    .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
-                    .unwrap_or_default();
-                self.audio_failed = Some(msg);
+                self.audio_failed = Some(panic_text(&*e));
             }
             return;
         }
@@ -164,9 +167,17 @@ impl Devices for Media {
         }
         self.tasks += 1;
         let dl = ctx.mem.read_u32(task + TASK_DATA_PTR);
-        if let Err(e) = self.gfx.run(ctx.mem.bytes(), dl) {
+        // A panic inside the interpreter counts as an error for that task;
+        // the game keeps running.
+        let (gfx, bytes) = (&mut self.gfx, ctx.mem.bytes());
+        let error = match panic::catch_unwind(AssertUnwindSafe(|| gfx.run(bytes, dl))) {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => Some(e.to_string()),
+            Err(p) => Some(format!("interpreter panicked: {}", panic_text(&*p))),
+        };
+        if let Some(e) = error {
             self.errors += 1;
-            self.first_error.get_or_insert_with(|| e.to_string());
+            self.first_error.get_or_insert(e);
         }
     }
 

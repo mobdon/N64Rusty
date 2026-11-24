@@ -146,6 +146,29 @@ fn write_if_changed(path: &Path, contents: &str) -> Result<bool, String> {
     Ok(true)
 }
 
+/// The run of back-to-back copies (each one starting in ROM and RAM where
+/// the one before ends) that `c` belongs to, as one `(rom, ram, len)`.
+fn run_of(copies: &[(u32, u32, u32)], c: (u32, u32, u32)) -> (u32, u32, u32) {
+    let joins = |a: &(u32, u32, u32), b: &(u32, u32, u32)| {
+        a.2 > 0 && b.2 > 0 && a.0.wrapping_add(a.2) == b.0 && a.1.wrapping_add(a.2) == b.1
+    };
+    let (mut lo, mut hi) = (c, c);
+    // Bounded, so a wrapped-around chain cannot loop forever.
+    for _ in 0..copies.len() {
+        match copies.iter().find(|p| joins(p, &lo)) {
+            Some(&p) => lo = p,
+            None => break,
+        }
+    }
+    for _ in 0..copies.len() {
+        match copies.iter().find(|n| joins(&hi, n)) {
+            Some(&n) => hi = n,
+            None => break,
+        }
+    }
+    (lo.0, lo.1, hi.0.wrapping_add(hi.2).wrapping_sub(lo.0))
+}
+
 fn translate(args: &[String]) -> Result<(), String> {
     let mut rom_path = None;
     let mut symbols = Vec::new();
@@ -220,8 +243,17 @@ fn translate(args: &[String]) -> Result<(), String> {
     for m in missing.iter().filter(|m| m[3] != 0) {
         regions.entry((m[1], m[2], m[3])).or_default().push(m[0]);
     }
+    // Games often copy one long piece of code in several back-to-back
+    // copies. Discovery looks at the whole run (so jump tables and calls
+    // that cross a copy's edge resolve); each copy then gets the functions
+    // that start inside it.
+    let copies: Vec<(u32, u32, u32)> = dma.iter().map(|d| (d[0], d[1], d[2])).collect();
+    let mut runs: BTreeMap<(u32, u32, u32), Vec<u32>> = BTreeMap::new();
+    for (&c, entries) in &regions {
+        runs.entry(run_of(&copies, c)).or_default().extend(entries);
+    }
     let mut overlays = Vec::new();
-    for (&(r, ram, len), entries) in &regions {
+    for (&(r, ram, len), entries) in &runs {
         let start = r as usize;
         let end = (start + len as usize).min(rom.bytes().len());
         if start >= end {
@@ -237,7 +269,20 @@ fn translate(args: &[String]) -> Result<(), String> {
             &data_pointers(&oimg),
             Some(ram.wrapping_add(len)),
         );
-        overlays.push(((r, ram, len), d));
+        let mut chunks: Vec<(u32, u32, u32)> = copies
+            .iter()
+            .chain(regions.keys())
+            .copied()
+            .filter(|&c| c.2 > 0 && run_of(&copies, c) == (r, ram, len))
+            .collect();
+        chunks.sort_unstable();
+        chunks.dedup();
+        for (cr, cram, clen) in chunks {
+            let mut part = d.clone();
+            part.functions
+                .retain(|f| f.addr >= cram && f.addr < cram.wrapping_add(clen));
+            overlays.push(((cr, cram, clen), part));
+        }
     }
 
     let mut failed = Vec::new();
@@ -393,6 +438,26 @@ fn translate(args: &[String]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn back_to_back_copies_form_one_run() {
+        let copies = [
+            (0x1000, 0x8030_0000, 0x100),
+            (0x1100, 0x8030_0100, 0x80),
+            (0x1180, 0x8030_0180, 0x40),
+            // Same ROM continues, but to another RAM place: not the same run.
+            (0x11c0, 0x8040_0000, 0x40),
+            (0x5000, 0x8030_0000, 0x0),
+        ];
+        let run = (0x1000, 0x8030_0000, 0x1c0);
+        for c in &copies[..3] {
+            assert_eq!(run_of(&copies, *c), run);
+        }
+        assert_eq!(run_of(&copies, copies[3]), copies[3]);
+        assert_eq!(run_of(&copies, copies[4]), copies[4]);
+        // A copy not in the list still finds its neighbours.
+        assert_eq!(run_of(&copies, (0x0f00, 0x802f_ff00, 0x100)).2, 0x2c0);
+    }
 
     #[test]
     fn reads_run_tables() {
