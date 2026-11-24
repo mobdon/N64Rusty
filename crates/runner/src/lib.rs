@@ -299,8 +299,11 @@ pub fn main_with(game: Game, devices: Option<Box<dyn devices::Devices>>) -> Exit
         return ExitCode::from(2);
     }
     // The per-game config sits next to the generated crate by default.
-    let run_config = run_config.or_else(|| Some(local.join("run.toml")).filter(|p| p.exists()));
-    let run_config = match run_config.map(|p| n64rusty_host::RunConfig::load(&p)) {
+    // The run config only matters to window runs.
+    let run_config = run_config
+        .or_else(|| Some(local.join("run.toml")).filter(|p| p.exists()))
+        .filter(|_| window);
+    let mut run_config = match run_config.map(|p| n64rusty_host::RunConfig::load(&p)) {
         Some(Err(e)) => {
             eprintln!("error: run config {e}");
             return ExitCode::from(2);
@@ -308,7 +311,11 @@ pub fn main_with(game: Game, devices: Option<Box<dyn devices::Devices>>) -> Exit
         Some(Ok(c)) => c,
         None => n64rusty_host::RunConfig::default(),
     };
-    let frames = frames.unwrap_or(if window { u64::MAX } else { 600 });
+    // The game, not the window, ends a run at its frame limit, so the run
+    // report is still printed.
+    let frames = frames
+        .or(run_config.frames.take())
+        .unwrap_or(if window { u64::MAX } else { 600 });
     let default_config = local.join("config.toml");
     if default_config.exists() {
         symbols.push(default_config);
