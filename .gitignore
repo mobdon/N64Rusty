@@ -1,0 +1,51 @@
+# Rust build output
+/target/
+**/*.rs.bk
+
+# ---------------------------------------------------------------------------
+# Game data: never committed. See README "Data rules".
+# ---------------------------------------------------------------------------
+
+# ROM images in any byte order, and archives of them
+*.z64
+*.Z64
+*.n64
+*.N64
+*.v64
+*.V64
+*.rom
+*.ROM
+*.bin
+*.zip
+*.7z
+*.rar
+/roms/
+
+# Generated Rust and anything else the translator writes
+/out/
+/generated/
+**/generated/
+
+# Per-game local folders (named by ROM hash): config, symbol maps read from
+# a local decompilation checkout, extracted assets, saves, captures
+/local/
+/.local/
+*.sym
+*.map
+*.elf
+
+# Extracted assets and built games
+/assets/
+/extracted/
+/dist/
+*.eep
+*.sra
+*.fla
+*.mpk
+
+# Editors and OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

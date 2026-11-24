@@ -1,0 +1,16 @@
+[package]
+name = "n64rusty"
+description = "Command-line front end for the n64rusty N64 recompiler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "n64rusty"
+path = "src/main.rs"
+
+[dependencies]
+n64rusty-translator.workspace = true
+n64rusty-runtime.workspace = true

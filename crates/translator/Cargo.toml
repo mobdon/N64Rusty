@@ -1,0 +1,10 @@
+[package]
+name = "n64rusty-translator"
+description = "Translates N64 (MIPS VR4300) machine code into Rust source"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
