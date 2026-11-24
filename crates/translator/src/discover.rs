@@ -43,6 +43,7 @@ impl Image<'_> {
 }
 
 /// What discovery found.
+#[derive(Clone, Debug)]
 pub struct Discovery {
     /// Functions in address order, with jump table targets filled in.
     pub functions: Vec<Function>,
