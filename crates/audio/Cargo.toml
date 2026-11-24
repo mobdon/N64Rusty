@@ -1,0 +1,17 @@
+[package]
+name = "n64rusty-audio"
+description = "Host audio for n64rusty: runs N64 audio command lists and plays or records the result"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+# Speaker output through cpal. Off by default so that headless builds and
+# tests need no system audio libraries (ALSA headers on Linux).
+speaker = ["dep:cpal"]
+
+[dependencies]
+n64rusty-runtime.workspace = true
+cpal = { version = "0.15", optional = true }
