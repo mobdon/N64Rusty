@@ -11,6 +11,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "n64rusty-conformance"
+version = "0.0.0"
+dependencies = [
+ "n64rusty-refcpu",
+ "n64rusty-runtime",
+ "n64rusty-translator",
+]
+
+[[package]]
+name = "n64rusty-refcpu"
+version = "0.0.0"
+
+[[package]]
 name = "n64rusty-runtime"
 version = "0.0.0"
 

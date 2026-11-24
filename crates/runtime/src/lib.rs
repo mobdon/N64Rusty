@@ -2,18 +2,245 @@
 //!
 //! Deliberately tiny and dependency-free: generated code depends only on this
 //! crate, so edits to the translator, hooks or host do not rebuild it.
-//! Guest CPU state, memory and the single call dispatch point land here in
-//! later steps.
+//!
+//! It holds the guest CPU state ([`Ctx`]), big-endian guest RAM ([`Memory`])
+//! and the single call dispatch point ([`Ctx::call`]) through which every
+//! guest call goes, so any guest function can be overridden by address.
 
 #![forbid(unsafe_code)]
+
+use std::collections::HashMap;
+
+mod memory;
+
+pub use memory::Memory;
 
 /// Crate version, checked against the version recorded in generated code.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// A recompiled (or host-written) guest function.
+pub type GuestFn = fn(&mut Ctx);
+
+/// Sign-extends a 32-bit result to a 64-bit register value, as the VR4300
+/// does for every 32-bit operation.
+#[inline(always)]
+pub const fn sx32(v: u32) -> u64 {
+    v as i32 as i64 as u64
+}
+
+/// Guest CPU state plus memory and the function table.
+pub struct Ctx {
+    /// General-purpose registers. `r[0]` is never written by generated code.
+    pub r: [u64; 32],
+    /// Multiply/divide result register HI.
+    pub hi: u64,
+    /// Multiply/divide result register LO.
+    pub lo: u64,
+    /// Guest RAM.
+    pub mem: Memory,
+    funcs: HashMap<u32, GuestFn>,
+    overrides: HashMap<u32, GuestFn>,
+}
+
+impl Ctx {
+    /// A context with zeroed registers and the given RAM.
+    pub fn new(mem: Memory) -> Self {
+        Self {
+            r: [0; 32],
+            hi: 0,
+            lo: 0,
+            mem,
+            funcs: HashMap::new(),
+            overrides: HashMap::new(),
+        }
+    }
+
+    /// Registers a recompiled function at its guest address.
+    pub fn register(&mut self, addr: u32, f: GuestFn) {
+        self.funcs.insert(addr, f);
+    }
+
+    /// Replaces the function at `addr`. Overrides win over registered
+    /// functions, so a hook can stand in for any guest routine.
+    pub fn set_override(&mut self, addr: u32, f: GuestFn) {
+        self.overrides.insert(addr, f);
+    }
+
+    /// Removes an override, restoring the registered function.
+    pub fn clear_override(&mut self, addr: u32) {
+        self.overrides.remove(&addr);
+    }
+
+    /// Calls the guest function at `addr`. Every call in generated code goes
+    /// through here.
+    pub fn call(&mut self, addr: u32) {
+        let f = self
+            .overrides
+            .get(&addr)
+            .or_else(|| self.funcs.get(&addr))
+            .copied();
+        match f {
+            Some(f) => f(self),
+            None => panic!("call to unknown guest function {addr:#010x}"),
+        }
+    }
+
+    /// Signed 32-bit divide (DIV). Division by zero and overflow give the
+    /// VR4300's results instead of trapping.
+    pub fn div(&mut self, a: u64, b: u64) {
+        let n = a as i32;
+        let d = b as i32;
+        if d == 0 {
+            self.lo = if n < 0 { 1 } else { u64::MAX };
+            self.hi = sx32(n as u32);
+        } else {
+            self.lo = sx32(n.wrapping_div(d) as u32);
+            self.hi = sx32(n.wrapping_rem(d) as u32);
+        }
+    }
+
+    /// Unsigned 32-bit divide (DIVU).
+    pub fn divu(&mut self, a: u64, b: u64) {
+        let n = a as u32;
+        let d = b as u32;
+        match (n.checked_div(d), n.checked_rem(d)) {
+            (Some(q), Some(r)) => {
+                self.lo = sx32(q);
+                self.hi = sx32(r);
+            }
+            _ => {
+                self.lo = u64::MAX;
+                self.hi = sx32(n);
+            }
+        }
+    }
+
+    /// Signed 64-bit divide (DDIV).
+    pub fn ddiv(&mut self, a: u64, b: u64) {
+        let n = a as i64;
+        let d = b as i64;
+        if d == 0 {
+            self.lo = if n < 0 { 1 } else { u64::MAX };
+            self.hi = n as u64;
+        } else {
+            self.lo = n.wrapping_div(d) as u64;
+            self.hi = n.wrapping_rem(d) as u64;
+        }
+    }
+
+    /// Unsigned 64-bit divide (DDIVU).
+    pub fn ddivu(&mut self, a: u64, b: u64) {
+        match (a.checked_div(b), a.checked_rem(b)) {
+            (Some(q), Some(r)) => {
+                self.lo = q;
+                self.hi = r;
+            }
+            _ => {
+                self.lo = u64::MAX;
+                self.hi = a;
+            }
+        }
+    }
+
+    /// Signed 32-bit multiply (MULT).
+    pub fn mult(&mut self, a: u64, b: u64) {
+        let p = (a as i32 as i64).wrapping_mul(b as i32 as i64) as u64;
+        self.lo = sx32(p as u32);
+        self.hi = sx32((p >> 32) as u32);
+    }
+
+    /// Unsigned 32-bit multiply (MULTU).
+    pub fn multu(&mut self, a: u64, b: u64) {
+        let p = (a as u32 as u64) * (b as u32 as u64);
+        self.lo = sx32(p as u32);
+        self.hi = sx32((p >> 32) as u32);
+    }
+
+    /// Signed 64-bit multiply (DMULT).
+    pub fn dmult(&mut self, a: u64, b: u64) {
+        let p = (a as i64 as i128).wrapping_mul(b as i64 as i128) as u128;
+        self.lo = p as u64;
+        self.hi = (p >> 64) as u64;
+    }
+
+    /// Unsigned 64-bit multiply (DMULTU).
+    pub fn dmultu(&mut self, a: u64, b: u64) {
+        let p = (a as u128) * (b as u128);
+        self.lo = p as u64;
+        self.hi = (p >> 64) as u64;
+    }
+
+    /// Called by generated code for an instruction the translator does not
+    /// support yet.
+    #[cold]
+    pub fn unimplemented(&mut self, pc: u32, word: u32) -> ! {
+        panic!("unimplemented instruction {word:#010x} at {pc:#010x}")
+    }
+}
+
+/// Called by generated code when execution reaches an address inside a
+/// function that is not a known block start (for example a jump table target
+/// that was not discovered).
+#[cold]
+pub fn bad_pc(func: u32, pc: u32) -> ! {
+    panic!("jump to {pc:#010x} inside function {func:#010x} is not a known block start")
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn version_is_set() {
-        assert!(!super::VERSION.is_empty());
+        assert!(!VERSION.is_empty());
+    }
+
+    #[test]
+    fn div_edge_cases() {
+        let mut c = Ctx::new(Memory::new(16));
+        c.div(7, 0);
+        assert_eq!((c.lo, c.hi), (u64::MAX, 7));
+        c.div(sx32(-7i32 as u32), 0);
+        assert_eq!((c.lo, c.hi), (1, sx32(-7i32 as u32)));
+        c.div(sx32(i32::MIN as u32), sx32(-1i32 as u32));
+        assert_eq!((c.lo, c.hi), (sx32(i32::MIN as u32), 0));
+        c.div(sx32(-7i32 as u32), 2);
+        assert_eq!((c.lo, c.hi), (sx32(-3i32 as u32), sx32(-1i32 as u32)));
+        c.divu(0xFFFF_FFFF, 0);
+        assert_eq!((c.lo, c.hi), (u64::MAX, u64::MAX));
+        c.ddiv(i64::MIN as u64, u64::MAX);
+        assert_eq!((c.lo, c.hi), (i64::MIN as u64, 0));
+    }
+
+    #[test]
+    fn mult_splits_and_sign_extends() {
+        let mut c = Ctx::new(Memory::new(16));
+        c.multu(0xFFFF_FFFF, 0xFFFF_FFFF);
+        assert_eq!(c.lo, 1);
+        assert_eq!(c.hi, sx32(0xFFFF_FFFE));
+        c.mult(sx32(-2i32 as u32), 3);
+        assert_eq!((c.lo, c.hi), (sx32(-6i32 as u32), u64::MAX));
+        c.dmultu(u64::MAX, 2);
+        assert_eq!((c.lo, c.hi), (u64::MAX - 1, 1));
+    }
+
+    #[test]
+    fn overrides_win() {
+        fn a(c: &mut Ctx) {
+            c.r[2] = 1;
+        }
+        fn b(c: &mut Ctx) {
+            c.r[2] = 2;
+        }
+        let mut c = Ctx::new(Memory::new(16));
+        c.register(0x8000_0400, a);
+        c.call(0x8000_0400);
+        assert_eq!(c.r[2], 1);
+        c.set_override(0x8000_0400, b);
+        c.call(0x8000_0400);
+        assert_eq!(c.r[2], 2);
+        c.clear_override(0x8000_0400);
+        c.call(0x8000_0400);
+        assert_eq!(c.r[2], 1);
     }
 }

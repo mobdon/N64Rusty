@@ -5,7 +5,10 @@ code (MIPS VR4300, big-endian) and writes Rust, which links against a small
 runtime crate and builds into a native program. You supply your own legally
 obtained ROM; this repository contains no game data.
 
-Status: **step 0, scaffold only.** There is no translation logic yet.
+Status: **step 1, CPU translator.** The VR4300 integer instruction set
+translates to Rust, with branch delay slots, and is tested per instruction
+against a reference interpreter. Floating point, ROM loading and the rest of
+the console come next.
 
 ## Layout
 
@@ -14,12 +17,45 @@ Status: **step 0, scaffold only.** There is no translation logic yet.
 | `n64rusty-translator` | `crates/translator` | MIPS machine code to Rust source |
 | `n64rusty-runtime` | `crates/runtime` | Tiny runtime that generated Rust links against. Kept separate so generated code is not rebuilt when the tool changes |
 | `n64rusty` | `crates/cli` | Command-line front end |
+| `n64rusty-refcpu` | `crates/refcpu` | Reference VR4300 interpreter, used only by tests |
+| `n64rusty-conformance` | `crates/conformance` | Per-instruction tests: translated code against the reference CPU |
 
 ```
 cargo build --workspace
 cargo test --workspace
 cargo run -p n64rusty -- version
 ```
+
+## How translation works
+
+Each guest function becomes one Rust function, `fn(&mut Ctx)`, whose body is
+`loop { match pc { ... } }` over its basic blocks. Registers are 64-bit and
+every 32-bit result is sign-extended, as on the VR4300.
+
+- **Delay slots.** A branch's condition (or a register jump's target) is read
+  first, then the link register is written, then the delay-slot instruction
+  runs, and only then does control move. Likely branches run the delay slot
+  only when taken. A branch target that is another branch's delay slot gets
+  its own block.
+- **Calls.** Every call goes through `Ctx::call(addr)`, the single dispatch
+  point, so any guest function can be overridden by address with
+  `Ctx::set_override`. `jr $ra` returns; jumps and branches that leave the
+  function are tail calls.
+- **Not modelled yet.** Overflow exceptions (ADD, ADDI, SUB and their
+  64-bit forms behave like the unsigned forms), traps, LL/SC, the TLB, and
+  coprocessor instructions. These emit a call that panics with the address,
+  so the first one a game reaches is easy to find.
+
+### Tests
+
+`crates/conformance` writes several hundred tiny programs by hand with a
+built-in encoder (one or a few instructions each, plus branch, loop, call and
+tail-call shapes), translates them at build time, and runs each 64 times from
+random register and memory states. The translated code and the reference CPU
+must agree on every register, HI, LO and every byte of memory. The reference
+CPU is a separate implementation with its own decoder and byte-by-byte
+unaligned accesses, so a mistake in one shows up as a mismatch. No game code
+or data is used.
 
 ## Data rules
 
