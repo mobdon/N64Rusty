@@ -1,0 +1,26 @@
+[package]
+name = "n64rusty-host"
+description = "Host side of a recompiled N64 game: window, frame pacing, controller input, scripted record and replay, run config and a debug port"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+# Higher than the workspace because of the gamepad library.
+rust-version = "1.84"
+
+[features]
+default = ["window", "gamepad"]
+# A real window (winit). Everything else, and every test, works without it.
+window = ["dep:winit"]
+# Gamepads (gilrs). On Linux this needs the libudev development package.
+gamepad = ["dep:gilrs"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+winit = { version = "0.30", optional = true }
+gilrs = { version = "0.11", optional = true }
+
+[[example]]
+name = "play"
+required-features = ["window"]

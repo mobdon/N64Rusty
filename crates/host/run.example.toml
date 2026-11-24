@@ -1,0 +1,34 @@
+# One file per run. Copy it next to your game's local folder
+# (local/<sha256>/run.toml) and change what you need. Every key is optional.
+
+# rom = "game.z64"        # your own ROM; relative paths are from this file
+controllers = 1           # 1 to 4
+rate_hz = 60.0            # frame pacing in the window
+# frames = 600            # stop after this many frames
+# replay = "inputs.txt"   # play this input script instead of live input
+# record = "inputs.txt"   # save this run's input as a script when it ends
+# debug_port = 6464       # wait for a test driver on 127.0.0.1 before every frame
+gamepads = true
+
+# Keys are named as the window library names them (KeyW, Space, Enter,
+# ShiftLeft, Digit1). Arrow keys are not allowed; movement is WASD.
+[keys.1]
+STICK_UP = "KeyW"
+STICK_LEFT = "KeyA"
+STICK_DOWN = "KeyS"
+STICK_RIGHT = "KeyD"
+STICK_HALF = "ShiftLeft"
+A = "KeyJ"
+B = "KeyK"
+Z = "Space"
+START = "Enter"
+L = "KeyQ"
+R = "KeyE"
+C_UP = "KeyT"
+C_LEFT = "KeyF"
+C_DOWN = "KeyG"
+C_RIGHT = "KeyH"
+D_UP = "Digit1"
+D_DOWN = "Digit2"
+D_LEFT = "Digit3"
+D_RIGHT = "Digit4"
