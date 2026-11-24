@@ -126,19 +126,21 @@ the game slows down. There is no frame limit unless `--frames` is given.
 Window size, frame rate, key layout, gamepad ports and input record/replay
 come from `run.toml` in the per-game folder, or `--run file`.
 
-On Windows (PowerShell), from the repository folder:
+On Windows, one script does it all: it builds the translator, translates
+your ROM, builds the game program, copies it to `local\<sha256>\game.exe` and
+starts it with `--window`. From the repository folder in PowerShell:
 
 ```
-cargo run --release -p n64rusty -- translate C:\path\to\your.z64 --symbols C:\path\to\map.txt
-cd local\<sha256>\out
-cargo build --release
-copy target\release\n64rusty-game-<hash>.exe ..\game.exe
-cd ..
-.\game.exe C:\path\to\your.z64 --symbols C:\path\to\map.txt --local . --window
+powershell -ExecutionPolicy Bypass -File scripts\play.ps1 -Rom C:\path\to\your.z64 -Symbols C:\path\to\map.txt -Files C:\path\to\per-game-files
 ```
 
-Run the copy rather than the file in `target`, so a rebuild never fights a
-running game. Close the window to stop. `record = "take.txt"` in `run.toml`
+`-Rom` can also be the folder that holds the ROM. `-Files` is optional: a
+folder with per-game run files (`config.toml`, `dma.txt`, `missing.txt`,
+`run.toml`) to copy into `local\<sha256>\` before translating. The script
+stops at the first step that fails and says which.
+
+The game runs from a copy, so a rebuild never fights a running game. Close
+the window to stop. `record = "take.txt"` in `run.toml`
 keeps your input; `replay = "take.txt"` plays it back. With `headless = true`
 in the run config nothing is opened and the run goes as fast as it can with
 scripted input, which is how this mode is tested.
