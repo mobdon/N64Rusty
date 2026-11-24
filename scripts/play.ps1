@@ -5,7 +5,7 @@
 # -Rom      your own ROM (any byte order), or a folder holding it.
 # -Symbols  symbol maps (`name = 0xADDR;` lines), passed to translate and to the game.
 # -Files    optional folder with per-game run files (config.toml, dma.txt,
-#           missing.txt, run.toml); they are copied into local\<sha256>\ first.
+#           missing.txt, run.toml); each is copied into local\<sha256>\ if not there yet.
 # Extra arguments after these go to the game (for example -- --frames 3000).
 # Run it from anywhere; it works in the repository it lives in.
 
@@ -28,7 +28,8 @@ if (Test-Path -LiteralPath $Rom -PathType Container) {
     $Rom = $found.FullName
 }
 Write-Host "ROM: $Rom"
-$Symbols = @($Symbols | ForEach-Object { (Resolve-Path -LiteralPath $_).Path })
+# `powershell -File` passes "a","b" as one string "a,b", so split it.
+$Symbols = @($Symbols | ForEach-Object { $_ -split "," } | Where-Object { $_ } | ForEach-Object { (Resolve-Path -LiteralPath $_).Path })
 $sym = @($Symbols | ForEach-Object { "--symbols"; $_ })
 Set-Location (Join-Path $PSScriptRoot "..")
 $repo = (Get-Location).Path
@@ -47,7 +48,8 @@ New-Item -ItemType Directory -Force $local | Out-Null
 if ($Files) {
     foreach ($n in "config.toml", "dma.txt", "missing.txt", "run.toml") {
         $p = Join-Path $Files $n
-        if (Test-Path -LiteralPath $p) { Copy-Item -LiteralPath $p $local -Force; Write-Host "copied $n" }
+        # Keep a local copy: runs append to dma.txt and missing.txt, and the next translate needs that.
+        if ((Test-Path -LiteralPath $p) -and -not (Test-Path -LiteralPath (Join-Path $local $n))) { Copy-Item -LiteralPath $p $local -Force; Write-Host "copied $n" }
     }
 }
 

@@ -304,3 +304,18 @@ fn renderers_on_many_threads_at_once() {
         t.join().unwrap();
     }
 }
+
+#[test]
+fn window_path_letterboxes_at_window_size() {
+    let Some(mut r) = renderer() else { return };
+    let mut ram = Ram::default();
+    let dl = scene(&mut ram, |_, _| {});
+    let f = frame(&mut ram, &dl);
+    // A wide window: 4:3 picture 640x480 in the middle, bars at the sides.
+    assert_eq!(n64rusty_gfx::fit(800, 480, 320, 240), (80, 0, 640, 480));
+    let img = r.render_letterboxed(&f, 800, 480).unwrap();
+    assert_px(&img, 40, 240, [0, 0, 0, 255]);
+    assert_px(&img, 760, 240, [0, 0, 0, 255]);
+    assert_px(&img, 90, 10, BLUE);
+    assert_px(&img, 710, 470, BLUE);
+}

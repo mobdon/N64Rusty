@@ -247,6 +247,37 @@ fn lights_vertices_from_normals() {
 }
 
 #[test]
+fn light_colour_command_changes_a_loaded_light() {
+    let mut ram = Ram::default();
+    let verts = ram.vertices(&[V {
+        pos: [0, 0, 0],
+        st: [0, 0],
+        rgba: [0, 0, 127, 255],
+    }]);
+    let light = ram.put(&[128, 0, 0, 0, 128, 0, 0, 0, 0, 0, 127, 0, 0, 0, 0, 0]);
+    let ambient = ram.put(&[0, 0, 0, 0, 0, 0, 0, 0]);
+    let mut dl = Dl::default();
+    setup(&mut ram, &mut dl);
+    dl.geometry(0, G_LIGHTING)
+        .num_lights(1)
+        .light(light, 1)
+        .light(ambient, 2)
+        // gSPLightColor: light 1 becomes full green (both colour words),
+        // the ambient (light 2, offset 24) a little blue.
+        .light_color(0, 0x00FF_0000)
+        .light_color(4, 0x00FF_0000)
+        .light_color(24, 0x0000_3300)
+        .vtx(verts, 1, 0)
+        .tri(0, 0, 0)
+        .end();
+    let addr = ram.dl(&dl);
+    let c = run(&ram, addr).vertices[0].color;
+    assert_eq!(c[0], 0.0, "{c:?}");
+    assert_eq!(c[1], 1.0, "{c:?}");
+    assert!((c[2] - 0.2).abs() < 1e-5, "{c:?}");
+}
+
+#[test]
 fn culling_both_faces_drops_triangles() {
     let mut ram = Ram::default();
     let verts = ram.vertices(&[v(0, 0, 0, [255; 4]); 3]);
