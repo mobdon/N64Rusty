@@ -197,11 +197,9 @@ impl Interpreter {
                     self.tex_on = w0 & 0xFE != 0;
                 }
                 0xD8 => {
-                    for _ in 0..(w1 / 64).max(1) {
-                        if self.modelview.len() > 1 {
-                            self.modelview.pop();
-                        }
-                    }
+                    let n = (w1 / 64).max(1) as usize;
+                    let keep = self.modelview.len().saturating_sub(n).max(1);
+                    self.modelview.truncate(keep);
                 }
                 0xD9 => self.geometry = (self.geometry & (w0 & 0x00FF_FFFF)) | w1,
                 0xDA => self.matrix(rdram, w0, w1, at)?,
@@ -222,7 +220,8 @@ impl Interpreter {
                 },
                 0xE1 => self.rdphalf1 = w1,
                 0xE2 | 0xE3 => {
-                    let len = (w0 & 0xFF) + 1;
+                    // A malformed length past 32 bits would overflow the shift.
+                    let len = ((w0 & 0xFF) + 1).min(32);
                     let shift = 32u32.saturating_sub(((w0 >> 8) & 0xFF) + len);
                     let mask = (((1u64 << len) - 1) << shift) as u32;
                     let m = if w0 >> 24 == 0xE2 {

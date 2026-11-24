@@ -340,3 +340,21 @@ fn texture_rectangle_maps_texels_to_pixels() {
         "{corners:?}"
     );
 }
+
+#[test]
+fn malformed_lengths_from_guest_data_do_not_panic() {
+    let mut ram = Ram::default();
+    let mut dl = Dl::default();
+    // Other-mode writes with a length field of 0xFF (256 bits) and shifts
+    // that would run past the word.
+    dl.0.extend([0xE200_00FF, 0x1234_5678, 0xE3FF_00FF, 0xFFFF_FFFF]);
+    dl.0.extend([0xE2FF_FF1F, 0xFFFF_FFFF]);
+    // Pop far more matrices than were pushed.
+    dl.0.extend([0xD838_0002, 0xFFFF_FFC0]);
+    // A one-pixel-wide colour image still gives a usable height.
+    dl.cimg(0x0F_0000, 1);
+    dl.end();
+    let addr = ram.dl(&dl);
+    let f = run(&ram, addr);
+    assert_eq!(f.height(), 1);
+}

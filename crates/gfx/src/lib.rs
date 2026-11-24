@@ -150,7 +150,7 @@ pub struct Frame {
 impl Frame {
     /// The N64 framebuffer height, assuming the usual 4:3 shape.
     pub fn height(&self) -> u32 {
-        self.width * 3 / 4
+        (self.width * 3 / 4).max(1)
     }
 
     /// The draws, in order.
