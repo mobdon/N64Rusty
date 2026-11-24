@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use n64rusty_rom::{Rom, BOOT_SEGMENT_ROM};
-use n64rusty_translator::discover::{data_pointers, discover, Image};
+use n64rusty_translator::discover::{data_pointers, discover, function_starts, Image};
 use n64rusty_translator::{emit, translate_function};
 
 const USAGE: &str = "\
@@ -243,6 +243,25 @@ fn translate(args: &[String]) -> Result<(), String> {
     for m in missing.iter().filter(|m| m[3] != 0) {
         regions.entry((m[1], m[2], m[3])).or_default().push(m[0]);
     }
+    // Any other copy that is laid out like code is code too: a game loads
+    // each scene's code this way, and waiting for a run to call into it
+    // costs a crash per scene.
+    for d in &dma {
+        let (r, ram, len) = (d[0], d[1], d[2]);
+        let start = r as usize;
+        let end = (start + len as usize).min(rom.bytes().len());
+        let boot_copy = r.wrapping_sub(boot_rom) == ram.wrapping_sub(img.base);
+        if len == 0 || start >= end || boot_copy || regions.contains_key(&(r, ram, len)) {
+            continue;
+        }
+        let oimg = Image {
+            base: ram,
+            bytes: &rom.bytes()[start..end],
+        };
+        if !function_starts(&oimg).is_empty() {
+            regions.insert((r, ram, len), Vec::new());
+        }
+    }
     // Games often copy one long piece of code in several back-to-back
     // copies. Discovery looks at the whole run (so jump tables and calls
     // that cross a copy's edge resolve); each copy then gets the functions
@@ -263,9 +282,13 @@ fn translate(args: &[String]) -> Result<(), String> {
             base: ram,
             bytes: &rom.bytes()[start..end],
         };
+        // Overlay code is mostly reached through pointers its own code sets
+        // up, so also start at every function its layout shows.
+        let mut entries = entries.clone();
+        entries.extend(function_starts(&oimg));
         let d = discover(
             &oimg,
-            entries,
+            &entries,
             &data_pointers(&oimg),
             Some(ram.wrapping_add(len)),
         );
