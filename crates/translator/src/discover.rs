@@ -223,6 +223,19 @@ fn looks_like_prologue(w: u32) -> bool {
     i.op == Op::Addiu && i.rs == 29 && i.rt == 29 && i.simm() < 0
 }
 
+/// Words anywhere in the image that point inside it at something that starts
+/// like a function (`addiu $sp, $sp, -n`): function pointers in data tables.
+/// Pass them to [`discover`] as hints.
+pub fn data_pointers(img: &Image) -> Vec<u32> {
+    let mut out: Vec<u32> = (0..img.bytes.len() / 4)
+        .filter_map(|k| img.word(img.base + 4 * k as u32))
+        .filter(|&v| img.word(v).is_some_and(looks_like_prologue))
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 /// Finds functions reachable from `entries`, then from `hints` and from
 /// address pairs that look like function pointers. Those second-pass
 /// addresses must lie below `code_end`, which defaults to the end of the
@@ -337,6 +350,19 @@ mod tests {
     }
     const JR_RA: u32 = 0x03E0_0008;
     const NOP: u32 = 0;
+
+    #[test]
+    fn data_pointers_find_prologues() {
+        // 0x1000: addiu $sp,$sp,-8; 0x1004: jr $ra; 0x1008: nop;
+        // 0x100c: pointer to 0x1000; 0x1010: pointer to 0x1004 (no prologue).
+        let words = [0x27BD_FFF8u32, 0x03E0_0008, 0, 0x1000, 0x1004];
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_be_bytes()).collect();
+        let img = Image {
+            base: 0x1000,
+            bytes: &bytes,
+        };
+        assert_eq!(data_pointers(&img), vec![0x1000]);
+    }
 
     #[test]
     fn follows_calls_and_ends_at_return() {

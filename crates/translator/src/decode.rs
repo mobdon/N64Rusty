@@ -118,6 +118,9 @@ pub enum Op {
     Ldc1,
     Swc1,
     Sdc1,
+    // COP0 (system control) register moves.
+    Mfc0,
+    Mtc0,
     /// COP1 arithmetic, conversion or compare: format in `rs`, operation in
     /// the funct field.
     Cop1,
@@ -242,6 +245,11 @@ impl Inst {
             0x35 => Op::Ldc1,
             0x39 => Op::Swc1,
             0x3D => Op::Sdc1,
+            0x10 => match rs {
+                0x00 | 0x01 => Op::Mfc0,
+                0x04 | 0x05 => Op::Mtc0,
+                _ => Op::Unknown,
+            },
             0x02 => Op::J,
             0x03 => Op::Jal,
             0x04 => Op::Beq,
@@ -323,9 +331,9 @@ impl Inst {
             | Add | Addu | Sub | Subu | And | Or | Xor | Nor | Slt | Sltu | Dadd | Daddu | Dsub
             | Dsubu | Dsll | Dsrl | Dsra | Dsll32 | Dsrl32 | Dsra32 => self.rd,
             Addi | Addiu | Slti | Sltiu | Andi | Ori | Xori | Lui | Daddi | Daddiu | Ldl | Ldr
-            | Lb | Lh | Lwl | Lw | Lbu | Lhu | Lwr | Lwu | Ld | Mfc1 | Dmfc1 | Cfc1 => self.rt,
-            // COP0 moves such as MFC0 write rt; be conservative.
-            Unknown if self.word >> 26 == 0x10 => self.rt,
+            | Lb | Lh | Lwl | Lw | Lbu | Lhu | Lwr | Lwu | Ld | Mfc1 | Dmfc1 | Cfc1 | Mfc0 => {
+                self.rt
+            }
             _ => return None,
         };
         (d != 0).then_some(d)

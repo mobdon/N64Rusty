@@ -974,6 +974,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "n64rusty-runner"
+version = "0.0.0"
+dependencies = [
+ "n64rusty-rom",
+ "n64rusty-runtime",
+]
+
+[[package]]
 name = "n64rusty-runtime"
 version = "0.0.0"
 

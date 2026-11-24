@@ -5,11 +5,14 @@ code (MIPS VR4300, big-endian) and writes Rust, which links against a small
 runtime crate and builds into a native program. You supply your own legally
 obtained ROM; this repository contains no game data.
 
-Status: **step 2, ROM loader.** The VR4300 integer and floating-point
+Status: **step 3, headless runs.** The VR4300 integer and floating-point
 instruction sets translate to Rust, with branch delay slots, and are tested
-per instruction against a reference interpreter. ROMs load in any byte order, and the boot
-segment's functions are found from the entry point and written out as a Rust
-crate that compiles. Floating point and the rest of the console come next.
+per instruction against a reference interpreter. ROMs load in any byte order;
+the boot segment and the code the game loads at run time are found and written
+out as a Rust crate that builds into a native program. That program runs the
+game headless with the system library replaced by native Rust, until the
+first routine that is still missing. Graphics, audio and input plug in later
+through one small interface.
 
 ## Layout
 
@@ -21,8 +24,8 @@ crate that compiles. Floating point and the rest of the console come next.
 | `n64rusty-rom` | `crates/rom` | ROM loading: byte order, SHA-256, header, boot code variant |
 | `n64rusty-refcpu` | `crates/refcpu` | Reference VR4300 interpreter, used only by tests |
 | `n64rusty-conformance` | `crates/conformance` | Per-instruction tests: translated code against the reference CPU |
+| `n64rusty-runner` | `crates/runner` | Runs a recompiled game: boot, threads, messages, timers, DMA and the system library replaced in Rust; devices plug in through one trait |
 | `n64rusty-gfx` | `crates/gfx` | High-level display-list interpreter and headless wgpu renderer with PNG capture |
-
 | `n64rusty-host` | `crates/host` | Window, frame pacing, controllers, input record and replay, per-run config, debug port |
 
 ```
@@ -51,6 +54,44 @@ per 64 KiB of address space, rewritten only when its contents change),
 `report.txt` and a `config.toml` template.
 
 On Linux, building needs `libudev-dev` (for gamepads).
+
+## Running headless
+
+The generated crate builds a program that runs the game with no window and
+no sound:
+
+```
+cd local/<sha256>/out && cargo build
+./target/debug/n64rusty-game-<hash> path/to/your.z64 [--symbols local-map.txt] [--frames 600]
+```
+
+It replaces the system library (threads, message queues, timers, video
+retrace, cartridge DMA, controllers, task and audio submission) by role
+name. The addresses of those routines come from `--symbols` or from
+`local/<sha256>/config.toml` (`name = 0xADDR` lines); neither is ever
+committed. Guest threads run one at a time on host threads, in priority
+order, on a virtual clock: retrace and timer interrupts arrive on time
+even while a thread is busy, and when every thread waits, time jumps to the
+next event. The game always runs at its original speed in game time.
+
+A run stops after `--frames` retraces, on a deadlock, or at the first
+panic, and prints the threads, the cartridge copies and the most recent
+calls. It also writes two files next to `out/`:
+
+- `dma.txt`: every cartridge copy seen (ROM offset, RAM address, length).
+- `missing.txt`: each call into code that was never translated, with the
+  copy that put it there.
+
+Run `translate` again and it adds that code: code copied in at run time
+becomes an overlay (its own module, active while that copy is in RAM), boot
+segment code that a later copy overwrites is dropped, and boot code reached
+only through a pointer is added. Repeat until the run reaches its frame
+limit.
+
+Graphics, audio and input are separate crates that implement
+`n64rusty_runner::devices::Devices` (RSP tasks, audio buffers, retrace and
+controller state). The default, `Headless`, ignores output and reports one
+connected controller with nothing pressed.
 
 ## Window and input
 
@@ -175,6 +216,8 @@ lives under a local, git-ignored folder named by that hash:
 local/<sha256>/          # git-ignored
     config.toml          # hook addresses with role names, found by us
     out/                 # generated Rust
+    dma.txt, missing.txt # what headless runs saw, read by translate
+    report.txt           # summary of the last translate
     ...                  # saves, captures, extracted data
 ```
 
