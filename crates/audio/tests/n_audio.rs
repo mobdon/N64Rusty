@@ -96,15 +96,17 @@ fn adpcm_packs_offsets_and_count() {
             book(DATA),
             load(4, 16, DATA + 0x100), // 9 bytes, DMA rounds to 16
             (1 << 24 | STATE, flags << 28 | 32 << 16 | 4 << 12 | 0x100),
-            save(0x100, 32, OUT),
+            save(0x100, 64, OUT),
         ]
     };
+    // The output starts with the 16 samples decoded before (none yet).
     run(&mut rsp, &mut ram, &decode(1));
     let want: Vec<i16> = (1..=16).map(|i| 2 * i).collect();
-    assert_eq!(get(&ram, OUT, 16), want);
+    assert_eq!(get(&ram, OUT, 16), [0; 16]);
+    assert_eq!(get(&ram, OUT + 32, 16), want);
     run(&mut rsp, &mut ram, &decode(0));
-    let want: Vec<i16> = (17..=32).map(|i| 2 * i).collect();
-    assert_eq!(get(&ram, OUT, 16), want, "continues from the state");
+    let want: Vec<i16> = (1..=32).map(|i| 2 * i).collect();
+    assert_eq!(get(&ram, OUT, 32), want, "continues from the state");
 }
 
 #[test]

@@ -66,13 +66,15 @@ fn adpcm_integrator_predictor_continues_across_tasks() {
             loadbuff(DATA + 0x100),
             setbuff(0x000, 0x100, 32),
             c(1, flags, 0, STATE),
-            setbuff(0, 0x100, 32),
+            setbuff(0, 0x100, 64),
             savebuff(OUT),
         ]
     };
+    // The output starts with the 16 samples decoded before (none yet).
     run(&mut rsp, &mut ram, &decode(1));
     let want: Vec<i16> = (1..=16).map(|i| 2 * i).collect();
-    assert_eq!(get(&ram, OUT, 16), want);
+    assert_eq!(get(&ram, OUT, 16), [0; 16]);
+    assert_eq!(get(&ram, OUT + 32, 16), want);
     assert_eq!(
         get(&ram, STATE, 16),
         want,
@@ -83,8 +85,8 @@ fn adpcm_integrator_predictor_continues_across_tasks() {
     let mut cont = decode(0);
     cont[2] = loadbuff(DATA + 0x109);
     run(&mut rsp, &mut ram, &cont);
-    let want: Vec<i16> = (17..=32).map(|i| 2 * i).collect();
-    assert_eq!(get(&ram, OUT, 16), want);
+    let want: Vec<i16> = (1..=32).map(|i| 2 * i).collect();
+    assert_eq!(get(&ram, OUT, 32), want);
 }
 
 #[test]
@@ -106,7 +108,7 @@ fn adpcm_clamps_and_sign_extends() {
             loadbuff(DATA + 0x100),
             setbuff(0, 0x100, 32),
             c(1, 1, 0, STATE),
-            setbuff(0, 0x100, 8),
+            setbuff(0, 0x120, 8),
             savebuff(OUT),
         ],
     );

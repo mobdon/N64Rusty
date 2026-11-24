@@ -278,19 +278,24 @@ impl AudioRsp {
     /// predictor's two rows of 8 coefficients (Q11) from the codebook.
     fn adpcm(&mut self, ram: &mut Memory, flags: u8, state: u32, inp: u16, out: u16, count: u16) {
         let frames = (count as usize).div_ceil(32);
-        if frames == 0 {
-            return;
-        }
-        let (mut p2, mut p1) = (0i64, 0i64);
+        // The output starts with the last frame decoded before (or the loop
+        // start's): the game resamples from part-way into it.
+        let mut last = [0i16; 16];
         if flags & A_INIT == 0 {
             let src = if flags & A_LOOP != 0 {
                 self.loop_addr
             } else {
                 state
             };
-            p2 = ram.read_u16(src + 28) as i16 as i64;
-            p1 = ram.read_u16(src + 30) as i16 as i64;
+            for (i, v) in last.iter_mut().enumerate() {
+                *v = ram.read_u16(src + 2 * i as u32) as i16;
+            }
         }
+        for (i, &v) in last.iter().enumerate() {
+            self.st(out + 2 * i as u16, v);
+        }
+        let (mut p2, mut p1) = (last[14] as i64, last[15] as i64);
+        let out = out + 32;
         let (mut inp, mut out) = (inp, out);
         for _ in 0..frames {
             let header = self.dmem[inp as usize & MASK];
