@@ -27,9 +27,11 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Software Vulkan driver
+      - name: Install Linux libraries
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
+        # Gamepad support (gilrs) links against libudev; the renderer tests
+        # draw on lavapipe, the software Vulkan driver.
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev mesa-vulkan-drivers
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
