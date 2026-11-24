@@ -175,10 +175,13 @@ impl<G: Guest> Session<G> {
         *written = rec.text().len();
     }
 
-    fn next_command(&self, block: bool) -> Option<(String, Sender<String>)> {
+    fn next_command(&mut self, block: bool) -> Option<(String, Sender<String>)> {
         let port = self.debug.as_ref()?;
         if block && matches!(self.mode, Mode::Paused) && !self.done {
-            port.requests.recv().ok()
+            let request = port.requests.recv().ok();
+            // Nothing can ever unpause the run now: end it rather than spin.
+            self.done |= request.is_none();
+            request
         } else {
             port.requests.try_recv().ok()
         }
@@ -299,5 +302,26 @@ mod tests {
         assert!(p.due(t0 + ms(95))); // stalled: restart, no burst of catch-up frames
         assert!(!p.due(t0 + ms(100)));
         assert_eq!(p.next(), t0 + ms(105));
+    }
+
+    struct Count(u64);
+    impl Guest for Count {
+        fn frame(&mut self, _: u64, _: &Pads) {
+            self.0 += 1;
+        }
+    }
+
+    #[test]
+    fn paused_run_ends_when_the_debug_port_is_gone() {
+        let mut s = Session::new(Count(0), &RunConfig::default()).unwrap();
+        let (tx, requests) = std::sync::mpsc::channel();
+        drop(tx);
+        s.debug = Some(DebugPort {
+            addr: "127.0.0.1:1".parse().unwrap(),
+            requests,
+        });
+        s.mode = Mode::Paused;
+        assert_eq!(s.tick(&Pads::default(), true), Tick::Done);
+        assert_eq!(s.finish().unwrap().0, 0);
     }
 }
