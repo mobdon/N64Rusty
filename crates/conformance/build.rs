@@ -19,10 +19,7 @@ fn main() {
         let funcs: Vec<_> = p
             .funcs
             .iter()
-            .map(|(addr, words)| n64rusty_translator::Function {
-                addr: *addr,
-                words: words.clone(),
-            })
+            .map(|(addr, words)| n64rusty_translator::Function::new(*addr, words.clone()))
             .collect();
         let src = n64rusty_translator::translate_module(&funcs)
             .unwrap_or_else(|e| panic!("translating {}: {e}", p.name));

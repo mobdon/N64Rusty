@@ -101,6 +101,12 @@ pub enum Op {
     Cache,
     Ld,
     Sd,
+    // COP1 condition branches. Decoded so that blocks and delay slots are
+    // laid out correctly; the condition itself is not implemented yet.
+    Bc1f,
+    Bc1t,
+    Bc1fl,
+    Bc1tl,
     /// Anything not decoded yet (coprocessors, traps, LL/SC, ...).
     Unknown,
 }
@@ -202,6 +208,12 @@ impl Inst {
                 0x13 => Op::Bgezall,
                 _ => Op::Unknown,
             },
+            0x11 if rs == 0x08 => match rt & 3 {
+                0 => Op::Bc1f,
+                1 => Op::Bc1t,
+                2 => Op::Bc1fl,
+                _ => Op::Bc1tl,
+            },
             0x02 => Op::J,
             0x03 => Op::Jal,
             0x04 => Op::Beq,
@@ -274,6 +286,23 @@ impl Inst {
         (pc.wrapping_add(4) & 0xF000_0000) | ((self.word & 0x03FF_FFFF) << 2)
     }
 
+    /// The general-purpose register this instruction writes, if any
+    /// (ignoring `$ra` written by linking branches and jumps).
+    pub fn dest(&self) -> Option<u8> {
+        use Op::*;
+        let d = match self.op {
+            Sll | Srl | Sra | Sllv | Srlv | Srav | Jalr | Mfhi | Mflo | Dsllv | Dsrlv | Dsrav
+            | Add | Addu | Sub | Subu | And | Or | Xor | Nor | Slt | Sltu | Dadd | Daddu | Dsub
+            | Dsubu | Dsll | Dsrl | Dsra | Dsll32 | Dsrl32 | Dsra32 => self.rd,
+            Addi | Addiu | Slti | Sltiu | Andi | Ori | Xori | Lui | Daddi | Daddiu | Ldl | Ldr
+            | Lb | Lh | Lwl | Lw | Lbu | Lhu | Lwr | Lwu | Ld => self.rt,
+            // Coprocessor moves such as MFC0/MFC1 write rt; be conservative.
+            Unknown if self.word >> 26 == 0x10 || self.word >> 26 == 0x11 => self.rt,
+            _ => return None,
+        };
+        (d != 0).then_some(d)
+    }
+
     /// How this instruction changes control flow.
     pub fn flow(&self) -> Flow {
         use Op::*;
@@ -282,7 +311,11 @@ impl Inst {
                 likely: false,
                 link: false,
             },
-            Beql | Bnel | Blezl | Bgtzl | Bltzl | Bgezl => Flow::Branch {
+            Bc1f | Bc1t => Flow::Branch {
+                likely: false,
+                link: false,
+            },
+            Beql | Bnel | Blezl | Bgtzl | Bltzl | Bgezl | Bc1fl | Bc1tl => Flow::Branch {
                 likely: true,
                 link: false,
             },

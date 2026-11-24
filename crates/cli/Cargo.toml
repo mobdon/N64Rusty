@@ -14,3 +14,4 @@ path = "src/main.rs"
 [dependencies]
 n64rusty-translator.workspace = true
 n64rusty-runtime.workspace = true
+n64rusty-rom = { path = "../rom" }
