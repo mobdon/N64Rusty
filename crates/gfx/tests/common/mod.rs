@@ -211,6 +211,18 @@ impl Dl {
         self.c(0xE1 << 24, (st[0] as u32) << 16 | st[1] as u32);
         self.c(0xF1 << 24, (step[0] as u32) << 16 | step[1] as u32)
     }
+    /// Scissor box in whole pixels.
+    pub fn scissor(&mut self, x0: u32, y0: u32, x1: u32, y1: u32) -> &mut Self {
+        self.c(
+            0xED << 24 | (x0 * 4) << 12 | y0 * 4,
+            (x1 * 4) << 12 | y1 * 4,
+        )
+    }
+    /// `G_MODIFYVTX`: field offset `what` (0x10 colour, 0x14 st, 0x18
+    /// screen xy, 0x1C screen z) of loaded vertex `v`.
+    pub fn modify_vtx(&mut self, what: u32, v: u32, value: u32) -> &mut Self {
+        self.c(0x02 << 24 | what << 16 | v * 2, value)
+    }
     pub fn cimg(&mut self, addr: u32, width: u32) -> &mut Self {
         self.c(0xFF << 24 | 2 << 19 | (width - 1), addr)
     }
