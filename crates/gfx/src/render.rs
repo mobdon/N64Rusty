@@ -155,6 +155,10 @@ fn factor(f: u8) -> wgpu::BlendFactor {
 /// driver while another renderer's device was calling into it (the Vulkan
 /// loader drops drivers it probed), which crashed parallel tests on Linux.
 fn adapter() -> Result<&'static wgpu::Adapter, RenderError> {
+    gpu().map(|(_, a)| a)
+}
+
+fn gpu() -> Result<(&'static wgpu::Instance, &'static wgpu::Adapter), RenderError> {
     static ADAPTER: OnceLock<Result<(wgpu::Instance, wgpu::Adapter), String>> = OnceLock::new();
     let found = ADAPTER.get_or_init(|| {
         let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
@@ -171,7 +175,7 @@ fn adapter() -> Result<&'static wgpu::Adapter, RenderError> {
         Ok((instance, adapter))
     });
     match found {
-        Ok((_, adapter)) => Ok(adapter),
+        Ok((instance, adapter)) => Ok((instance, adapter)),
         Err(e) => Err(RenderError::NoAdapter(e.clone())),
     }
 }
@@ -396,6 +400,73 @@ impl Renderer {
     /// Draw `frame` at `width` x `height` pixels and read it back. The
     /// frame's native framebuffer is scaled to fill the image.
     pub fn render(&mut self, frame: &Frame, width: u32, height: u32) -> Result<Image, RenderError> {
+        let (target, encoder) = self.draw(frame, width, height);
+        self.read_back(encoder, &target)
+    }
+
+    /// Submits `encoder` and reads `target` back.
+    fn read_back(
+        &self,
+        mut encoder: wgpu::CommandEncoder,
+        target: &wgpu::Texture,
+    ) -> Result<Image, RenderError> {
+        let (width, height, size) = (target.width(), target.height(), target.size());
+        // Read back, with rows padded to the copy alignment.
+        let row = width * 4;
+        let padded =
+            row.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback"),
+            size: (padded * height) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            target.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded),
+                    rows_per_image: Some(height),
+                },
+            },
+            size,
+        );
+        self.queue.submit([encoder.finish()]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        readback.map_async(wgpu::MapMode::Read, .., move |r| {
+            let _ = tx.send(r);
+        });
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|e| RenderError::Readback(e.to_string()))?;
+        rx.recv()
+            .map_err(|e| RenderError::Readback(e.to_string()))?
+            .map_err(|e| RenderError::Readback(e.to_string()))?;
+        let data = readback
+            .get_mapped_range(..)
+            .map_err(|e| RenderError::Readback(e.to_string()))?;
+        let mut rgba = Vec::with_capacity((row * height) as usize);
+        for y in 0..height {
+            let start = (y * padded) as usize;
+            rgba.extend_from_slice(&data[start..start + row as usize]);
+        }
+        Ok(Image {
+            width,
+            height,
+            rgba,
+        })
+    }
+
+    /// Records the passes that draw `frame` into a new `width` x `height`
+    /// colour texture; nothing is submitted yet.
+    fn draw(
+        &mut self,
+        frame: &Frame,
+        width: u32,
+        height: u32,
+    ) -> (wgpu::Texture, wgpu::CommandEncoder) {
         let size = wgpu::Extent3d {
             width,
             height,
@@ -408,7 +479,9 @@ impl Renderer {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: COLOR_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
         let depth = self.device.create_texture(&wgpu::TextureDescriptor {
@@ -569,52 +642,7 @@ impl Renderer {
             }
         }
 
-        // Read back, with rows padded to the copy alignment.
-        let row = width * 4;
-        let padded =
-            row.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("readback"),
-            size: (padded * height) as u64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        encoder.copy_texture_to_buffer(
-            target.as_image_copy(),
-            wgpu::TexelCopyBufferInfo {
-                buffer: &readback,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(padded),
-                    rows_per_image: Some(height),
-                },
-            },
-            size,
-        );
-        self.queue.submit([encoder.finish()]);
-        let (tx, rx) = std::sync::mpsc::channel();
-        readback.map_async(wgpu::MapMode::Read, .., move |r| {
-            let _ = tx.send(r);
-        });
-        self.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .map_err(|e| RenderError::Readback(e.to_string()))?;
-        rx.recv()
-            .map_err(|e| RenderError::Readback(e.to_string()))?
-            .map_err(|e| RenderError::Readback(e.to_string()))?;
-        let data = readback
-            .get_mapped_range(..)
-            .map_err(|e| RenderError::Readback(e.to_string()))?;
-        let mut rgba = Vec::with_capacity((row * height) as usize);
-        for y in 0..height {
-            let start = (y * padded) as usize;
-            rgba.extend_from_slice(&data[start..start + row as usize]);
-        }
-        Ok(Image {
-            width,
-            height,
-            rgba,
-        })
+        (target, encoder)
     }
 
     fn buffer(&self, data: &[u8], usage: wgpu::BufferUsages) -> wgpu::Buffer {
@@ -713,4 +741,290 @@ fn clip_matrices(frame: &Frame) -> Vec<crate::Mat4> {
 fn transform(m: &crate::Mat4, p: [f32; 3]) -> [f32; 4] {
     let v = [p[0], p[1], p[2], 1.0];
     [0, 1, 2, 3].map(|j| (0..4).map(|k| v[k] * m[k][j]).sum())
+}
+
+/// The largest rectangle with the frame's shape that fits a `win_w` x
+/// `win_h` window, centred: `(x, y, width, height)`.
+pub fn fit(win_w: u32, win_h: u32, frame_w: u32, frame_h: u32) -> (u32, u32, u32, u32) {
+    let (fw, fh) = (frame_w.max(1) as u64, frame_h.max(1) as u64);
+    let (w, h) = if win_w as u64 * fh <= win_h as u64 * fw {
+        (win_w as u64, win_w as u64 * fh / fw)
+    } else {
+        (win_h as u64 * fw / fh, win_h as u64)
+    };
+    let (w, h) = (w.max(1) as u32, h.max(1) as u32);
+    ((win_w - w.min(win_w)) / 2, (win_h - h.min(win_h)) / 2, w, h)
+}
+
+/// Copies a drawn frame into a part of another texture.
+const BLIT_SHADER: &str = r#"
+@group(0) @binding(0) var tex: texture_2d<f32>;
+@group(0) @binding(1) var smp: sampler;
+struct Out { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
+@vertex fn vs(@builtin(vertex_index) i: u32) -> Out {
+    // One triangle covering the viewport.
+    let uv = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+    var o: Out;
+    o.pos = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0, 1.0);
+    o.uv = uv;
+    return o;
+}
+@fragment fn fs(o: Out) -> @location(0) vec4<f32> {
+    return vec4<f32>(textureSample(tex, smp, o.uv).rgb, 1.0);
+}
+"#;
+
+/// Draws frames into a texture of another format, letterboxed.
+struct Blit {
+    pipeline: wgpu::RenderPipeline,
+    layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+}
+
+impl Blit {
+    fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Blit {
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("blit"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("blit"),
+            source: wgpu::ShaderSource::Wgsl(BLIT_SHADER.into()),
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("blit"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("blit"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &module,
+                entry_point: Some("vs"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fs"),
+                compilation_options: Default::default(),
+                targets: &[Some(format.into())],
+            }),
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor::default());
+        Blit {
+            pipeline,
+            layout,
+            sampler,
+        }
+    }
+
+    /// Records a copy of `src` into `dst`, sized to fit it with the
+    /// source's shape and centred, black elsewhere.
+    fn record(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        src: &wgpu::Texture,
+        dst: &wgpu::TextureView,
+        (x, y, w, h): (u32, u32, u32, u32),
+    ) {
+        let view = src.create_view(&Default::default());
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("blit"),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        });
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("blit"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: dst,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_viewport(x as f32, y as f32, w as f32, h as f32, 0.0, 1.0);
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.draw(0..3, 0..1);
+    }
+}
+
+/// A window the renderer draws finished frames into, at the window's own
+/// resolution, keeping the frame's shape with black bars.
+pub struct WindowTarget {
+    surface: wgpu::Surface<'static>,
+    format: wgpu::TextureFormat,
+    /// The surface format without sRGB encoding: frame colours are already
+    /// display values.
+    view_format: wgpu::TextureFormat,
+    present_mode: wgpu::PresentMode,
+    alpha: wgpu::CompositeAlphaMode,
+    size: Option<(u32, u32)>,
+    blit: Option<Blit>,
+}
+
+impl Renderer {
+    /// Prepares to draw into a window (any window handle, for example an
+    /// `Arc` of a winit window).
+    pub fn window_target(
+        &self,
+        window: impl Into<wgpu::SurfaceTarget<'static>>,
+    ) -> Result<WindowTarget, RenderError> {
+        let (instance, adapter) = gpu()?;
+        let surface = instance
+            .create_surface(window)
+            .map_err(|e| RenderError::Device(e.to_string()))?;
+        let caps = surface.get_capabilities(adapter);
+        let format = *caps.formats.first().ok_or_else(|| {
+            RenderError::Device("the graphics adapter cannot draw into this window".into())
+        })?;
+        // Mailbox shows the newest frame without waiting for the screen;
+        // the game keeps its own pace either way.
+        let present_mode = if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
+            wgpu::PresentMode::Mailbox
+        } else {
+            wgpu::PresentMode::Fifo
+        };
+        Ok(WindowTarget {
+            surface,
+            format,
+            view_format: format.remove_srgb_suffix(),
+            present_mode,
+            alpha: caps
+                .alpha_modes
+                .first()
+                .copied()
+                .unwrap_or(wgpu::CompositeAlphaMode::Auto),
+            size: None,
+            blit: None,
+        })
+    }
+
+    /// Draws `frame` into a window whose inner size is `width` x `height`.
+    /// A frame the window cannot take right now (minimised, being resized)
+    /// is skipped.
+    pub fn present(
+        &mut self,
+        frame: &Frame,
+        win: &mut WindowTarget,
+        width: u32,
+        height: u32,
+    ) -> Result<(), RenderError> {
+        if width == 0 || height == 0 {
+            return Ok(());
+        }
+        if win.size != Some((width, height)) {
+            win.surface.configure(
+                &self.device,
+                &wgpu::SurfaceConfiguration {
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    format: win.format,
+                    color_space: Default::default(),
+                    width,
+                    height,
+                    present_mode: win.present_mode,
+                    desired_maximum_frame_latency: 2,
+                    alpha_mode: win.alpha,
+                    view_formats: vec![win.view_format],
+                },
+            );
+            win.size = Some((width, height));
+        }
+        let texture = match win.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(t) => t,
+            wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
+                win.size = None; // configure again next frame
+                t
+            }
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                win.size = None;
+                return Ok(());
+            }
+            _ => return Ok(()),
+        };
+        let blit = win
+            .blit
+            .get_or_insert_with(|| Blit::new(&self.device, win.view_format));
+        let view = texture.texture.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(win.view_format),
+            ..Default::default()
+        });
+        let rect = fit(width, height, frame.width, frame.height());
+        let (src, mut encoder) = self.draw(frame, rect.2, rect.3);
+        blit.record(&self.device, &mut encoder, &src, &view, rect);
+        self.queue.submit([encoder.finish()]);
+        self.queue.present(texture);
+        Ok(())
+    }
+
+    /// Like [`Renderer::present`], into an off-screen image of `width` x
+    /// `height`, for tests of the window path.
+    pub fn render_letterboxed(
+        &mut self,
+        frame: &Frame,
+        width: u32,
+        height: u32,
+    ) -> Result<Image, RenderError> {
+        let dst = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("letterboxed"),
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            ..target_desc(wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            })
+        });
+        let blit = Blit::new(&self.device, COLOR_FORMAT);
+        let rect = fit(width, height, frame.width, frame.height());
+        let (src, mut encoder) = self.draw(frame, rect.2, rect.3);
+        blit.record(
+            &self.device,
+            &mut encoder,
+            &src,
+            &dst.create_view(&Default::default()),
+            rect,
+        );
+        self.read_back(encoder, &dst)
+    }
 }
