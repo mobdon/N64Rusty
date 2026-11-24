@@ -1,0 +1,18 @@
+[package]
+name = "n64rusty-conformance"
+description = "Per-instruction tests: translated Rust against the reference CPU, synthetic code only"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+n64rusty-runtime.workspace = true
+
+[build-dependencies]
+n64rusty-translator.workspace = true
+
+[dev-dependencies]
+n64rusty-refcpu = { path = "../refcpu" }

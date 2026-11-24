@@ -38,6 +38,16 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
+## Hardware documentation
+
+Read for instruction behaviour; no text or tables are copied.
+
+- NEC VR4300 64-bit microprocessor user's manual: instruction semantics,
+  sign extension of 32-bit results, multiply and divide results, unaligned
+  loads and stores.
+- MIPS III / MIPS IV instruction set references: encodings and branch delay
+  slot rules, including branch-likely behaviour.
+
 ## Adding a source
 
 Every new source gets an entry here before its influence lands: name, link,

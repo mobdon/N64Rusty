@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/translator", "crates/runtime", "crates/cli"]
+members = ["crates/translator", "crates/runtime", "crates/cli", "crates/refcpu", "crates/conformance"]
 
 [workspace.package]
 version = "0.0.0"
@@ -12,3 +12,12 @@ rust-version = "1.75"
 [workspace.dependencies]
 n64rusty-translator = { path = "crates/translator" }
 n64rusty-runtime = { path = "crates/runtime" }
+
+# The conformance tests run hundreds of thousands of guest instructions;
+# optimise the crates they exercise even in debug builds.
+[profile.dev.package.n64rusty-conformance]
+opt-level = 2
+[profile.dev.package.n64rusty-refcpu]
+opt-level = 2
+[profile.dev.package.n64rusty-runtime]
+opt-level = 2
