@@ -1,0 +1,14 @@
+[package]
+name = "n64rusty-gfx"
+description = "High-level N64 display-list interpreter and wgpu renderer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+# wgpu needs a newer compiler than the rest of the workspace.
+rust-version = "1.88"
+
+[dependencies]
+wgpu = "30"
+pollster = "0.4"
+png = "0.18"
