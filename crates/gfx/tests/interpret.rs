@@ -1,0 +1,360 @@
+//! Display-list interpretation, checked on the CPU with synthetic lists.
+
+mod common;
+
+use common::*;
+use n64rusty_gfx::{Command, Frame, GfxError, Interpreter, Wrap};
+
+fn run(ram: &Ram, dl: u32) -> Frame {
+    let mut it = Interpreter::new();
+    it.run(&ram.bytes, dl).expect("display list runs");
+    it.take_frame()
+}
+
+#[test]
+fn records_a_triangle_with_its_state() {
+    let mut ram = Ram::default();
+    let verts = ram.vertices(&[
+        v(-50, -50, 0, [255, 0, 0, 255]),
+        v(50, -50, 0, [0, 255, 0, 255]),
+        v(0, 50, 0, [0, 0, 255, 128]),
+    ]);
+    let mut dl = Dl::default();
+    setup(&mut ram, &mut dl);
+    let combine = pass(SHADE);
+    dl.other_modes(CYCLE_1, ZBUF)
+        .geometry(0, G_ZBUFFER | G_SHADE | G_SHADING_SMOOTH)
+        .combine(combine)
+        .prim(0x11223344)
+        .vtx(verts, 3, 0)
+        .tri(0, 1, 2)
+        .end();
+    let addr = ram.dl(&dl);
+    let f = run(&ram, addr);
+
+    assert!(f.warnings.is_empty(), "{:?}", f.warnings);
+    let draws: Vec<_> = f.draws().collect();
+    assert_eq!(draws.len(), 1);
+    let d = draws[0];
+    assert_eq!((d.first, d.count), (0, 3));
+    assert_eq!(d.state.combine, combine);
+    assert_eq!(d.state.other_l, ZBUF);
+    assert_eq!(
+        d.state.prim,
+        [0x11, 0x22, 0x33, 0x44].map(|c| c as f32 / 255.0)
+    );
+    assert_eq!(d.state.geometry, G_ZBUFFER | G_SHADE | G_SHADING_SMOOTH);
+    assert_eq!(f.vertices[0].pos, [-50.0, -50.0, 0.0]);
+    assert_eq!(f.vertices[2].color, [0.0, 0.0, 1.0, 128.0 / 255.0]);
+    let t = &f.transforms[f.vertices[0].transform as usize];
+    assert!((t.projection[0][0] - 0.01).abs() < 1e-4);
+    assert_eq!(t.viewport.scale, [160.0, 120.0]);
+    assert_eq!(f.width, 320);
+    assert_eq!(f.color_image, 0x0F_0000);
+}
+
+#[test]
+fn second_triangle_with_same_state_extends_the_draw() {
+    let mut ram = Ram::default();
+    let verts = ram.vertices(&[v(0, 0, 0, [255; 4]); 4]);
+    let mut dl = Dl::default();
+    setup(&mut ram, &mut dl);
+    dl.vtx(verts, 4, 0).tri2([0, 1, 2], [1, 2, 3]);
+    dl.prim(0xFF0000FF).tri(0, 1, 3).end();
+    let addr = ram.dl(&dl);
+    let f = run(&ram, addr);
+    let draws: Vec<_> = f.draws().collect();
+    assert_eq!(draws.len(), 2);
+    assert_eq!(draws[0].count, 6);
+    assert_eq!(draws[1].first, 6);
+}
+
+#[test]
+fn matrix_stack_push_multiply_pop() {
+    let mut ram = Ram::default();
+    let verts = ram.vertices(&[v(0, 0, 0, [255; 4])]);
+    let mut a = n64rusty_gfx::IDENTITY;
+    a[3] = [1.0, 2.0, 3.0, 1.0];
+    let mut b = n64rusty_gfx::IDENTITY;
+    b[0][0] = 2.0;
+    b[3][0] = -0.5;
+    let (ma, mb) = (ram.matrix(a), ram.matrix(b));
+    let mut dl = Dl::default();
+    setup(&mut ram, &mut dl);
+    dl.mtx(ma, LOAD)
+        .mtx(mb, PUSH)
+        .vtx(verts, 1, 0)
+        .pop(1)
+        .vtx(verts, 1, 0)
+        .end();
+    let addr = ram.dl(&dl);
+    let f = run(&ram, addr);
+    assert_eq!(f.transforms.len(), 2);
+    // b applied first, then a: rows of b times a.
+    assert_eq!(f.transforms[0].modelview, n64rusty_gfx::mat_mul(&b, &a));
+    assert_eq!(f.transforms[0].modelview[3], [0.5, 2.0, 3.0, 1.0]);
+    assert_eq!(f.transforms[1].modelview, a);
+    // Tags tell the two loads apart.
+    assert_ne!(f.transforms[0].tag, f.transforms[1].tag);
+}
+
+#[test]
+fn segments_calls_and_branches() {
+    let mut ram = Ram::default();
+    let verts = ram.vertices(&[v(0, 0, 0, [255; 4]); 3]);
+    // Leaf list: draws one triangle with vertices from segment 6.
+    let mut leaf = Dl::default();
+    leaf.vtx(0x0600_0000, 3, 0).tri(0, 1, 2).end();
+    let leaf = ram.dl(&leaf);
+    // Middle list: branches (no return) to the leaf through segment 4.
+    let mut mid = Dl::default();
+    mid.branch(0x0400_0000 | (leaf - 0x1000));
+    let mid = ram.dl(&mid);
+    let mut root = Dl::default();
+    setup(&mut ram, &mut root);
+    root.segment(6, verts)
+        .segment(4, 0x1000)
+        .call(mid)
+        .call(leaf) // returns here after the branch chain ends
+        .end();
+    let addr = ram.dl(&root);
+    let f = run(&ram, addr);
+    assert_eq!(f.vertices.len(), 6);
+}
+
+#[test]
+fn fill_rectangles_clear_depth_or_draw_the_fill_colour() {
+    let mut ram = Ram::default();
+    let mut dl = Dl::default();
+    setup(&mut ram, &mut dl);
+    dl.other_modes(CYCLE_FILL, 0)
+        .cimg(0x0E_0000, 320) // the depth image
+        .fill_color(0xFFFC_FFFC)
+        .fill_rect(0, 0, 319, 239)
+        .cimg(0x0F_0000, 320)
+        .fill_color(0x07C1_07C1) // RGBA5551 green, opaque
+        .fill_rect(10, 20, 29, 39)
+        .end();
+    let addr = ram.dl(&dl);
+    let f = run(&ram, addr);
+    assert_eq!(f.commands[0], Command::ClearDepth);
+    let d = f.draws().next().unwrap();
+    assert!(d.state.rect);
+    assert_eq!(d.state.prim, [0.0, 1.0, 0.0, 1.0]);
+    let xs: Vec<f32> = f.vertices[..6].iter().map(|v| v.pos[0]).collect();
+    // Fill mode includes the right edge: 10..30.
+    assert_eq!(xs.iter().cloned().fold(f32::MAX, f32::min), 10.0);
+    assert_eq!(xs.iter().cloned().fold(f32::MIN, f32::max), 30.0);
+}
+
+#[test]
+fn loads_and_decodes_an_rgba16_texture() {
+    let mut ram = Ram::default();
+    // 4x2 RGBA16: red, green, blue, white / then all transparent black.
+    let texels: [u16; 8] = [0xF801, 0x07C1, 0x003F, 0xFFFF, 0, 0, 0, 0];
+    let tex: Vec<u8> = texels.iter().flat_map(|t| t.to_be_bytes()).collect();
+    let tex = ram.put(&tex);
+    let mut verts = [v(0, 0, 0, [255; 4]); 3];
+    verts[1].st = [4 << 5, 0]; // s = 4.0 texels
+    verts[2].st = [0, 2 << 5];
+    let verts = ram.vertices(&verts);
+    let mut dl = Dl::default();
+    setup(&mut ram, &mut dl);
+    dl.texture(true, 0)
+        .timg(0, 2, 1, tex)
+        .tile(0, 2, 0, 0, 7)
+        .load_block(7, 8)
+        .tile(0, 2, 1, 0, 0) // 4 texels * 2 bytes = one 64-bit line
+        .tile_size(0, 4, 2)
+        .vtx(verts, 3, 0)
+        .tri(0, 1, 2)
+        .end();
+    let addr = ram.dl(&dl);
+    let f = run(&ram, addr);
+    let d = f.draws().next().unwrap();
+    let t = &f.textures[d.state.textures[0].unwrap() as usize];
+    assert_eq!((t.width, t.height), (4, 2));
+    assert_eq!(&t.rgba[..8], &[255, 0, 0, 255, 0, 255, 0, 255]);
+    assert_eq!(&t.rgba[12..16], &[255, 255, 255, 255]);
+    assert_eq!(&t.rgba[16..20], &[0, 0, 0, 0]);
+    assert_eq!(t.wrap, [Wrap::Repeat; 2]);
+    assert_eq!(f.vertices[1].uv[0], [1.0, 0.0]);
+    assert_eq!(f.vertices[2].uv[0], [0.0, 1.0]);
+}
+
+#[test]
+fn decodes_a_palette_texture() {
+    let mut ram = Ram::default();
+    let pal: Vec<u8> = [0x0001u16, 0xF801, 0x07C1]
+        .iter()
+        .flat_map(|c| c.to_be_bytes())
+        .collect();
+    let pal = ram.put(&pal);
+    // CI8, 4x2, rows padded to one 64-bit line.
+    let tex = ram.put(&[1, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    let verts = ram.vertices(&[v(0, 0, 0, [255; 4]); 3]);
+    let mut dl = Dl::default();
+    setup(&mut ram, &mut dl);
+    dl.other_modes(2 << 14, 0) // palette entries are RGBA16
+        .texture(true, 0)
+        .timg(0, 2, 1, pal)
+        .tile(0, 2, 0, 256, 7)
+        .load_tlut(7, 3)
+        .timg(2, 1, 1, tex)
+        .tile(2, 1, 0, 0, 7)
+        .load_block(7, 16)
+        .tile(2, 1, 1, 0, 0)
+        .tile_size(0, 4, 2)
+        .vtx(verts, 3, 0)
+        .tri(0, 1, 2)
+        .end();
+    let addr = ram.dl(&dl);
+    let f = run(&ram, addr);
+    let t = &f.textures[0];
+    assert_eq!(&t.rgba[..4], &[255, 0, 0, 255]);
+    assert_eq!(&t.rgba[4..8], &[0, 255, 0, 255]);
+    assert_eq!(&t.rgba[16..20], &[0, 0, 0, 255]);
+}
+
+#[test]
+fn lights_vertices_from_normals() {
+    let mut ram = Ram::default();
+    // Normal pointing at +z, stored in the colour bytes; alpha 200.
+    let verts = ram.vertices(&[V {
+        pos: [0, 0, 0],
+        st: [0, 0],
+        rgba: [0, 0, 127, 200],
+    }]);
+    // Directional light towards +z, half red; ambient a little blue.
+    let light = ram.put(&[128, 0, 0, 0, 128, 0, 0, 0, 0, 0, 127, 0, 0, 0, 0, 0]);
+    let ambient = ram.put(&[0, 0, 51, 0, 0, 0, 51, 0]);
+    let mut dl = Dl::default();
+    setup(&mut ram, &mut dl);
+    dl.geometry(0, G_LIGHTING)
+        .num_lights(1)
+        .light(light, 1)
+        .light(ambient, 2)
+        .vtx(verts, 1, 0)
+        .tri(0, 0, 0)
+        .end();
+    let addr = ram.dl(&dl);
+    let f = run(&ram, addr);
+    let c = f.vertices[0].color;
+    assert!((c[0] - 128.0 / 255.0).abs() < 1e-5, "{c:?}");
+    assert_eq!(c[1], 0.0);
+    assert!((c[2] - 0.2).abs() < 1e-5, "{c:?}");
+    assert_eq!(c[3], 200.0 / 255.0);
+}
+
+#[test]
+fn culling_both_faces_drops_triangles() {
+    let mut ram = Ram::default();
+    let verts = ram.vertices(&[v(0, 0, 0, [255; 4]); 3]);
+    let mut dl = Dl::default();
+    setup(&mut ram, &mut dl);
+    dl.geometry(0, G_CULL_FRONT | G_CULL_BACK)
+        .vtx(verts, 3, 0)
+        .tri(0, 1, 2)
+        .end();
+    let addr = ram.dl(&dl);
+    assert_eq!(run(&ram, addr).vertices.len(), 0);
+}
+
+#[test]
+fn bad_lists_are_errors_or_warnings() {
+    let mut ram = Ram::default();
+    let mut it = Interpreter::new();
+    // Starts outside RAM.
+    assert!(matches!(
+        it.run(&ram.bytes, 0x00F0_0000),
+        Err(GfxError::OutOfRange { .. })
+    ));
+    // Branches to itself forever.
+    let at = ram.put(&[0; 8]);
+    let mut dl = Dl::default();
+    dl.branch(at);
+    ram.bytes[at as usize..at as usize + 8].copy_from_slice(
+        &dl.0
+            .iter()
+            .flat_map(|w| w.to_be_bytes())
+            .collect::<Vec<_>>(),
+    );
+    assert!(matches!(
+        it.run(&ram.bytes, at),
+        Err(GfxError::TooLong { .. })
+    ));
+    // An unknown command is skipped with a warning.
+    let mut dl = Dl::default();
+    dl.0.extend([0x7700_0000, 0]);
+    dl.end();
+    let addr = ram.dl(&dl);
+    let mut it = Interpreter::new();
+    it.run(&ram.bytes, addr).unwrap();
+    assert_eq!(it.take_frame().warnings.len(), 1);
+}
+
+#[test]
+fn state_carries_over_between_tasks_but_frames_are_separate() {
+    let mut ram = Ram::default();
+    let verts = ram.vertices(&[v(0, 0, 0, [255; 4]); 3]);
+    let mut first = Dl::default();
+    setup(&mut ram, &mut first);
+    first.segment(6, verts).end();
+    let first = ram.dl(&first);
+    let mut second = Dl::default();
+    second.vtx(0x0600_0000, 3, 0).tri(0, 1, 2).end();
+    let second = ram.dl(&second);
+    let mut it = Interpreter::new();
+    it.run(&ram.bytes, first).unwrap();
+    it.run(&ram.bytes, second).unwrap();
+    assert_eq!(it.take_frame().vertices.len(), 3);
+    assert_eq!(it.take_frame().vertices.len(), 0);
+}
+
+#[test]
+fn texture_rectangle_maps_texels_to_pixels() {
+    let mut ram = Ram::default();
+    let tex = ram.put(&[0xFF; 32]); // 4x4 RGBA16 white
+    let mut dl = Dl::default();
+    setup(&mut ram, &mut dl);
+    dl.other_modes(CYCLE_1, 0)
+        .timg(0, 2, 1, tex)
+        .tile(0, 2, 0, 0, 7)
+        .load_block(7, 16)
+        .tile(0, 2, 1, 0, 0)
+        .tile_size(0, 4, 4)
+        // 8x8 pixels at half a texel per pixel, starting at texel (0, 0).
+        .tex_rect(0, [10, 20, 18, 28], [0, 0], [1 << 9, 1 << 9])
+        .end();
+    let addr = ram.dl(&dl);
+    let f = run(&ram, addr);
+    let d = f.draws().next().unwrap();
+    assert!(d.state.rect && d.state.textures[0].is_some());
+    let corners: Vec<_> = f.vertices[..6].iter().map(|v| (v.pos, v.uv[0])).collect();
+    assert!(
+        corners.contains(&([10.0, 20.0, -1.0], [0.0, 0.0])),
+        "{corners:?}"
+    );
+    assert!(
+        corners.contains(&([18.0, 28.0, -1.0], [1.0, 1.0])),
+        "{corners:?}"
+    );
+}
+
+#[test]
+fn malformed_lengths_from_guest_data_do_not_panic() {
+    let mut ram = Ram::default();
+    let mut dl = Dl::default();
+    // Other-mode writes with a length field of 0xFF (256 bits) and shifts
+    // that would run past the word.
+    dl.0.extend([0xE200_00FF, 0x1234_5678, 0xE3FF_00FF, 0xFFFF_FFFF]);
+    dl.0.extend([0xE2FF_FF1F, 0xFFFF_FFFF]);
+    // Pop far more matrices than were pushed.
+    dl.0.extend([0xD838_0002, 0xFFFF_FFC0]);
+    // A one-pixel-wide colour image still gives a usable height.
+    dl.cimg(0x0F_0000, 1);
+    dl.end();
+    let addr = ram.dl(&dl);
+    let f = run(&ram, addr);
+    assert_eq!(f.height(), 1);
+}

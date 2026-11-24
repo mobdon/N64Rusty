@@ -61,6 +61,25 @@ Read for instruction behaviour; no text or tables are copied.
 - cpal (https://github.com/RustAudio/cpal), Apache-2.0: speaker output in
   `crates/audio`, only with its `speaker` feature.
 
+## Graphics
+
+Read for command layouts and hardware behaviour; no text, tables or code are
+copied. The renderer is a high-level reimplementation: it never runs the
+graphics microcode.
+
+- N64brew wiki (https://n64brew.dev), community hardware documentation:
+  display-list command encodings for the F3DEX2 microcode, the fixed-point
+  formats of matrices, vertices, viewports and lights, texture memory, tile
+  descriptors and texel formats, the colour combiner inputs and the blender
+  and other-mode bits.
+- The publicly documented N64 graphics binary interface (the `gbi.h`
+  command macros as described in the N64 programming manuals and the
+  N64brew wiki): the same encodings, cross-checked.
+- wgpu (https://github.com/gfx-rs/wgpu, MIT OR Apache-2.0), png
+  (https://github.com/image-rs/image-png, MIT OR Apache-2.0) and pollster
+  (https://github.com/zesterer/pollster, MIT OR Apache-2.0) are used as
+  ordinary dependencies.
+
 ## Adding a source
 
 Every new source gets an entry here before its influence lands: name, link,

@@ -91,24 +91,25 @@ impl KeyMap {
     /// Controller state with these keys held.
     pub fn pad(&self, held: &HashSet<KeyCode>) -> Pad {
         let mut pad = Pad::default();
-        let (mut x, mut y, mut half) = (0i8, 0i8, false);
+        let (mut up, mut down, mut left, mut right, mut half) = (false, false, false, false, false);
         for (key, binding) in &self.0 {
             if !held.contains(key) {
                 continue;
             }
             match binding {
                 Binding::Button(b) => pad.buttons |= b,
-                Binding::StickUp => y = 1,
-                Binding::StickDown => y = -1,
-                Binding::StickLeft => x = -1,
-                Binding::StickRight => x = 1,
+                Binding::StickUp => up = true,
+                Binding::StickDown => down = true,
+                Binding::StickLeft => left = true,
+                Binding::StickRight => right = true,
                 Binding::Half => half = true,
             }
         }
         // shortcut: diagonals reach the square's corner, not the stick's octagonal gate; fine for menus and movement, revisit if a game reads the stick's magnitude.
         let reach = if half { STICK_MAX / 2 } else { STICK_MAX };
-        pad.x = x * reach;
-        pad.y = y * reach;
+        // Opposite keys held together cancel out, like a centred stick.
+        pad.x = (right as i8 - left as i8) * reach;
+        pad.y = (up as i8 - down as i8) * reach;
         pad
     }
 }
@@ -189,6 +190,10 @@ mod tests {
             KeyCode::ArrowRight,
         ];
         assert_eq!(map.pad(&held(&arrows)), Pad::default());
+        let all = [KeyCode::KeyW, KeyCode::KeyA, KeyCode::KeyS, KeyCode::KeyD];
+        assert_eq!(map.pad(&held(&all)), Pad::default());
+        let up_left = map.pad(&held(&[KeyCode::KeyW, KeyCode::KeyS, KeyCode::KeyA]));
+        assert_eq!((up_left.x, up_left.y), (-STICK_MAX, 0));
         assert!(map.0.iter().all(|(k, _)| !arrows.contains(k)));
     }
 

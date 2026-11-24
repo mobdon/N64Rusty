@@ -24,7 +24,7 @@ use std::thread;
 pub type Request = (String, Sender<String>);
 
 pub struct DebugPort {
-    addr: SocketAddr,
+    pub(crate) addr: SocketAddr,
     pub(crate) requests: Receiver<Request>,
 }
 
@@ -51,9 +51,19 @@ impl DebugPort {
 
 fn serve(stream: TcpStream, tx: Sender<Request>) -> io::Result<()> {
     let mut out = stream.try_clone()?;
-    for line in BufReader::new(stream).lines() {
+    let mut input = BufReader::new(stream);
+    let mut bytes = Vec::new();
+    loop {
+        bytes.clear();
+        if input.read_until(b'\n', &mut bytes)? == 0 {
+            break;
+        }
+        // Lossy, so a garbled line gets an `err` reply rather than a dropped connection.
+        let line = String::from_utf8_lossy(&bytes)
+            .trim_end_matches(['\r', '\n'])
+            .to_string();
         let (reply_tx, reply_rx) = channel();
-        if tx.send((line?, reply_tx)).is_err() {
+        if tx.send((line, reply_tx)).is_err() {
             break;
         }
         match reply_rx.recv() {
