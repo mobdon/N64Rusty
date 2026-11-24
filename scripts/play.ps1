@@ -28,7 +28,8 @@ if (Test-Path -LiteralPath $Rom -PathType Container) {
     $Rom = $found.FullName
 }
 Write-Host "ROM: $Rom"
-$Symbols = @($Symbols | ForEach-Object { (Resolve-Path -LiteralPath $_).Path })
+# `powershell -File` passes "a","b" as one string "a,b", so split it.
+$Symbols = @($Symbols | ForEach-Object { $_ -split "," } | Where-Object { $_ } | ForEach-Object { (Resolve-Path -LiteralPath $_).Path })
 $sym = @($Symbols | ForEach-Object { "--symbols"; $_ })
 Set-Location (Join-Path $PSScriptRoot "..")
 $repo = (Get-Location).Path
