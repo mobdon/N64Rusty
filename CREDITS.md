@@ -55,6 +55,11 @@ Read for instruction behaviour; no text or tables are copied.
   `crates/audio` is written from those descriptions; no microcode, tables or
   code are copied. The microcode's resampling filter table is not
   reproduced (the host uses its own Catmull-Rom interpolation).
+- mupen64plus-rsp-hle (https://github.com/mupen64plus/mupen64plus-rsp-hle),
+  GPL-2.0: read as a hardware reference only, for the `n_audio`
+  microcode's command layout (fixed DMEM buffers, packed offsets and
+  counts), its linear envelope ramp and its pole filter. No code or tables
+  are copied; `crates/audio` implements them independently.
 
 ## Dependencies
 

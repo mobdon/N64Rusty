@@ -1,5 +1,7 @@
-//! Interpreter for audio command lists in the standard audio microcode's
-//! command set.
+//! Interpreter for audio command lists, in the two command sets the system
+//! library's audio code uses: the standard set, and the set of the
+//! alternative `n_audio` library, whose microcode works on a fixed DMEM
+//! layout and packs buffer offsets and counts into each command.
 //!
 //! Each command is two big-endian words: the top byte of the first word is
 //! the opcode. Commands work on a 4 KiB data memory (DMEM) holding 16-bit
@@ -28,6 +30,7 @@ const A_AUX: u8 = 0x08;
 /// Keep one per game: like the RSP, it keeps segment bases, buffer settings,
 /// volumes and the ADPCM codebook between tasks.
 pub struct AudioRsp {
+    n_audio: bool,
     dmem: Box<[u8; DMEM]>,
     segments: [u32; 16],
     inp: u16,
@@ -51,9 +54,21 @@ impl Default for AudioRsp {
     }
 }
 
+// Fixed DMEM layout of the `n_audio` microcode: every command works on one
+// subframe of 184 samples.
+const N_COUNT: u16 = 0x170;
+const N_MAIN: u16 = 0x4F0;
+const N_MAIN2: u16 = 0x660;
+const N_DRY_LEFT: u16 = 0x9D0;
+const N_DRY_RIGHT: u16 = 0xB40;
+const N_WET_LEFT: u16 = 0xCB0;
+const N_WET_RIGHT: u16 = 0xE20;
+
 impl AudioRsp {
+    /// For games using the standard audio library.
     pub fn new() -> Self {
         Self {
+            n_audio: false,
             dmem: Box::new([0; DMEM]),
             segments: [0; 16],
             inp: 0,
@@ -72,12 +87,25 @@ impl AudioRsp {
         }
     }
 
+    /// For games using the alternative `n_audio` library.
+    pub fn n_audio() -> Self {
+        Self {
+            n_audio: true,
+            ..Self::new()
+        }
+    }
+
     /// Runs the `len`-byte command list at `list` in guest RAM, as the RSP
     /// does for an audio task. Panics on a command it does not implement,
     /// naming it, so the first one a game uses is easy to find.
     pub fn run(&mut self, ram: &mut Memory, list: u32, len: u32) {
         for at in (list..list + len).step_by(8) {
-            self.command(ram, ram.read_u32(at), ram.read_u32(at + 4));
+            let (w0, w1) = (ram.read_u32(at), ram.read_u32(at + 4));
+            if self.n_audio {
+                self.n_command(ram, w0, w1);
+            } else {
+                self.command(ram, w0, w1);
+            }
         }
     }
 
@@ -85,24 +113,18 @@ impl AudioRsp {
         let flags = (w0 >> 16) as u8;
         let lo0 = w0 as u16;
         let (hi1, lo1) = ((w1 >> 16) as u16, w1 as u16);
+        let (inp, out, count) = (self.inp, self.out, self.count);
         match w0 >> 24 {
             0 => {}
-            1 => self.adpcm(ram, flags, self.addr(w1)),
-            2 => (0..lo1).for_each(|i| self.dmem[(lo0 + i) as usize & MASK] = 0),
-            3 => self.envmixer(ram, flags, self.addr(w1)),
-            4 => {
-                let src = self.addr(w1);
-                for i in 0..self.count {
-                    self.dmem[(self.inp + i) as usize & MASK] = ram.read_u8(src + i as u32);
-                }
+            1 => self.adpcm(ram, flags, self.addr(w1), inp, out, count),
+            2 => self.clear(lo0, lo1),
+            3 => {
+                let outs = [out, self.dry_right, self.wet_left, self.wet_right];
+                self.envmix_exp(ram, flags, self.addr(w1), inp, outs, count);
             }
-            5 => self.resample(ram, flags, lo0, self.addr(w1)),
-            6 => {
-                let dst = self.addr(w1);
-                for i in 0..self.count {
-                    ram.write_u8(dst + i as u32, self.dmem[(self.out + i) as usize & MASK]);
-                }
-            }
+            4 => self.load(ram, self.addr(w1), inp, count),
+            5 => self.resample(ram, flags, lo0, self.addr(w1), inp, out, count),
+            6 => self.save(ram, self.addr(w1), out, count),
             7 => self.segments[(w1 >> 24) as usize & 0xF] = w1 & 0xFF_FFFF,
             8 if flags & A_AUX != 0 => {
                 (self.dry_right, self.wet_left, self.wet_right) = (lo0, hi1, lo1)
@@ -117,40 +139,116 @@ impl AudioRsp {
                     (self.target[ch], self.rate[ch]) = (lo0 as i16, w1 as i32);
                 }
             }
-            10 => {
-                let bytes: Vec<u8> = (0..lo1)
-                    .map(|i| self.dmem[(lo0 + i) as usize & MASK])
-                    .collect();
-                for (i, b) in bytes.into_iter().enumerate() {
-                    self.dmem[(hi1 as usize + i) & MASK] = b;
-                }
-            }
-            11 => {
-                let src = self.addr(w1);
-                for (i, c) in self.book.iter_mut().take(lo0 as usize / 2).enumerate() {
-                    *c = ram.read_u16(src + 2 * i as u32) as i16;
-                }
-            }
-            12 => {
-                let gain = lo0 as i16 as i32;
-                for i in (0..self.count).step_by(2) {
-                    let v = (self.ld(hi1 + i) as i32 * gain) >> 15;
-                    self.add(lo1 + i, v);
-                }
-            }
-            13 => {
-                let n = self.count / 2;
-                let lr: Vec<(i16, i16)> = (0..n)
-                    .map(|i| (self.ld(hi1 + 2 * i), self.ld(lo1 + 2 * i)))
-                    .collect();
-                for (i, (l, r)) in lr.into_iter().enumerate() {
-                    let at = self.out + 4 * i as u16;
-                    self.st(at, l);
-                    self.st(at + 2, r);
-                }
-            }
+            10 => self.dmem_move(lo0, hi1, lo1),
+            11 => self.load_book(ram, self.addr(w1), lo0),
+            12 => self.mix(lo0 as i16, hi1, lo1, count),
+            13 => self.interleave(out, hi1, lo1, count),
             15 => self.loop_addr = self.addr(w1),
             op => panic!("audio command {op:#x} not implemented ({w0:08x} {w1:08x})"),
+        }
+    }
+
+    /// The `n_audio` command set. Opcodes keep their standard meanings, but
+    /// buffers are offsets from the main buffer, counts are fixed at one
+    /// subframe, addresses are physical, and there is no SETBUFF or SEGMENT.
+    /// Opcode 14 is the pole filter, the form games have been seen to send.
+    fn n_command(&mut self, ram: &mut Memory, w0: u32, w1: u32) {
+        let flags = (w0 >> 16) as u8;
+        let lo0 = w0 as u16;
+        let (hi1, lo1) = ((w1 >> 16) as u16, w1 as u16);
+        let a0 = w0 & 0xFF_FFFF;
+        let a1 = w1 & 0xFF_FFFF;
+        // Offset and count fields of LOADBUFF and SAVEBUFF.
+        let (off12, count12) = (N_MAIN + (w0 & 0xFFF) as u16, ((w0 >> 12) & 0xFFF) as u16);
+        match w0 >> 24 {
+            0 => {}
+            1 => {
+                let flags = (w1 >> 28) as u8;
+                let count = ((w1 >> 16) & 0xFFF) as u16;
+                let inp = N_MAIN + ((w1 >> 12) & 0xF) as u16;
+                let out = N_MAIN + (w1 & 0xFFF) as u16;
+                self.adpcm(ram, flags, a0, inp, out, count);
+            }
+            2 => self.clear(N_MAIN + lo0, lo1 & 0xFFF),
+            3 => {
+                self.vol[1] = lo0 as i16;
+                self.envmix_lin(ram, flags, a1);
+            }
+            4 => self.load(ram, a1, off12, count12),
+            5 => {
+                let flags = (w1 >> 30) as u8;
+                let pitch = (w1 >> 14) as u16;
+                let inp = N_MAIN + ((w1 >> 2) & 0xFFF) as u16;
+                let out = if w1 & 3 != 0 { N_MAIN2 } else { N_MAIN };
+                self.resample(ram, flags, pitch, a0, inp, out, N_COUNT);
+            }
+            6 => self.save(ram, a1, off12, count12),
+            9 if flags & A_VOL != 0 && flags & A_LEFT != 0 => {
+                (self.vol[0], self.dry, self.wet) = (lo0 as i16, hi1 as i16, lo1 as i16)
+            }
+            9 if flags & A_VOL != 0 => (self.target[1], self.rate[1]) = (lo0 as i16, w1 as i32),
+            9 => (self.target[0], self.rate[0]) = (lo0 as i16, w1 as i32),
+            10 => self.dmem_move(N_MAIN + lo0, N_MAIN + hi1, (lo1 + 3) & !3),
+            11 => self.load_book(ram, a1, lo0),
+            12 => self.mix(lo0 as i16, N_MAIN + hi1, N_MAIN + lo1, N_COUNT),
+            13 => self.interleave(N_MAIN, N_DRY_LEFT, N_DRY_RIGHT, N_COUNT),
+            14 => {
+                let buf = if w1 >> 24 == 0 { N_MAIN } else { N_MAIN2 };
+                self.pole_filter(ram, flags, lo0, buf, a1);
+            }
+            15 => self.loop_addr = a1,
+            op => panic!("n_audio command {op:#x} not implemented ({w0:08x} {w1:08x})"),
+        }
+    }
+
+    fn clear(&mut self, at: u16, count: u16) {
+        (0..count).for_each(|i| self.dmem[(at + i) as usize & MASK] = 0);
+    }
+
+    fn load(&mut self, ram: &Memory, src: u32, at: u16, count: u16) {
+        for i in 0..count {
+            self.dmem[(at + i) as usize & MASK] = ram.read_u8(src + i as u32);
+        }
+    }
+
+    fn save(&self, ram: &mut Memory, dst: u32, at: u16, count: u16) {
+        for i in 0..count {
+            ram.write_u8(dst + i as u32, self.dmem[(at + i) as usize & MASK]);
+        }
+    }
+
+    fn dmem_move(&mut self, from: u16, to: u16, count: u16) {
+        let bytes: Vec<u8> = (0..count)
+            .map(|i| self.dmem[(from + i) as usize & MASK])
+            .collect();
+        for (i, b) in bytes.into_iter().enumerate() {
+            self.dmem[(to as usize + i) & MASK] = b;
+        }
+    }
+
+    fn load_book(&mut self, ram: &Memory, src: u32, bytes: u16) {
+        for (i, c) in self.book.iter_mut().take(bytes as usize / 2).enumerate() {
+            *c = ram.read_u16(src + 2 * i as u32) as i16;
+        }
+    }
+
+    /// Saturating `out += in * gain` (gain Q15) over `count` bytes.
+    fn mix(&mut self, gain: i16, inp: u16, out: u16, count: u16) {
+        for i in (0..count).step_by(2) {
+            let v = (self.ld(inp + i) as i32 * gain as i32) >> 15;
+            self.add(out + i, v);
+        }
+    }
+
+    /// Left and right buffers of `count` bytes each into one stereo buffer.
+    fn interleave(&mut self, out: u16, left: u16, right: u16, count: u16) {
+        let lr: Vec<(i16, i16)> = (0..count / 2)
+            .map(|i| (self.ld(left + 2 * i), self.ld(right + 2 * i)))
+            .collect();
+        for (i, (l, r)) in lr.into_iter().enumerate() {
+            let at = out + 4 * i as u16;
+            self.st(at, l);
+            self.st(at + 2, r);
         }
     }
 
@@ -178,8 +276,8 @@ impl AudioRsp {
     /// VADPCM decode: each 9-byte frame is a header (scale shift, predictor
     /// index) and 16 four-bit residuals, decoded 8 at a time with the
     /// predictor's two rows of 8 coefficients (Q11) from the codebook.
-    fn adpcm(&mut self, ram: &mut Memory, flags: u8, state: u32) {
-        let frames = (self.count as usize).div_ceil(32);
+    fn adpcm(&mut self, ram: &mut Memory, flags: u8, state: u32, inp: u16, out: u16, count: u16) {
+        let frames = (count as usize).div_ceil(32);
         if frames == 0 {
             return;
         }
@@ -193,7 +291,7 @@ impl AudioRsp {
             p2 = ram.read_u16(src + 28) as i16 as i64;
             p1 = ram.read_u16(src + 30) as i16 as i64;
         }
-        let (mut inp, mut out) = (self.inp, self.out);
+        let (mut inp, mut out) = (inp, out);
         for _ in 0..frames {
             let header = self.dmem[inp as usize & MASK];
             inp += 1;
@@ -243,7 +341,17 @@ impl AudioRsp {
     /// the interpolation if a test against hardware captures ever needs it.
     ///
     /// State: 4 history samples then the 16-bit position fraction.
-    fn resample(&mut self, ram: &mut Memory, flags: u8, pitch: u16, state: u32) {
+    #[allow(clippy::too_many_arguments)]
+    fn resample(
+        &mut self,
+        ram: &mut Memory,
+        flags: u8,
+        pitch: u16,
+        state: u32,
+        inp: u16,
+        out: u16,
+        count: u16,
+    ) {
         let mut s: Vec<i32> = vec![0; 4];
         let mut pos = 0u64;
         if flags & A_INIT == 0 {
@@ -253,9 +361,9 @@ impl AudioRsp {
             pos = ram.read_u16(state + 8) as u64;
         }
         let step = pitch as u64 * 2;
-        let n_out = self.count / 2;
+        let n_out = count / 2;
         let n_in = ((pos + step * n_out as u64) >> 16) as u16;
-        s.extend((0..n_in).map(|i| self.ld(self.inp + 2 * i) as i32));
+        s.extend((0..n_in).map(|i| self.ld(inp + 2 * i) as i32));
         for j in 0..n_out {
             let i = (pos >> 16) as usize;
             let t = (pos & 0xFFFF) as f32 / 65536.0;
@@ -263,7 +371,7 @@ impl AudioRsp {
             let v = b + 0.5
                 * t
                 * (c - a + t * (2.0 * a - 5.0 * b + 4.0 * c - d + t * (3.0 * (b - c) + d - a)));
-            self.st(self.out + 2 * j, clamp(v.round() as i64));
+            self.st(out + 2 * j, clamp(v.round() as i64));
             pos += step;
         }
         let n = n_in as usize;
@@ -280,7 +388,15 @@ impl AudioRsp {
     /// (Q16) until they reach their target.
     ///
     /// State: volume (Q16) for left and right, targets, rates, dry, wet.
-    fn envmixer(&mut self, ram: &mut Memory, flags: u8, state: u32) {
+    fn envmix_exp(
+        &mut self,
+        ram: &mut Memory,
+        flags: u8,
+        state: u32,
+        inp: u16,
+        outs: [u16; 4],
+        count: u16,
+    ) {
         let mut vol = self.vol.map(|v| (v as i64) << 16);
         let (mut target, mut rate, mut dry, mut wet) = (self.target, self.rate, self.dry, self.wet);
         if flags & A_INIT == 0 {
@@ -290,9 +406,8 @@ impl AudioRsp {
             rate = [w(4) as i32, w(5) as i32];
             (dry, wet) = (w(6) as i16, w(7) as i16);
         }
-        let outs = [self.out, self.dry_right, self.wet_left, self.wet_right];
-        for i in 0..self.count / 2 {
-            let x = self.ld(self.inp + 2 * i) as i64;
+        for i in 0..count / 2 {
+            let x = self.ld(inp + 2 * i) as i64;
             for ch in 0..2 {
                 let g = (x * (vol[ch] >> 16)) >> 15;
                 self.add(outs[ch] + 2 * i, ((g * dry as i64) >> 15) as i32);
@@ -323,6 +438,93 @@ impl AudioRsp {
         ];
         for (i, w) in words.into_iter().enumerate() {
             ram.write_u32(state + 4 * i as u32, w);
+        }
+    }
+
+    /// `n_audio` envelope mixer: the main buffer, scaled by left and right
+    /// volumes that move linearly towards their targets by `rate / 8` (Q16)
+    /// per sample, is added with the dry gain to the dry buffers and with the
+    /// wet gain to the wet buffers.
+    ///
+    /// State: the same layout as the standard mixer, with steps for rates.
+    fn envmix_lin(&mut self, ram: &mut Memory, flags: u8, state: u32) {
+        let mut vol = self.vol.map(|v| (v as i64) << 16);
+        let mut target = self.target.map(|t| (t as i64) << 16);
+        let mut step = self.rate.map(|r| (r / 8) as i64);
+        let (mut dry, mut wet) = (self.dry, self.wet);
+        if flags & A_INIT == 0 {
+            let w = |i: u32| ram.read_u32(state + 4 * i) as i32 as i64;
+            vol = [w(0), w(1)];
+            target = [w(2) << 16, w(3) << 16];
+            step = [w(4), w(5)];
+            (dry, wet) = (w(6) as i16, w(7) as i16);
+        }
+        let outs = [N_DRY_LEFT, N_DRY_RIGHT, N_WET_LEFT, N_WET_RIGHT];
+        for i in 0..N_COUNT / 2 {
+            for ch in 0..2 {
+                vol[ch] += step[ch];
+                let reached = if step[ch] <= 0 {
+                    vol[ch] <= target[ch]
+                } else {
+                    vol[ch] >= target[ch]
+                };
+                if reached {
+                    (vol[ch], step[ch]) = (target[ch], 0);
+                }
+            }
+            let x = self.ld(N_MAIN + 2 * i) as i32;
+            for (k, out) in outs.into_iter().enumerate() {
+                let g = if k < 2 { dry } else { wet } as i64;
+                let gain = clamp(((vol[k % 2] >> 16) * g + 0x4000) >> 15) as i32;
+                self.add(out + 2 * i, (x * gain) >> 15);
+            }
+        }
+        let words = [
+            vol[0],
+            vol[1],
+            target[0] >> 16,
+            target[1] >> 16,
+            step[0],
+            step[1],
+            dry as i64,
+            wet as i64,
+        ];
+        for (i, w) in words.into_iter().enumerate() {
+            ram.write_u32(state + 4 * i as u32, w as u32);
+        }
+    }
+
+    /// Two-pole filter over one subframe of `buf`, in place, with the two
+    /// rows of 8 coefficients loaded into the codebook and `gain` (Q14) on
+    /// the input. Like ADPCM decoding it works 8 samples at a time from the
+    /// last two outputs.
+    ///
+    /// State: the last 4 output samples.
+    fn pole_filter(&mut self, ram: &mut Memory, flags: u8, gain: u16, buf: u16, state: u32) {
+        let gain = gain as i64;
+        let h1: Vec<i64> = self.book[0..8].iter().map(|&c| c as i64).collect();
+        let h2: Vec<i64> = self.book[8..16].iter().map(|&c| c as i64).collect();
+        let h2g: Vec<i64> = h2.iter().map(|&c| (c * gain) >> 14).collect();
+        let (mut l1, mut l2) = (0i64, 0i64);
+        if flags & A_INIT == 0 {
+            l1 = ram.read_u16(state + 4) as i16 as i64;
+            l2 = ram.read_u16(state + 6) as i16 as i64;
+        }
+        for f in 0..N_COUNT / 16 {
+            let at = buf + 16 * f;
+            let x: Vec<i64> = (0..8).map(|i| self.ld(at + 2 * i) as i64).collect();
+            for i in 0..8 {
+                let mut acc = x[i] * gain + h1[i] * l1 + h2[i] * l2;
+                for k in 0..i {
+                    acc += h2g[k] * x[i - 1 - k];
+                }
+                self.st(at + 2 * i as u16, clamp(acc >> 14));
+            }
+            (l1, l2) = (self.ld(at + 12) as i64, self.ld(at + 14) as i64);
+        }
+        let end = buf + N_COUNT;
+        for i in 0..4u16 {
+            ram.write_u16(state + 2 * i as u32, self.ld(end - 8 + 2 * i) as u16);
         }
     }
 }
