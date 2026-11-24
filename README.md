@@ -21,6 +21,8 @@ crate that compiles. Floating point and the rest of the console come next.
 | `n64rusty-rom` | `crates/rom` | ROM loading: byte order, SHA-256, header, boot code variant |
 | `n64rusty-refcpu` | `crates/refcpu` | Reference VR4300 interpreter, used only by tests |
 | `n64rusty-conformance` | `crates/conformance` | Per-instruction tests: translated code against the reference CPU |
+| `n64rusty-gfx` | `crates/gfx` | High-level display-list interpreter and headless wgpu renderer with PNG capture |
+
 | `n64rusty-host` | `crates/host` | Window, frame pacing, controllers, input record and replay, per-run config, debug port |
 
 ```
@@ -82,6 +84,26 @@ it).
 
 Tests use the headless path only. To try the window and your controllers by
 hand: `cargo run -p n64rusty-host --example window [run.toml]`.
+
+## Graphics
+
+`n64rusty-gfx` does not run the graphics microcode. It reads the display
+lists a game builds in guest RAM (F3DEX2 encoding), does the vertex work
+itself (matrix stack, lighting, texture coordinates, texture memory and
+texel formats), and records triangles with their colour-combiner and
+render-mode state. A wgpu renderer then draws each frame offscreen, with a
+fragment shader generated per combiner setting, and can save chosen frames
+as PNG files. Nothing opens a window.
+
+Vertices stay in object space with their model-view, projection and
+viewport kept apart until drawing, so widescreen and in-between frames for
+high refresh rates can be added later without changing game speed.
+
+```
+cargo run -p n64rusty-gfx --example synthetic -- out.png
+```
+
+draws a hand-built display list. Tests use only synthetic lists.
 
 ## How translation works
 

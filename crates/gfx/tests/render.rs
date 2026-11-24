@@ -1,0 +1,262 @@
+//! Rendering synthetic display lists headlessly and checking pixels.
+//!
+//! Needs a GPU or a software adapter. Without one these tests are skipped
+//! with a message, unless `N64RUSTY_REQUIRE_GPU` is set (CI sets it), in
+//! which case they fail.
+
+mod common;
+
+use common::*;
+use n64rusty_gfx::{Capture, Combiner, Frame, Image, Interpreter, Renderer};
+
+fn renderer() -> Option<Renderer> {
+    match Renderer::new() {
+        Ok(r) => {
+            eprintln!("adapter: {}", r.adapter_name());
+            Some(r)
+        }
+        Err(e) if std::env::var_os("N64RUSTY_REQUIRE_GPU").is_none() => {
+            eprintln!("skipping: {e}");
+            None
+        }
+        Err(e) => panic!("{e}"),
+    }
+}
+
+fn frame(ram: &mut Ram, dl: &Dl) -> Frame {
+    let addr = ram.dl(dl);
+    let mut it = Interpreter::new();
+    it.run(&ram.bytes, addr).expect("display list runs");
+    it.take_frame()
+}
+
+fn near(a: [u8; 4], b: [u8; 4]) -> bool {
+    a.iter().zip(b).all(|(x, y)| x.abs_diff(y) <= 3)
+}
+
+#[track_caller]
+fn assert_px(img: &Image, x: u32, y: u32, want: [u8; 4]) {
+    let got = img.pixel(x, y);
+    assert!(
+        near(got, want),
+        "pixel ({x}, {y}) is {got:?}, want {want:?}"
+    );
+}
+
+/// Clear to blue with a fill rectangle, then the given body.
+fn scene(ram: &mut Ram, body: impl FnOnce(&mut Ram, &mut Dl)) -> Dl {
+    let mut dl = Dl::default();
+    setup(ram, &mut dl);
+    dl.other_modes(CYCLE_FILL, 0)
+        .cimg(0x0E_0000, 320)
+        .fill_color(0xFFFC_FFFC)
+        .fill_rect(0, 0, 319, 239)
+        .cimg(0x0F_0000, 320)
+        .fill_color(0x003F_003F)
+        .fill_rect(0, 0, 319, 239);
+    body(ram, &mut dl);
+    dl.end();
+    dl
+}
+
+const BLUE: [u8; 4] = [0, 0, 255, 255];
+const RED: [u8; 4] = [255, 0, 0, 255];
+
+#[test]
+fn fill_then_primitive_triangle() {
+    let Some(mut r) = renderer() else { return };
+    let mut ram = Ram::default();
+    let verts = ram.vertices(&[
+        v(-50, -50, 0, [255; 4]),
+        v(50, -50, 0, [255; 4]),
+        v(0, 50, 0, [255; 4]),
+    ]);
+    let dl = scene(&mut ram, |_, dl| {
+        dl.other_modes(CYCLE_1, 0)
+            .combine(pass(PRIM))
+            .prim(0xFF00_00FF)
+            .vtx(verts, 3, 0)
+            .tri(0, 1, 2);
+    });
+    let f = frame(&mut ram, &dl);
+    for scale in [1, 2] {
+        let img = r.render(&f, 320 * scale, 240 * scale).unwrap();
+        // Object y is up: the apex (0, 50) is above the centre.
+        assert_px(&img, 160 * scale, 130 * scale, RED);
+        assert_px(&img, 160 * scale, 50 * scale, BLUE);
+        assert_px(&img, 5, 5, BLUE);
+    }
+}
+
+#[test]
+fn shade_is_interpolated_and_combined() {
+    let Some(mut r) = renderer() else { return };
+    let mut ram = Ram::default();
+    let white = [255; 4];
+    let verts = ram.vertices(&[
+        v(-100, -100, 0, white),
+        v(100, -100, 0, white),
+        v(100, 100, 0, white),
+        v(-100, 100, 0, [0, 0, 0, 255]),
+    ]);
+    // (SHADE - 0) * ENV + 0: white shade times a green environment.
+    let modulate = Combiner::both([SHADE, 15, ENV, 7], [SHADE, 7, ENV, 7]).to_raw();
+    let dl = scene(&mut ram, |_, dl| {
+        dl.other_modes(CYCLE_1, 0)
+            .geometry(0, G_SHADE | G_SHADING_SMOOTH)
+            .combine(modulate)
+            .env(0x00FF_00FF)
+            .vtx(verts, 4, 0)
+            .tri2([0, 1, 2], [0, 2, 3]);
+    });
+    let f = frame(&mut ram, &dl);
+    let img = r.render(&f, 320, 240).unwrap();
+    assert_px(&img, 315, 235, [0, 255, 0, 255]); // bottom right, all white
+    let mid = img.pixel(10, 10); // near the black top-left corner
+    assert!(mid[1] < 60 && mid[0] == 0, "{mid:?}");
+}
+
+#[test]
+fn textured_triangles_sample_the_texture() {
+    let Some(mut r) = renderer() else { return };
+    let mut ram = Ram::default();
+    // 2x2 RGBA16 checker, padded to one 64-bit line per row.
+    let mut tex = Vec::new();
+    for row in [[0xF801u16, 0x07C1], [0x07C1, 0xF801]] {
+        for t in row {
+            tex.extend_from_slice(&t.to_be_bytes());
+        }
+        tex.extend_from_slice(&[0; 4]);
+    }
+    let tex = ram.put(&tex);
+    let mut verts = [
+        v(-100, -100, 0, [255; 4]),
+        v(100, -100, 0, [255; 4]),
+        v(100, 100, 0, [255; 4]),
+        v(-100, 100, 0, [255; 4]),
+    ];
+    // Top of the screen is t = 0.
+    verts[0].st = [0, 2 << 5];
+    verts[1].st = [2 << 5, 2 << 5];
+    verts[2].st = [2 << 5, 0];
+    verts[3].st = [0, 0];
+    let verts = ram.vertices(&verts);
+    let dl = scene(&mut ram, |_, dl| {
+        dl.other_modes(CYCLE_1 | FILTER_POINT, 0)
+            .combine(pass(TEXEL0))
+            .texture(true, 0)
+            .timg(0, 2, 1, tex)
+            .tile(0, 2, 0, 0, 7)
+            .load_block(7, 8)
+            .tile(0, 2, 1, 0, 0)
+            .tile_size(0, 2, 2)
+            .vtx(verts, 4, 0)
+            .tri2([0, 1, 2], [0, 2, 3]);
+    });
+    let f = frame(&mut ram, &dl);
+    let img = r.render(&f, 320, 240).unwrap();
+    let green = [0, 255, 0, 255];
+    assert_px(&img, 80, 60, RED);
+    assert_px(&img, 240, 60, green);
+    assert_px(&img, 80, 180, green);
+    assert_px(&img, 240, 180, RED);
+}
+
+#[test]
+fn depth_buffer_keeps_the_nearer_triangle() {
+    let Some(mut r) = renderer() else { return };
+    let mut ram = Ram::default();
+    // Two full-screen quads; the red one is nearer but drawn first.
+    let quad = |z, c| {
+        [
+            v(-100, -100, z, c),
+            v(100, -100, z, c),
+            v(100, 100, z, c),
+            v(-100, 100, z, c),
+        ]
+    };
+    let mut both = quad(-50, [255, 0, 0, 255]).to_vec();
+    both.extend(quad(50, [0, 255, 0, 255]));
+    let verts = ram.vertices(&both);
+    let dl = scene(&mut ram, |_, dl| {
+        dl.other_modes(CYCLE_1, ZBUF)
+            .geometry(0, G_ZBUFFER | G_SHADE | G_SHADING_SMOOTH)
+            .combine(pass(SHADE))
+            .vtx(verts, 8, 0)
+            .tri2([0, 1, 2], [0, 2, 3])
+            .tri2([4, 5, 6], [4, 6, 7]);
+    });
+    let f = frame(&mut ram, &dl);
+    let img = r.render(&f, 320, 240).unwrap();
+    assert_px(&img, 160, 120, RED);
+}
+
+#[test]
+fn translucent_render_mode_blends_with_the_framebuffer() {
+    let Some(mut r) = renderer() else { return };
+    let mut ram = Ram::default();
+    let c = [255, 0, 0, 128];
+    let verts = ram.vertices(&[
+        v(-100, -100, 0, c),
+        v(100, -100, 0, c),
+        v(100, 100, 0, c),
+        v(-100, 100, 0, c),
+    ]);
+    let dl = scene(&mut ram, |_, dl| {
+        dl.other_modes(CYCLE_1, XLU)
+            .geometry(0, G_SHADE | G_SHADING_SMOOTH)
+            .combine(pass(SHADE))
+            .vtx(verts, 4, 0)
+            .tri2([0, 1, 2], [0, 2, 3]);
+    });
+    let f = frame(&mut ram, &dl);
+    let img = r.render(&f, 320, 240).unwrap();
+    let p = img.pixel(160, 120);
+    assert!(
+        (120..=136).contains(&p[0]) && (119..=135).contains(&p[2]),
+        "{p:?}"
+    );
+}
+
+#[test]
+fn back_faces_are_culled() {
+    let Some(mut r) = renderer() else { return };
+    let mut ram = Ram::default();
+    // Clockwise on screen: a back face.
+    let verts = ram.vertices(&[
+        v(-50, -50, 0, [255; 4]),
+        v(0, 50, 0, [255; 4]),
+        v(50, -50, 0, [255; 4]),
+    ]);
+    let dl = scene(&mut ram, |_, dl| {
+        dl.other_modes(CYCLE_1, 0)
+            .geometry(0, G_CULL_BACK)
+            .combine(pass(PRIM))
+            .prim(0xFF00_00FF)
+            .vtx(verts, 3, 0)
+            .tri(0, 1, 2);
+    });
+    let f = frame(&mut ram, &dl);
+    let img = r.render(&f, 320, 240).unwrap();
+    assert_px(&img, 160, 130, BLUE);
+}
+
+#[test]
+fn captures_only_chosen_frames_to_png() {
+    let Some(mut r) = renderer() else { return };
+    let mut ram = Ram::default();
+    let dl = scene(&mut ram, |_, _| {});
+    let f = frame(&mut ram, &dl);
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("gfx-capture");
+    let _ = std::fs::remove_dir_all(&dir);
+    let cap = Capture::new(&dir, [2]);
+    assert_eq!(cap.frame(1, &mut r, &f).unwrap(), None);
+    let path = cap.frame(2, &mut r, &f).unwrap().expect("frame 2 saved");
+    let decoder = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(&path).unwrap()));
+    let mut reader = decoder.read_info().unwrap();
+    let mut buf = vec![0; reader.output_buffer_size().unwrap()];
+    let info = reader.next_frame(&mut buf).unwrap();
+    assert_eq!((info.width, info.height), (320, 240));
+    assert_eq!(&buf[..4], &BLUE);
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+}
