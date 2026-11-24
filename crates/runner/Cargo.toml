@@ -13,3 +13,4 @@ n64rusty-runtime.workspace = true
 n64rusty-rom = { path = "../rom" }
 n64rusty-gfx = { path = "../gfx" }
 n64rusty-audio = { path = "../audio" }
+n64rusty-host = { path = "../host" }
