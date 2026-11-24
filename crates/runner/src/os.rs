@@ -115,6 +115,22 @@ struct Thread {
     regs: Option<Box<Regs>>,
     /// Order of becoming ready, for round robin among equal priorities.
     seq: u64,
+    /// Which osCreateThread made this thread. A game may create a new
+    /// thread in the memory of one that is only stopped; the host thread
+    /// left from the old one must then never run again.
+    generation: u64,
+}
+
+thread_local! {
+    /// The generation of the guest thread this host thread runs.
+    static GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether this host thread still runs the guest thread `id`.
+fn still_mine(st: &State, id: u32) -> bool {
+    st.threads
+        .get(&id)
+        .is_some_and(|t| t.generation == GENERATION.with(|g| g.get()))
 }
 
 struct Timer {
@@ -419,7 +435,8 @@ fn reschedule(c: &mut Ctx, mut st: MutexGuard<'static, State>) -> MutexGuard<'st
         let spawn = !st.threads[&best].spawned;
         if spawn {
             st.threads.get_mut(&best).unwrap().spawned = true;
-            spawn_thread(best);
+            let generation = st.threads[&best].generation;
+            spawn_thread(best, generation);
         }
         os().cv.notify_all();
         if mine == Some(TState::Dead) {
@@ -430,6 +447,10 @@ fn reschedule(c: &mut Ctx, mut st: MutexGuard<'static, State>) -> MutexGuard<'st
             .cv
             .wait_while(st, |s| s.current != Some(me) || s.done.is_some())
             .unwrap_or_else(|e| e.into_inner());
+        if !still_mine(&st, me) {
+            // Replaced by a new thread in the same memory: retire.
+            park(st);
+        }
         if let Some(regs) = st.threads.get_mut(&me).and_then(|t| t.regs.take()) {
             regs.load(c);
         }
@@ -447,16 +468,20 @@ fn park(mut st: MutexGuard<'static, State>) -> ! {
     }
 }
 
-fn spawn_thread(id: u32) {
+fn spawn_thread(id: u32, generation: u64) {
     std::thread::Builder::new()
         .name(format!("guest-{id:08x}"))
         .stack_size(256 << 20)
         .spawn(move || {
+            GENERATION.with(|g| g.set(generation));
             let st = lock();
             let st = os()
                 .cv
                 .wait_while(st, |s| s.current != Some(id) || s.done.is_some())
                 .unwrap_or_else(|e| e.into_inner());
+            if !still_mine(&st, id) {
+                park(st);
+            }
             let c = shared_ctx();
             let (entry, arg, sp) = {
                 let t = &st.threads[&id];
@@ -545,9 +570,10 @@ pub fn run(
             spawned: true,
             regs: None,
             seq: 0,
+            generation: 0,
         },
     );
-    spawn_thread(0);
+    spawn_thread(0, 0);
     os().cv.notify_all();
     let st = lock();
     let mut st = os()
@@ -591,22 +617,24 @@ fn os_create_thread(c: &mut Ctx) {
     );
     c.mem.write_u32(t + 4, pri as u32);
     c.mem.write_u32(t + 0x14, id);
-    {
-        lock().threads.insert(
-            t,
-            Thread {
-                id: t,
-                pri,
-                state: TState::Stopped,
-                entry,
-                arg: a,
-                sp,
-                spawned: false,
-                regs: None,
-                seq: 0,
-            },
-        );
-    }
+    let mut st = lock();
+    st.seq += 1;
+    let generation = st.seq;
+    st.threads.insert(
+        t,
+        Thread {
+            id: t,
+            pri,
+            state: TState::Stopped,
+            entry,
+            arg: a,
+            sp,
+            spawned: false,
+            regs: None,
+            seq: 0,
+            generation,
+        },
+    );
 }
 
 fn os_start_thread(c: &mut Ctx) {
