@@ -6,7 +6,7 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::mem;
 use std::net::SocketAddr;
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Sender, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -177,14 +177,23 @@ impl<G: Guest> Session<G> {
 
     fn next_command(&mut self, block: bool) -> Option<(String, Sender<String>)> {
         let port = self.debug.as_ref()?;
-        if block && matches!(self.mode, Mode::Paused) && !self.done {
-            let request = port.requests.recv().ok();
-            // Nothing can ever unpause the run now: end it rather than spin.
-            self.done |= request.is_none();
-            request
+        let paused = matches!(self.mode, Mode::Paused);
+        let (request, gone) = if block && paused && !self.done {
+            match port.requests.recv() {
+                Ok(r) => (Some(r), false),
+                Err(_) => (None, true),
+            }
         } else {
-            port.requests.try_recv().ok()
+            match port.requests.try_recv() {
+                Ok(r) => (Some(r), false),
+                Err(e) => (None, e == TryRecvError::Disconnected),
+            }
+        };
+        // Nothing can ever unpause the run now: end it rather than wait forever.
+        if gone && paused {
+            self.done = true;
         }
+        request
     }
 
     fn end_step(&mut self) {
@@ -323,5 +332,16 @@ mod tests {
         s.mode = Mode::Paused;
         assert_eq!(s.tick(&Pads::default(), true), Tick::Done);
         assert_eq!(s.finish().unwrap().0, 0);
+
+        // The same without blocking, as the window polls it.
+        let mut s = Session::new(Count(0), &RunConfig::default()).unwrap();
+        let (tx, requests) = std::sync::mpsc::channel();
+        drop(tx);
+        s.debug = Some(DebugPort {
+            addr: "127.0.0.1:1".parse().unwrap(),
+            requests,
+        });
+        s.mode = Mode::Paused;
+        assert_eq!(s.tick(&Pads::default(), false), Tick::Done);
     }
 }

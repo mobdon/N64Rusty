@@ -115,6 +115,15 @@ fn debug_port_steps_one_frame_at_a_time() {
 fn headless_config_never_opens_a_window() {
     // A window would need an event loop; a headless run must not make one.
     let cfg = RunConfig::parse("headless = true\nframes = 3", "".as_ref()).unwrap();
-    let log = run_windowed(Log::default(), &cfg).unwrap();
-    assert_eq!(log.0.len(), 3);
+    struct NoWindow(u64);
+    impl Guest for NoWindow {
+        fn frame(&mut self, _: u64, _: &Pads) {
+            self.0 += 1;
+        }
+        fn attach_window(&mut self, _: std::sync::Arc<winit::window::Window>) {
+            panic!("a headless run opened a window");
+        }
+    }
+    let guest = run_windowed(NoWindow(0), &cfg).unwrap();
+    assert_eq!(guest.0, 3);
 }
