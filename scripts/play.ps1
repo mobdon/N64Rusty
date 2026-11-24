@@ -69,7 +69,14 @@ Copy-Item $exe.FullName $game -Force
 
 Write-Host "== Playing (close the window to stop)"
 Push-Location $local
+Remove-Item -LiteralPath "crash.txt" -ErrorAction SilentlyContinue
 & $game $Rom @sym --local . --window @GameArgs
 $code = $LASTEXITCODE
+if (Test-Path -LiteralPath "crash.txt") {
+    Write-Host "== The game crashed. Its message, also saved in $local\crash.txt:"
+    Get-Content -LiteralPath "crash.txt" -TotalCount 40
+} elseif ($code -ne 0) {
+    Write-Host "== The game stopped with exit code $code; see the messages above."
+}
 Pop-Location
 exit $code
