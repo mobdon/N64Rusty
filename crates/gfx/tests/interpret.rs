@@ -358,3 +358,29 @@ fn malformed_lengths_from_guest_data_do_not_panic() {
     let f = run(&ram, addr);
     assert_eq!(f.height(), 1);
 }
+
+#[test]
+fn modify_vertex_overwrites_colour_texture_and_screen_position() {
+    let mut ram = Ram::default();
+    let verts = ram.vertices(&[v(10, 20, 30, [0; 4]); 3]);
+    let mut dl = Dl::default();
+    setup(&mut ram, &mut dl);
+    dl.vtx(verts, 3, 0)
+        .modify_vtx(0x10, 0, 0xFF80_00FF)
+        .modify_vtx(0x14, 1, (64 << 16) | 32) // s = 2.0, t = 1.0 texels
+        .modify_vtx(0x18, 2, (40 << 16) | 100) // screen (10, 25)
+        .modify_vtx(0x1C, 2, 0x7FFF << 16)
+        .scissor(8, 16, 300, 200)
+        .tri(0, 1, 2)
+        .end();
+    let addr = ram.dl(&dl);
+    let f = run(&ram, addr);
+    assert!(f.warnings.is_empty(), "{:?}", f.warnings);
+    assert_eq!(f.vertices[0].color, [1.0, 128.0 / 255.0, 0.0, 1.0]);
+    assert_eq!(f.vertices[0].pos, [10.0, 20.0, 30.0]);
+    let moved = f.vertices[2];
+    assert_eq!(moved.pos, [10.0, 25.0, 1.0]);
+    assert_ne!(moved.transform, f.vertices[0].transform);
+    let d = f.draws().next().unwrap();
+    assert_eq!(d.state.scissor, Some([8.0, 16.0, 300.0, 200.0]));
+}

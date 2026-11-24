@@ -541,12 +541,18 @@ impl Renderer {
                     Command::Draw(d) if d.state.color_image == frame.color_image => d,
                     Command::Draw(_) => continue,
                 };
-                let (key, bind) = &prepared[next];
+                let i = next;
+                next += 1;
+                let (key, bind) = &prepared[i];
+                let [x, y, w, h] = scissor(d.state.scissor, frame, width, height);
+                if w == 0 || h == 0 {
+                    continue;
+                }
+                pass.set_scissor_rect(x, y, w, h);
                 pass.set_pipeline(&self.pipelines[key]);
-                pass.set_bind_group(0, &ubind, &[(next as u64 * UNIFORM_STRIDE) as u32]);
+                pass.set_bind_group(0, &ubind, &[(i as u64 * UNIFORM_STRIDE) as u32]);
                 pass.set_bind_group(1, bind, &[]);
                 pass.draw(d.first..d.first + d.count, 0..1);
-                next += 1;
             }
         }
 
@@ -608,6 +614,18 @@ impl Renderer {
         self.queue.write_buffer(&buf, 0, data);
         buf
     }
+}
+
+/// The scissor box scaled from framebuffer pixels to the target, clamped to
+/// it, as x, y, width, height.
+fn scissor(s: Option<[f32; 4]>, frame: &Frame, width: u32, height: u32) -> [u32; 4] {
+    let [x0, y0, x1, y1] = s.unwrap_or([0.0, 0.0, f32::MAX, f32::MAX]);
+    let sx = width as f32 / frame.width as f32;
+    let sy = height as f32 / frame.height() as f32;
+    let px = |v: f32, scale: f32, max: u32| ((v * scale).round().max(0.0) as u32).min(max);
+    let (x0, x1) = (px(x0, sx, width), px(x1, sx, width));
+    let (y0, y1) = (px(y0, sy, height), px(y1, sy, height));
+    [x0, y0, x1.saturating_sub(x0), y1.saturating_sub(y0)]
 }
 
 fn target_desc(size: wgpu::Extent3d) -> wgpu::TextureDescriptor<'static> {

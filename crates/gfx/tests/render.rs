@@ -260,3 +260,22 @@ fn captures_only_chosen_frames_to_png() {
     assert_eq!(&buf[..4], &BLUE);
     assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
 }
+
+#[test]
+fn scissor_limits_drawing() {
+    let Some(mut r) = renderer() else { return };
+    let mut ram = Ram::default();
+    let dl = scene(&mut ram, |_, dl| {
+        dl.scissor(100, 100, 200, 150)
+            .other_modes(CYCLE_FILL, 0)
+            .fill_color(0xF801_F801)
+            .fill_rect(0, 0, 319, 239);
+    });
+    let f = frame(&mut ram, &dl);
+    for scale in [1, 2] {
+        let img = r.render(&f, 320 * scale, 240 * scale).unwrap();
+        assert_px(&img, 150 * scale, 125 * scale, RED);
+        assert_px(&img, 50 * scale, 125 * scale, BLUE);
+        assert_px(&img, 150 * scale, 200 * scale, BLUE);
+    }
+}

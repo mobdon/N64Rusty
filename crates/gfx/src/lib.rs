@@ -111,6 +111,8 @@ pub struct RenderState {
     pub rect: bool,
     /// Address of the colour image this was drawn into.
     pub color_image: u32,
+    /// Scissor box in framebuffer pixels (x0, y0, x1, y1), if one was set.
+    pub scissor: Option<[f32; 4]>,
 }
 
 /// A run of triangles sharing one [`RenderState`].

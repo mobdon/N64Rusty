@@ -131,6 +131,7 @@ impl Interpreter {
                 textures: [None; 2],
                 rect: false,
                 color_image: 0,
+                scissor: None,
             },
             fill_color: 0,
             prim_depth: 0.0,
@@ -175,6 +176,12 @@ impl Interpreter {
             pc += 8;
             match w0 >> 24 {
                 0x01 => self.vertices(rdram, w0, w1, at)?,
+                0x02 => self.modify_vertex(w0, w1, at),
+                0xED => {
+                    let fixed = |v: u32, sh: u32| ((v >> sh) & 0xFFF) as f32 / 4.0;
+                    self.state.scissor =
+                        Some([fixed(w0, 12), fixed(w0, 0), fixed(w1, 12), fixed(w1, 0)]);
+                }
                 0x05 => self.tri([(w0 >> 16) & 0xFF, (w0 >> 8) & 0xFF, w0 & 0xFF], at),
                 0x06 | 0x07 => {
                     self.tri([(w0 >> 16) & 0xFF, (w0 >> 8) & 0xFF, w0 & 0xFF], at);
@@ -182,7 +189,7 @@ impl Interpreter {
                 }
                 // G_SPNOOP, G_CULLDL (drawing everything is always safe),
                 // syncs, scissor and the coprocessor-only commands.
-                0x00 | 0x03 | 0xE0 | 0xE6..=0xE9 | 0xED | 0xF1 => {}
+                0x00 | 0x03 | 0xE0 | 0xE6..=0xE9 | 0xF1 => {}
                 0x04 => {
                     // shortcut: G_BRANCH_Z always takes the branch (the
                     // nearer, more detailed level); compare depth when a
@@ -407,6 +414,36 @@ impl Interpreter {
             };
         }
         Ok(())
+    }
+
+    /// `G_MODIFYVTX`: overwrite one field of a loaded vertex.
+    fn modify_vertex(&mut self, w0: u32, w1: u32, at: u32) {
+        let i = ((w0 & 0xFFFF) / 2) as usize;
+        if i >= VTX_BUFFER {
+            self.warn(format!("bad vertex modify at {at:#010x}"));
+            return;
+        }
+        match (w0 >> 16) & 0xFF {
+            0x10 => self.vtx[i].color = rgba(w1),
+            // Replaces the coordinate as given; the texture scale is not applied.
+            0x14 => self.vtx[i].st = [(w1 >> 16) as i16 as f32 / 32.0, w1 as i16 as f32 / 32.0],
+            // Screen position in quarter pixels: the vertex leaves its
+            // transform and is drawn in framebuffer space.
+            0x18 => {
+                let t = self.rect_transform();
+                let v = &mut self.vtx[i];
+                v.transform = t;
+                v.pos = [(w1 >> 16) as i16 as f32 / 4.0, w1 as i16 as f32 / 4.0, 0.0];
+            }
+            0x1C => {
+                let t = self.rect_transform();
+                let v = &mut self.vtx[i];
+                if v.transform == t {
+                    v.pos[2] = (w1 >> 16) as f32 / 32767.0 * 2.0 - 1.0;
+                }
+            }
+            w => self.warn(format!("vertex modify {w:#x} at {at:#010x}")),
+        }
     }
 
     /// Directional lights plus ambient (the light after the last one).
