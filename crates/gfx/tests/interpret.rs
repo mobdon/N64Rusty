@@ -353,6 +353,7 @@ fn primitive_depth_stays_in_the_depth_range() {
         .end();
     let addr = ram.dl(&dl);
     let f = run(&ram, addr);
+    assert_eq!(f.vertices.len(), 6);
     assert!(
         f.vertices.iter().all(|v| v.pos[2] == 1.0),
         "{:?}",
