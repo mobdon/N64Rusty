@@ -254,7 +254,7 @@ pub fn letterbox(image: &Image, x: u32, y: u32, width: u32, buf: &mut [u32]) {
         let cols = image.width.min(width.saturating_sub(x)) as usize;
         let src = &image.rgba[(row * image.width * 4) as usize..][..cols * 4];
         let at = ((y + row) * width + x) as usize;
-        for (d, s) in buf[at..at + cols].iter_mut().zip(src.chunks_exact(4)) {
+        for (d, s) in buf[at..at + cols].iter_mut().zip(src.as_chunks::<4>().0) {
             *d = (s[0] as u32) << 16 | (s[1] as u32) << 8 | s[2] as u32;
         }
     }
