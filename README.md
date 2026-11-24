@@ -21,6 +21,7 @@ crate that compiles. Floating point and the rest of the console come next.
 | `n64rusty-rom` | `crates/rom` | ROM loading: byte order, SHA-256, header, boot code variant |
 | `n64rusty-refcpu` | `crates/refcpu` | Reference VR4300 interpreter, used only by tests |
 | `n64rusty-conformance` | `crates/conformance` | Per-instruction tests: translated code against the reference CPU |
+| `n64rusty-audio` | `crates/audio` | Host audio: runs the game's audio command lists, plays the result to a WAV file or the speakers |
 
 ```
 cargo build --workspace
@@ -72,6 +73,24 @@ every 32-bit result is sign-extended, as on the VR4300.
   64-bit forms behave like the unsigned forms), traps (BREAK, SYSCALL), LL/SC and
   the TLB. These emit a call that panics with the address,
   so the first one a game reaches is easy to find.
+
+### Audio
+
+`crates/audio` does on the host what the RSP audio microcode and the audio
+interface do on the console. Its interface is three calls for the system
+library overrides to make:
+
+- `AudioRsp::run(ram, list, len)` when the game starts an audio task: runs
+  the command list (ADPCM decode, resample, volume envelopes, mix,
+  interleave) against guest RAM.
+- `AudioOut::set_frequency(hz)` and `AudioOut::play(ram, addr, len)` when the
+  game sets the AI frequency and queues the next AI buffer.
+
+Output goes to a WAV file (`record_wav`) and, with the `speaker` feature,
+to the default output device (`open_speaker`, through cpal; on Linux this
+needs the ALSA development package, `libasound2-dev`). `set_muted` silences
+the speakers while WAV recording carries on. Playback runs at the rate the
+game sets. Tests use synthetic command lists and only write WAV data.
 
 ### Tests
 

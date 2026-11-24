@@ -47,6 +47,19 @@ Read for instruction behaviour; no text or tables are copied.
   loads and stores.
 - MIPS III / MIPS IV instruction set references: encodings and branch delay
   slot rules, including branch-likely behaviour.
+- N64brew wiki (https://n64brew.dev), Audio Interface and RSP pages: how
+  audio tasks, the AI frequency and AI buffers work.
+- The VADPCM sample format and the audio microcode's command encodings and
+  flags as described in public N64 development documentation and the
+  decompiled system library headers (https://github.com/decompals/ultralib).
+  `crates/audio` is written from those descriptions; no microcode, tables or
+  code are copied. The microcode's resampling filter table is not
+  reproduced (the host uses its own Catmull-Rom interpolation).
+
+## Dependencies
+
+- cpal (https://github.com/RustAudio/cpal), Apache-2.0: speaker output in
+  `crates/audio`, only with its `speaker` feature.
 
 ## Adding a source
 
