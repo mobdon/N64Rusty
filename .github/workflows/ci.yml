@@ -35,6 +35,15 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libudev-dev libasound2-dev mesa-vulkan-drivers
       - name: Format
         run: cargo fmt --all -- --check
+      - name: Check PowerShell scripts parse
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          foreach ($f in Get-ChildItem scripts\*.ps1) {
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$errors)
+            if ($errors) { $errors; exit 1 }
+          }
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Build
