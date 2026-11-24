@@ -76,6 +76,8 @@ struct Regs {
     lo: u64,
     f: [u64; 32],
     fcr31: u32,
+    fr: bool,
+    status: u32,
 }
 
 impl Regs {
@@ -86,6 +88,8 @@ impl Regs {
             lo: c.lo,
             f: c.f,
             fcr31: c.fcr31,
+            fr: c.fr,
+            status: c.cop0[12],
         })
     }
 
@@ -95,6 +99,8 @@ impl Regs {
         c.lo = self.lo;
         c.f = self.f;
         c.fcr31 = self.fcr31;
+        c.fr = self.fr;
+        c.cop0[12] = self.status;
     }
 }
 
@@ -304,7 +310,7 @@ fn deliver_due(c: &mut Ctx, st: &mut State) {
         st.frames += 1;
         st.devices.retrace(st.frames, st.framebuffer);
         if let Some((mq, msg, every)) = st.vi {
-            if every > 0 && st.frames % u64::from(every) == 0 {
+            if every > 0 && st.frames.is_multiple_of(u64::from(every)) {
                 put_message(c, st, mq, msg, false);
             }
         }
@@ -332,6 +338,11 @@ fn deliver_due(c: &mut Ctx, st: &mut State) {
         }
     }
 }
+
+/// COP0 Status for the boot code: CU1, CU0, FR, all interrupt lines, IE.
+const STATUS_BOOT: u32 = 0x3400_FF01;
+/// COP0 Status a new thread starts with: CU1, all interrupt lines, IE.
+const STATUS_THREAD: u32 = 0x2000_FF01;
 
 /// Sets the clock deadline at the next retrace or timer, so a thread that
 /// never blocks is still interrupted.
@@ -446,6 +457,12 @@ fn spawn_thread(id: u32) {
             c.r = [0; 32];
             c.r[4] = sx32(arg);
             c.r[29] = sx32(sp);
+            // The boot code runs as the boot ROM left it, with 64-bit FPU
+            // registers (Status.FR set). Threads start from the context the
+            // system library builds, whose Status has FR clear: doubles
+            // live in even/odd register pairs.
+            c.fr = id == 0;
+            c.cop0[12] = if id == 0 { STATUS_BOOT } else { STATUS_THREAD };
             drop(st);
             let r = panic::catch_unwind(AssertUnwindSafe(|| c.call(entry)));
             let mut st = lock();
@@ -480,8 +497,7 @@ pub fn run(
     devices: Box<dyn Devices>,
 ) -> (Outcome, String, u64) {
     ctx.on_deadline = Some(interrupt);
-    // Status: interrupts enabled, all lines unmasked.
-    ctx.cop0[12] = 0x3400_FF01;
+    ctx.cop0[12] = STATUS_BOOT;
     ctx.deadline = TICKS_PER_FRAME;
     let ok = OS
         .set(Os {
@@ -541,9 +557,15 @@ fn boot_returned(s: &State) -> bool {
 }
 
 /// The DMA log and frame count after a run, for reports.
-pub fn summary() -> (u64, Vec<(u32, u32, u32)>, String) {
-    let st = lock();
-    (st.frames, st.dma_log.clone(), st.describe_threads())
+pub fn summary() -> (u64, Vec<(u32, u32, u32)>, String, String) {
+    let mut st = lock();
+    let devices = st.devices.summary();
+    (
+        st.frames,
+        st.dma_log.clone(),
+        st.describe_threads(),
+        devices,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -746,7 +768,10 @@ fn os_vi_set_event(c: &mut Ctx) {
 
 fn os_vi_swap_buffer(c: &mut Ctx) {
     let fb = arg(c, 0);
-    lock().framebuffer = fb;
+    let mut st = lock();
+    st.framebuffer = fb;
+    let frame = st.frames;
+    st.devices.swap_buffer(c, frame, fb);
 }
 
 fn os_vi_get_framebuffer(c: &mut Ctx) {

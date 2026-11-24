@@ -1161,6 +1161,8 @@ dependencies = [
 name = "n64rusty-runner"
 version = "0.0.0"
 dependencies = [
+ "n64rusty-audio",
+ "n64rusty-gfx",
  "n64rusty-rom",
  "n64rusty-runtime",
 ]

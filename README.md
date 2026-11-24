@@ -10,9 +10,9 @@ instruction sets translate to Rust, with branch delay slots, and are tested
 per instruction against a reference interpreter. ROMs load in any byte order;
 the boot segment and the code the game loads at run time are found and written
 out as a Rust crate that builds into a native program. That program runs the
-game headless with the system library replaced by native Rust, until the
-first routine that is still missing. Graphics, audio and input plug in later
-through one small interface.
+game headless with the system library replaced by native Rust, its display
+lists drawn off screen and its audio command lists mixed, until the first
+routine that is still missing.
 
 ## Layout
 
@@ -84,15 +84,28 @@ calls. It also writes two files next to `out/`:
   copy that put it there.
 
 Run `translate` again and it adds that code: code copied in at run time
-becomes an overlay (its own module, active while that copy is in RAM), boot
+becomes an overlay (its own module, active while that copy is in RAM; a
+later copy into part of it hides only the functions it covers), boot
 segment code that a later copy overwrites is dropped, and boot code reached
 only through a pointer is added. Repeat until the run reaches its frame
 limit.
 
-Graphics, audio and input are separate crates that implement
-`n64rusty_runner::devices::Devices` (RSP tasks, audio buffers, retrace and
-controller state). The default, `Headless`, ignores output and reports one
-connected controller with nothing pressed.
+Graphics, audio and input reach the game through
+`n64rusty_runner::devices::Devices` (RSP tasks, audio buffers, frame swaps,
+retrace and controller state). The default runs every graphics task through
+`n64rusty-gfx` and every audio task through `n64rusty-audio`, and reports
+one connected controller with nothing pressed. Nothing is shown or played:
+
+```
+./target/debug/n64rusty-game-<hash> your.z64 --capture frames/ --capture-every 30 --wav run.wav
+```
+
+saves every 30th finished frame as a PNG and records the sound. Captures
+and recordings are game output: keep them in the git-ignored local folder.
+
+Guest threads start with the floating-point register mode the system
+library gives them (32-bit registers, doubles in even/odd pairs); the boot
+code keeps the 64-bit mode the boot ROM sets.
 
 ## Window and input
 

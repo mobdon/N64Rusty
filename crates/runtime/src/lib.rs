@@ -54,8 +54,9 @@ pub struct Ctx {
     funcs: HashMap<u32, GuestFn>,
     overrides: HashMap<u32, GuestFn>,
     overlays: Vec<Overlay>,
-    /// Overlays currently in RAM, as indexes into `overlays`.
-    loaded: Vec<usize>,
+    /// Overlays currently in RAM, as indexes into `overlays`, each with the
+    /// ranges later copies have overwritten since it was loaded.
+    loaded: Vec<(usize, Vec<(u32, u32)>)>,
     /// The most recent call targets, oldest first once full; see
     /// [`Ctx::recent_calls`].
     trace: [u32; TRACE_LEN],
@@ -145,18 +146,28 @@ impl Ctx {
     }
 
     /// Records that `len` bytes from ROM offset `rom` were copied to `ram`.
-    /// Overlays overwritten by the copy are unloaded and an overlay that
-    /// starts at exactly this copy is loaded.
+    /// An overlay that starts at exactly this copy is loaded. A copy over
+    /// part of a loaded overlay (often data into its own data area) makes
+    /// only the functions it covers unavailable; one over all of it
+    /// unloads it.
     pub fn overlay_loaded(&mut self, rom: u32, ram: u32, len: u32) {
         let (lo, hi) = (ram, ram.wrapping_add(len));
         let ovl = &self.overlays;
-        self.loaded.retain(|&i| {
-            let o = &ovl[i];
-            o.ram.wrapping_add(o.len) <= lo || o.ram >= hi
+        self.loaded.retain_mut(|(i, dead)| {
+            let o = &ovl[*i];
+            let (olo, ohi) = (o.ram, o.ram.wrapping_add(o.len));
+            if ohi <= lo || olo >= hi {
+                return true;
+            }
+            if lo <= olo && hi >= ohi {
+                return false;
+            }
+            dead.push((lo, hi));
+            true
         });
         for (i, o) in self.overlays.iter().enumerate() {
             if o.rom == rom && o.ram == ram {
-                self.loaded.push(i);
+                self.loaded.push((i, Vec::new()));
             }
         }
     }
@@ -167,8 +178,11 @@ impl Ctx {
         if let Some(f) = self.overrides.get(&addr) {
             return Some(*f);
         }
-        for &i in self.loaded.iter().rev() {
-            if let Some(f) = self.overlays[i].funcs.get(&addr) {
+        for (i, dead) in self.loaded.iter().rev() {
+            if dead.iter().any(|&(lo, hi)| addr >= lo && addr < hi) {
+                continue;
+            }
+            if let Some(f) = self.overlays[*i].funcs.get(&addr) {
                 return Some(*f);
             }
         }
@@ -353,29 +367,6 @@ mod tests {
     }
 
     #[test]
-    fn overlays_load_and_unload_with_copies() {
-        fn a(c: &mut Ctx) {
-            c.r[2] = 1;
-        }
-        fn b(c: &mut Ctx) {
-            c.r[2] = 2;
-        }
-        let mut c = Ctx::new(Memory::new(16));
-        c.register_overlay(0x1000, 0x8010_0000, 0x100, &[(0x8010_0000, a)]);
-        c.register_overlay(0x2000, 0x8010_0000, 0x100, &[(0x8010_0000, b)]);
-        assert!(!c.has_function(0x8010_0000));
-        c.overlay_loaded(0x2000, 0x8010_0000, 0x100);
-        c.call(0x8010_0000);
-        assert_eq!(c.r[2], 2);
-        c.overlay_loaded(0x1000, 0x8010_0000, 0x100);
-        c.call(0x8010_0000);
-        assert_eq!(c.r[2], 1);
-        // A copy of something else over it unloads it.
-        c.overlay_loaded(0x9000, 0x8010_0080, 0x10);
-        assert!(!c.has_function(0x8010_0000));
-    }
-
-    #[test]
     fn version_is_set() {
         assert!(!VERSION.is_empty());
     }
@@ -427,8 +418,15 @@ mod tests {
         c.overlay_loaded(0x2000, 0x8010_0000, 0x200);
         c.call(0x8010_0000);
         assert_eq!(c.r[2], 0xB);
-        // Data copied over it unloads it.
+        // Data copied into part of it hides only what it covers.
         c.overlay_loaded(0x9000, 0x8010_0080, 0x10);
+        assert!(c.has_function(0x8010_0000));
+        c.overlay_loaded(0x9000, 0x8010_0000, 0x10);
+        assert!(!c.has_function(0x8010_0000));
+        // Reloading brings it back; a copy over all of it unloads it.
+        c.overlay_loaded(0x1000, 0x8010_0000, 0x100);
+        assert!(c.has_function(0x8010_0000));
+        c.overlay_loaded(0x9000, 0x800F_0000, 0x10_0000);
         assert!(!c.has_function(0x8010_0000));
     }
 
