@@ -9,6 +9,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # The renderer tests draw on a GPU or a software adapter (lavapipe on
+  # Linux, WARP on Windows, Metal on macOS); fail rather than skip.
+  N64RUSTY_REQUIRE_GPU: "1"
 
 jobs:
   test:
@@ -26,8 +29,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install Linux libraries
         if: runner.os == 'Linux'
-        # Gamepad support (gilrs) links against libudev.
-        run: sudo apt-get update && sudo apt-get install -y libudev-dev
+        # Gamepad support (gilrs) links against libudev; the renderer tests
+        # draw on lavapipe, the software Vulkan driver.
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev mesa-vulkan-drivers
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
