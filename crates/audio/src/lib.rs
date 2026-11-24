@@ -8,9 +8,11 @@
 //!
 //! This crate does both halves on the host:
 //!
-//! - [`AudioRsp::run`] interprets a command list (the standard audio
-//!   microcode's command set) against guest RAM. Call it where the game
-//!   starts an audio task on the RSP.
+//! - [`AudioRsp::run`] interprets a command list against guest RAM. Call it
+//!   where the game starts an audio task on the RSP. Make the interpreter
+//!   with [`AudioRsp::new`] for games on the standard audio library, or
+//!   [`AudioRsp::n_audio`] for games on the alternative `n_audio` library,
+//!   whose microcode has its own command layout.
 //! - [`AudioOut`] takes the finished buffers (call [`AudioOut::set_frequency`]
 //!   and [`AudioOut::play`] where the game sets the AI frequency and queues
 //!   the next AI buffer) and writes them to a WAV file and, with the

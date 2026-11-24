@@ -195,6 +195,9 @@ library overrides to make:
 - `AudioRsp::run(ram, list, len)` when the game starts an audio task: runs
   the command list (ADPCM decode, resample, volume envelopes, mix,
   interleave) against guest RAM.
+  `AudioRsp::new()` handles the standard audio library's commands and
+  `AudioRsp::n_audio()` the alternative `n_audio` library's, which adds a
+  pole filter.
 - `AudioOut::set_frequency(hz)` and `AudioOut::play(ram, addr, len)` when the
   game sets the AI frequency and queues the next AI buffer.
 
