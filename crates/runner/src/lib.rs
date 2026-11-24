@@ -8,6 +8,7 @@
 //! opened and no sound is played.
 
 pub mod devices;
+pub mod live;
 pub mod media;
 pub mod os;
 
@@ -193,7 +194,8 @@ pub fn crash_report(ctx: &Ctx) -> String {
 
 /// Entry point for a generated game binary:
 /// `game <rom> [--symbols file]... [--config file] [--frames n]
-/// [--capture dir] [--capture-every n] [--capture-scale n] [--wav file] [--input script]`.
+/// [--capture dir] [--capture-every n] [--capture-scale n] [--wav file] [--input script]
+/// [--window] [--run run.toml]`.
 ///
 /// Display lists and audio command lists always go through the graphics
 /// and audio interpreters. With `--capture`, every n-th finished frame (60
@@ -201,6 +203,11 @@ pub fn crash_report(ctx: &Ctx) -> String {
 /// (`--capture-scale n` renders at n times the game's resolution); with
 /// `--wav`, the sound is recorded to a file; `--input` plays a controller
 /// script against retrace numbers. Nothing is shown or played.
+///
+/// `--window` plays the game live instead (see [`live`]): a window, sound,
+/// keyboard and gamepads, paced at the game's own rate, with no frame limit
+/// unless `--frames` is given. Window, input and pacing settings come from
+/// `--run` (default: `run.toml` in the per-game folder, if present).
 ///
 /// System routines are replaced by role name. Their addresses come from the
 /// per-game config (`name = 0xADDR` lines, found by us) and from symbol
@@ -215,7 +222,9 @@ pub fn main_with(game: Game, devices: Option<Box<dyn devices::Devices>>) -> Exit
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut rom_path = None;
     let mut symbols = Vec::new();
-    let mut frames = 600;
+    let mut frames = None;
+    let mut window = false;
+    let mut run_config = None;
     // The per-game folder: config, and run logs the translator reads.
     let mut local = PathBuf::from("..");
     let mut capture = None;
@@ -230,6 +239,10 @@ pub fn main_with(game: Game, devices: Option<Box<dyn devices::Devices>>) -> Exit
             rom_path = Some(PathBuf::from(a));
             continue;
         }
+        if flag == "--window" {
+            window = true;
+            continue;
+        }
         let Some(v) = it.next() else {
             eprintln!("error: {flag} needs a value");
             return ExitCode::from(2);
@@ -241,13 +254,14 @@ pub fn main_with(game: Game, devices: Option<Box<dyn devices::Devices>>) -> Exit
             "--capture" => capture = Some(PathBuf::from(v)),
             "--wav" => wav = Some(PathBuf::from(v)),
             "--input" => input = Some(PathBuf::from(v)),
+            "--run" => run_config = Some(PathBuf::from(v)),
             "--frames" | "--capture-every" | "--capture-scale" => {
                 let Some(n) = number() else {
                     eprintln!("error: {flag} needs a number, not {v:?}");
                     return ExitCode::from(2);
                 };
                 match flag {
-                    "--frames" => frames = n,
+                    "--frames" => frames = Some(n),
                     "--capture-every" => every = n,
                     _ => scale = n.min(8) as u32,
                 }
@@ -263,7 +277,7 @@ pub fn main_with(game: Game, devices: Option<Box<dyn devices::Devices>>) -> Exit
     }
     let Some(rom_path) = rom_path else {
         eprintln!(
-            "usage: <game> <rom> [--symbols file]... [--config file] [--frames n] [--local dir] [--capture dir] [--capture-every n] [--capture-scale n] [--wav file] [--input script]"
+            "usage: <game> <rom> [--symbols file]... [--config file] [--frames n] [--local dir] [--capture dir] [--capture-every n] [--capture-scale n] [--wav file] [--input script] [--window] [--run run.toml]"
         );
         return ExitCode::from(2);
     };
@@ -287,6 +301,16 @@ pub fn main_with(game: Game, devices: Option<Box<dyn devices::Devices>>) -> Exit
         return ExitCode::from(2);
     }
     // The per-game config sits next to the generated crate by default.
+    let run_config = run_config.or_else(|| Some(local.join("run.toml")).filter(|p| p.exists()));
+    let run_config = match run_config.map(|p| n64rusty_host::RunConfig::load(&p)) {
+        Some(Err(e)) => {
+            eprintln!("error: run config {e}");
+            return ExitCode::from(2);
+        }
+        Some(Ok(c)) => c,
+        None => n64rusty_host::RunConfig::default(),
+    };
+    let frames = frames.unwrap_or(if window { u64::MAX } else { 600 });
     let default_config = local.join("config.toml");
     if default_config.exists() {
         symbols.push(default_config);
@@ -341,12 +365,31 @@ pub fn main_with(game: Game, devices: Option<Box<dyn devices::Devices>>) -> Exit
     let n_audio = ["n_alSynNew", "n_alAudioFrame"]
         .iter()
         .any(|n| by_name.contains_key(*n));
-    let devices = devices.unwrap_or_else(|| {
-        Box::new(media::Media::new(capture, every, wav, n_audio, script).with_scale(scale))
-    });
-    let (outcome, report, frames_run) = os::run(ctx, game.entry, rom_bytes, frames, devices);
+    let media = media::Media::new(capture, every, wav, n_audio, script).with_scale(scale);
+    let entry = game.entry;
+    if window {
+        return live::play(&run_config, media, move |devices| {
+            run_and_report(ctx, entry, rom_bytes, frames, devices, &local)
+        });
+    }
+    let devices = devices.unwrap_or_else(|| Box::new(media));
+    ExitCode::from(run_and_report(
+        ctx, entry, rom_bytes, frames, devices, &local,
+    ))
+}
+
+/// Runs the game to its end and prints the report; returns the exit code.
+fn run_and_report(
+    ctx: &'static mut Ctx,
+    entry: u32,
+    rom_bytes: Arc<[u8]>,
+    frames: u64,
+    devices: Box<dyn devices::Devices>,
+    local: &std::path::Path,
+) -> u8 {
+    let (outcome, report, frames_run) = os::run(ctx, entry, rom_bytes, frames, devices);
     let (_, dma, threads, device_summary) = os::summary();
-    if let Err(e) = record_run(&local, &dma, &outcome) {
+    if let Err(e) = record_run(local, &dma, &outcome) {
         eprintln!(
             "warning: could not write the run log in {}: {e}",
             local.display()
@@ -362,19 +405,19 @@ pub fn main_with(game: Game, devices: Option<Box<dyn devices::Devices>>) -> Exit
     match outcome {
         os::Outcome::Frames(n) => {
             println!("ran {n} frames without a panic");
-            ExitCode::SUCCESS
+            0
         }
         os::Outcome::Returned => {
             println!("the boot code returned");
-            ExitCode::SUCCESS
+            0
         }
         os::Outcome::Deadlock(d) => {
             println!("deadlock: every thread waits and nothing can wake one\n{d}");
-            ExitCode::from(1)
+            1
         }
         os::Outcome::Panic(m) => {
             println!("panic: {m}\n{report}");
-            ExitCode::from(1)
+            1
         }
     }
 }

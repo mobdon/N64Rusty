@@ -314,7 +314,11 @@ pub fn discover(img: &Image, entries: &[u32], hints: &[u32], code_end: Option<u3
                 while a < pair[1] && img.word(a) == Some(0) {
                     a += 4;
                 }
-                if a < pair[1] && a < code_end && !inside_known(a) && known.insert(a) {
+                // Data that does not even decode is not taken for code.
+                let decodes = img
+                    .word(a)
+                    .is_some_and(|w| Inst::decode(w).op != Op::Unknown);
+                if a < pair[1] && a < code_end && decodes && !inside_known(a) && known.insert(a) {
                     fresh.push(a);
                 }
             }
@@ -425,6 +429,21 @@ mod tests {
         let d = discover(&img, &[BASE], &[], None);
         let starts: Vec<u32> = d.functions.iter().map(|f| f.addr).collect();
         assert_eq!(starts, vec![BASE, BASE + 24, BASE + 32]);
+    }
+
+    #[test]
+    fn data_between_functions_is_not_a_function() {
+        // f: jal h ; nop ; jr ra ; nop | a word that is no instruction |
+        // h: jr ra ; nop
+        let bytes = image(&[jal(BASE + 20), NOP, JR_RA, NOP, 0x7000_0000, JR_RA, NOP]);
+        let img = Image {
+            base: BASE,
+            bytes: &bytes,
+        };
+        assert_eq!(Inst::decode(0x7000_0000).op, Op::Unknown);
+        let d = discover(&img, &[BASE], &[], None);
+        let starts: Vec<u32> = d.functions.iter().map(|f| f.addr).collect();
+        assert_eq!(starts, vec![BASE, BASE + 20]);
     }
 
     #[test]

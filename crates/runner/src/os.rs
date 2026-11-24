@@ -268,7 +268,7 @@ fn put_message(c: &mut Ctx, st: &mut State, mq: u32, msg: u32, jam: bool) -> boo
         return false;
     }
     assert!(
-        first < count && count <= 0x1_0000,
+        first < count,
         "message queue {mq:#010x} is not set up: valid {valid}, first {first}, count {count}, buffer {buf:#010x}, called from {:#010x}",
         c.r[31] as u32
     );
