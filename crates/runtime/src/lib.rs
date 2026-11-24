@@ -15,7 +15,7 @@ mod fpu;
 mod memory;
 
 pub use fpu::{cvt_l, cvt_w, fcmp, Round};
-pub use memory::Memory;
+pub use memory::{Io, Memory};
 
 /// Crate version, checked against the version recorded in generated code.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -53,7 +53,41 @@ pub struct Ctx {
     pub mem: Memory,
     funcs: HashMap<u32, GuestFn>,
     overrides: HashMap<u32, GuestFn>,
+    overlays: Vec<Overlay>,
+    /// Overlays currently in RAM, as indexes into `overlays`.
+    loaded: Vec<usize>,
+    /// The most recent call targets, oldest first once full; see
+    /// [`Ctx::recent_calls`].
+    trace: [u32; TRACE_LEN],
+    /// Number of calls made through [`Ctx::call`].
+    pub calls: u64,
+    /// Current call depth.
+    pub depth: u32,
+    /// COP0 (system control) registers, as written by MTC0.
+    pub cop0: [u32; 32],
+    /// Virtual time in COP0 Count ticks: advances by [`COUNT_PER_CALL`]
+    /// per call, and hosts move it forward when the game waits.
+    pub clock: u64,
+    /// When `clock` reaches this, the next call first runs `on_deadline`.
+    /// Hosts use it to deliver interrupts (retrace, timers) to a game that
+    /// is busy and never blocks.
+    pub deadline: u64,
+    /// See [`Ctx::deadline`].
+    pub on_deadline: Option<GuestFn>,
 }
+
+struct Overlay {
+    rom: u32,
+    ram: u32,
+    len: u32,
+    funcs: HashMap<u32, GuestFn>,
+}
+
+/// How far the virtual COP0 Count register advances per call.
+pub const COUNT_PER_CALL: u32 = 64;
+
+/// How many recent calls [`Ctx`] remembers for crash reports.
+pub const TRACE_LEN: usize = 64;
 
 impl Ctx {
     /// A context with zeroed registers and the given RAM.
@@ -68,6 +102,15 @@ impl Ctx {
             mem,
             funcs: HashMap::new(),
             overrides: HashMap::new(),
+            overlays: Vec::new(),
+            loaded: Vec::new(),
+            trace: [0; TRACE_LEN],
+            calls: 0,
+            depth: 0,
+            cop0: [0; 32],
+            clock: 0,
+            deadline: u64::MAX,
+            on_deadline: None,
         }
     }
 
@@ -87,18 +130,100 @@ impl Ctx {
         self.overrides.remove(&addr);
     }
 
+    /// Registers the functions of code the game copies from the cartridge
+    /// at run time: `len` bytes from ROM offset `rom` placed at `ram`.
+    /// They are only called while that copy is in RAM (see
+    /// [`Ctx::overlay_loaded`]), so overlays sharing an address range
+    /// dispatch to whichever one is loaded.
+    pub fn register_overlay(&mut self, rom: u32, ram: u32, len: u32, funcs: &[(u32, GuestFn)]) {
+        self.overlays.push(Overlay {
+            rom,
+            ram,
+            len,
+            funcs: funcs.iter().copied().collect(),
+        });
+    }
+
+    /// Records that `len` bytes from ROM offset `rom` were copied to `ram`.
+    /// Overlays overwritten by the copy are unloaded and an overlay that
+    /// starts at exactly this copy is loaded.
+    pub fn overlay_loaded(&mut self, rom: u32, ram: u32, len: u32) {
+        let (lo, hi) = (ram, ram.wrapping_add(len));
+        let ovl = &self.overlays;
+        self.loaded.retain(|&i| {
+            let o = &ovl[i];
+            o.ram.wrapping_add(o.len) <= lo || o.ram >= hi
+        });
+        for (i, o) in self.overlays.iter().enumerate() {
+            if o.rom == rom && o.ram == ram {
+                self.loaded.push(i);
+            }
+        }
+    }
+
+    /// The function at `addr`: an override, a loaded overlay's, or a
+    /// registered one.
+    fn lookup(&self, addr: u32) -> Option<GuestFn> {
+        if let Some(f) = self.overrides.get(&addr) {
+            return Some(*f);
+        }
+        for &i in self.loaded.iter().rev() {
+            if let Some(f) = self.overlays[i].funcs.get(&addr) {
+                return Some(*f);
+            }
+        }
+        self.funcs.get(&addr).copied()
+    }
+
     /// Calls the guest function at `addr`. Every call in generated code goes
     /// through here.
     pub fn call(&mut self, addr: u32) {
-        let f = self
-            .overrides
-            .get(&addr)
-            .or_else(|| self.funcs.get(&addr))
-            .copied();
+        let f = self.lookup(addr);
+        self.trace[(self.calls % TRACE_LEN as u64) as usize] = addr;
+        self.calls += 1;
+        self.clock = self.clock.wrapping_add(u64::from(COUNT_PER_CALL));
+        if self.clock >= self.deadline {
+            if let Some(h) = self.on_deadline {
+                self.deadline = u64::MAX;
+                h(self);
+            }
+        }
         match f {
-            Some(f) => f(self),
+            Some(f) => {
+                self.depth += 1;
+                f(self);
+                self.depth -= 1;
+            }
             None => panic!("call to unknown guest function {addr:#010x}"),
         }
+    }
+
+    /// MFC0. Count (register 9) reads [`Ctx::clock`], so runs are
+    /// reproducible.
+    pub fn mfc0(&self, n: usize) -> u64 {
+        match n {
+            9 => sx32(self.clock as u32),
+            _ => sx32(self.cop0[n]),
+        }
+    }
+
+    /// MTC0. Writes are stored; none of them has a side effect yet.
+    pub fn mtc0(&mut self, n: usize, v: u64) {
+        self.cop0[n] = v as u32;
+    }
+
+    /// Whether a function is registered or overridden at `addr`.
+    pub fn has_function(&self, addr: u32) -> bool {
+        self.lookup(addr).is_some()
+    }
+
+    /// The most recent call targets, oldest first.
+    pub fn recent_calls(&self) -> Vec<u32> {
+        let n = self.calls.min(TRACE_LEN as u64) as usize;
+        let start = self.calls as usize - n;
+        (start..start + n)
+            .map(|k| self.trace[k % TRACE_LEN])
+            .collect()
     }
 
     /// Signed 32-bit divide (DIV). Division by zero and overflow give the
@@ -207,6 +332,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn deadline_runs_hook_once_before_the_call() {
+        fn hook(c: &mut Ctx) {
+            c.r[2] += 1;
+        }
+        fn callee(c: &mut Ctx) {
+            c.r[3] = c.r[2];
+        }
+        let mut c = Ctx::new(Memory::new(16));
+        c.register(0x8000_1000, callee);
+        c.on_deadline = Some(hook);
+        c.deadline = u64::from(COUNT_PER_CALL) * 2;
+        c.call(0x8000_1000);
+        assert_eq!((c.r[2], c.r[3]), (0, 0));
+        c.call(0x8000_1000);
+        assert_eq!((c.r[2], c.r[3]), (1, 1));
+        // Disarmed until the host sets a new deadline.
+        c.call(0x8000_1000);
+        assert_eq!(c.r[2], 1);
+    }
+
+    #[test]
+    fn overlays_load_and_unload_with_copies() {
+        fn a(c: &mut Ctx) {
+            c.r[2] = 1;
+        }
+        fn b(c: &mut Ctx) {
+            c.r[2] = 2;
+        }
+        let mut c = Ctx::new(Memory::new(16));
+        c.register_overlay(0x1000, 0x8010_0000, 0x100, &[(0x8010_0000, a)]);
+        c.register_overlay(0x2000, 0x8010_0000, 0x100, &[(0x8010_0000, b)]);
+        assert!(!c.has_function(0x8010_0000));
+        c.overlay_loaded(0x2000, 0x8010_0000, 0x100);
+        c.call(0x8010_0000);
+        assert_eq!(c.r[2], 2);
+        c.overlay_loaded(0x1000, 0x8010_0000, 0x100);
+        c.call(0x8010_0000);
+        assert_eq!(c.r[2], 1);
+        // A copy of something else over it unloads it.
+        c.overlay_loaded(0x9000, 0x8010_0080, 0x10);
+        assert!(!c.has_function(0x8010_0000));
+    }
+
+    #[test]
     fn version_is_set() {
         assert!(!VERSION.is_empty());
     }
@@ -238,6 +407,29 @@ mod tests {
         assert_eq!((c.lo, c.hi), (sx32(-6i32 as u32), u64::MAX));
         c.dmultu(u64::MAX, 2);
         assert_eq!((c.lo, c.hi), (u64::MAX - 1, 1));
+    }
+
+    #[test]
+    fn overlays_dispatch_by_what_is_loaded() {
+        fn a(c: &mut Ctx) {
+            c.r[2] = 0xA;
+        }
+        fn b(c: &mut Ctx) {
+            c.r[2] = 0xB;
+        }
+        let mut c = Ctx::new(Memory::new(16));
+        c.register_overlay(0x1000, 0x8010_0000, 0x100, &[(0x8010_0000, a)]);
+        c.register_overlay(0x2000, 0x8010_0000, 0x200, &[(0x8010_0000, b)]);
+        assert!(!c.has_function(0x8010_0000));
+        c.overlay_loaded(0x1000, 0x8010_0000, 0x100);
+        c.call(0x8010_0000);
+        assert_eq!(c.r[2], 0xA);
+        c.overlay_loaded(0x2000, 0x8010_0000, 0x200);
+        c.call(0x8010_0000);
+        assert_eq!(c.r[2], 0xB);
+        // Data copied over it unloads it.
+        c.overlay_loaded(0x9000, 0x8010_0080, 0x10);
+        assert!(!c.has_function(0x8010_0000));
     }
 
     #[test]

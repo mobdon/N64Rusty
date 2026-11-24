@@ -1,0 +1,12 @@
+[package]
+name = "n64rusty-runner"
+description = "Runs recompiled N64 code headless and replaces system routines"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+n64rusty-runtime.workspace = true
+n64rusty-rom = { path = "../rom" }
