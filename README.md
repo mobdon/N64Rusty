@@ -54,7 +54,8 @@ git-ignored `local/<sha256>/` folder: `out/` (the generated crate, one file
 per 64 KiB of address space, rewritten only when its contents change),
 `report.txt` and a `config.toml` template.
 
-On Linux, building needs `libudev-dev` (for gamepads).
+On Linux, building needs `libudev-dev` (for gamepads) and `libasound2-dev`
+(for sound).
 
 ## Running headless
 
@@ -111,6 +112,34 @@ matched against retrace numbers, so a headless run can press buttons.
 Guest threads start with the floating-point register mode the system
 library gives them (32-bit registers, doubles in even/odd pairs); the boot
 code keeps the 64-bit mode the boot ROM sets.
+
+## Playing in a window
+
+Add `--window` to the game program and it plays live: a window that draws
+each finished frame at the window's own resolution (keeping the 4:3 shape,
+with black bars), sound on the default speakers, and input from the keyboard
+and gamepads as described below. Frames run at the game's own rate (59.94
+per second); the game never runs faster, and if the computer falls behind,
+the game slows down. There is no frame limit unless `--frames` is given.
+Window size, frame rate, key layout, gamepad ports and input record/replay
+come from `run.toml` in the per-game folder, or `--run file`.
+
+On Windows (PowerShell), from the repository folder:
+
+```
+cargo run --release -p n64rusty -- translate C:\path\to\your.z64 --symbols C:\path\to\map.txt
+cd local\<sha256>\out
+cargo build --release
+copy target\release\n64rusty-game-<hash>.exe ..\game.exe
+cd ..
+.\game.exe C:\path\to\your.z64 --symbols C:\path\to\map.txt --local . --window
+```
+
+Run the copy rather than the file in `target`, so a rebuild never fights a
+running game. Close the window to stop. `record = "take.txt"` in `run.toml`
+keeps your input; `replay = "take.txt"` plays it back. With `headless = true`
+in the run config nothing is opened and the run goes as fast as it can with
+scripted input, which is how this mode is tested.
 
 ## Window and input
 

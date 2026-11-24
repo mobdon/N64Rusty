@@ -7,6 +7,7 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use n64rusty_audio::{AudioRsp, Wav};
 use n64rusty_gfx::{write_png, Frame, Interpreter, Renderer};
@@ -56,6 +57,8 @@ pub struct Media {
     saved: Vec<PathBuf>,
     last: Option<(u64, usize, usize)>,
     warnings: Vec<String>,
+    /// Where each finished frame goes for a live window, if anywhere.
+    shown: Option<Arc<Mutex<Option<Frame>>>>,
 }
 
 impl Media {
@@ -102,7 +105,13 @@ impl Media {
             saved: Vec::new(),
             last: None,
             warnings: Vec::new(),
+            shown: None,
         }
+    }
+
+    /// Hands every finished frame to `slot`, replacing one not yet taken.
+    pub fn show_frames(&mut self, slot: Arc<Mutex<Option<Frame>>>) {
+        self.shown = Some(slot);
     }
 
     fn save(&mut self, frame: u64, f: &Frame) {
@@ -235,6 +244,9 @@ impl Devices for Media {
         }
         if self.swaps.is_multiple_of(self.every) {
             self.save(frame, &f);
+        }
+        if let Some(slot) = &self.shown {
+            *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(f);
         }
     }
 
