@@ -74,7 +74,12 @@ impl Devices for Live {
     fn retrace(&mut self, frame: u64, framebuffer: u32) {
         self.media.retrace(frame, framebuffer);
         // Wait for the host's next frame. An error means the host is gone
-        // and the process is about to exit.
+        // and the process is about to exit. Retraces count from 1 and host
+        // frames from 0: skip host frame 0 so retrace n gets host frame n,
+        // as `--input` scripts and headless runs number them.
+        if frame == 1 {
+            let _ = self.input.recv();
+        }
         if let Ok(p) = self.input.recv() {
             self.pads = p;
             for (seen, pad) in self.seen.iter_mut().zip(&p) {
@@ -340,22 +345,23 @@ mod tests {
             RunConfig::parse("headless = true\nframes = 8\nreplay = \"take.txt\"\n", &dir).unwrap();
         let (live, screen) = pair(Media::new(None, 60, None, false, None));
         let shown = screen.shown.clone();
-        let game = std::thread::spawn(move || fake_game(live, 8));
+        let game = std::thread::spawn(move || fake_game(live, 7));
         let screen = n64rusty_host::run_windowed(screen, &cfg).unwrap();
         let seen = game.join().unwrap();
         std::fs::remove_dir_all(&dir).ok();
 
-        // Retrace n waits for host frame n - 1 and gets that frame's input.
-        assert_eq!(seen.len(), 8);
+        // Retrace n waits for host frame n and gets that frame's input
+        // (seen[0] is retrace 1).
+        assert_eq!(seen.len(), 7);
         let buttons: Vec<u16> = seen.iter().map(|p| p[0].buttons).collect();
-        assert_eq!(buttons, [0, 0, 0, button::START, button::A, 0, 0, 0]);
-        assert_eq!(seen[4][0].stick_x, 80);
+        assert_eq!(buttons, [0, 0, button::START, button::A, 0, 0, 0]);
+        assert_eq!(seen[3][0].stick_x, 80);
         // Port 2 plugs in the first time it is used.
         assert!(seen.iter().all(|p| p[0].connected));
-        assert!(!seen[4][1].connected);
-        assert!(seen[5][1].connected && seen[7][1].connected);
-        assert_eq!((seen[5][1].buttons, seen[5][1].stick_y), (button::B, -40));
-        assert!(!seen[7][2].connected);
+        assert!(!seen[3][1].connected);
+        assert!(seen[4][1].connected && seen[6][1].connected);
+        assert_eq!((seen[4][1].buttons, seen[4][1].stick_y), (button::B, -40));
+        assert!(!seen[6][2].connected);
         // Finished frames reach the screen; with no window none is drawn.
         assert!(shown.lock().unwrap().is_some());
         drop(screen);
