@@ -10,9 +10,10 @@ use std::path::PathBuf;
 
 use n64rusty_audio::{AudioRsp, Wav};
 use n64rusty_gfx::{write_png, Frame, Interpreter, Renderer};
+use n64rusty_host::script::Player;
 use n64rusty_runtime::Ctx;
 
-use crate::devices::Devices;
+use crate::devices::{Devices, Pad};
 
 /// `OSTask.t.type` of a graphics task.
 const TASK_GFX: u32 = 1;
@@ -26,6 +27,11 @@ const TASK_DATA_SIZE: u32 = 0x34;
 /// The default devices: graphics and audio interpreters, optional PNG
 /// capture and WAV recording, one controller with nothing pressed.
 pub struct Media {
+    /// Scripted controller input, if any.
+    input: Option<Player>,
+    /// Ports the script uses (port 1 is always plugged in).
+    ports: [bool; 4],
+    retrace: u64,
     sound: AudioRsp,
     /// Where to record, and the recording once the first buffer arrives.
     /// (The audio crate's player can also drive speakers, which is not
@@ -53,11 +59,31 @@ pub struct Media {
 }
 
 impl Media {
-    /// Saves every `every`-th finished frame to `capture`, and records the
-    /// sound to `wav`, when given.
-    pub fn new(capture: Option<PathBuf>, every: u64, wav: Option<PathBuf>) -> Self {
+    /// Saves every `every`-th finished frame to `capture` and records the
+    /// sound to `wav`, when given. `n_audio` selects the audio command set
+    /// of the alternative audio library. `input` is a controller script
+    /// (`frame port buttons x y` lines; see `n64rusty_host::script`), read
+    /// against retrace numbers.
+    pub fn new(
+        capture: Option<PathBuf>,
+        every: u64,
+        wav: Option<PathBuf>,
+        n_audio: bool,
+        input: Option<Vec<n64rusty_host::script::Event>>,
+    ) -> Self {
+        let mut ports = [true, false, false, false];
+        for e in input.iter().flatten() {
+            ports[e.port] = true;
+        }
         Media {
-            sound: AudioRsp::new(),
+            input: input.map(Player::new),
+            ports,
+            retrace: 0,
+            sound: if n_audio {
+                AudioRsp::n_audio()
+            } else {
+                AudioRsp::new()
+            },
             wav_path: wav,
             wav: None,
             rate: 0,
@@ -170,6 +196,23 @@ impl Devices for Media {
         self.rate = hz;
     }
 
+    fn retrace(&mut self, frame: u64, _framebuffer: u32) {
+        self.retrace = frame;
+    }
+
+    fn pads(&mut self) -> [Pad; 4] {
+        let held = match self.input.as_mut() {
+            Some(p) => p.pads_at(self.retrace),
+            None => Default::default(),
+        };
+        std::array::from_fn(|i| Pad {
+            connected: self.ports[i],
+            buttons: held[i].buttons,
+            stick_x: held[i].x,
+            stick_y: held[i].y,
+        })
+    }
+
     fn swap_buffer(&mut self, _ctx: &Ctx, frame: u64, _framebuffer: u32) {
         let f = self.gfx.take_frame();
         self.swaps += 1;
@@ -214,5 +257,36 @@ impl Devices for Media {
             s.push_str(&format!("  saved {}\n", p.display()));
         }
         s
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn script_drives_the_pads_by_retrace() {
+        let events =
+            n64rusty_host::script::parse("0 1 - 0 0\n10 1 START 0 0\n12 2 A 40 -20\n").unwrap();
+        let mut m = Media::new(None, 60, None, false, Some(events));
+        m.retrace(5, 0);
+        let p = m.pads();
+        assert!(p[0].connected && p[1].connected && !p[2].connected);
+        assert_eq!(p[0].buttons, 0);
+        m.retrace(12, 0);
+        let p = m.pads();
+        assert_eq!(p[0].buttons, n64rusty_host::pad::button::START);
+        assert_eq!(
+            (p[1].buttons, p[1].stick_x, p[1].stick_y),
+            (n64rusty_host::pad::button::A, 40, -20)
+        );
+    }
+
+    #[test]
+    fn no_script_means_one_idle_controller() {
+        let mut m = Media::new(None, 60, None, false, None);
+        let p = m.pads();
+        assert!(p[0].connected && !p[1].connected);
+        assert_eq!(p[0].buttons, 0);
     }
 }

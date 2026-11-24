@@ -102,6 +102,11 @@ one connected controller with nothing pressed. Nothing is shown or played:
 
 saves every 30th finished frame as a PNG and records the sound. Captures
 and recordings are game output: keep them in the git-ignored local folder.
+The audio command set follows the game's audio library: when the symbol map
+names the alternative library's routines (`n_alSynNew`, `n_alAudioFrame`),
+its command set is used. `--input script.txt` plays a controller script
+(`frame port buttons x y` lines, the format `n64rusty-host` records),
+matched against retrace numbers, so a headless run can press buttons.
 
 Guest threads start with the floating-point register mode the system
 library gives them (32-bit registers, doubles in even/odd pairs); the boot

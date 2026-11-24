@@ -193,12 +193,13 @@ pub fn crash_report(ctx: &Ctx) -> String {
 
 /// Entry point for a generated game binary:
 /// `game <rom> [--symbols file]... [--config file] [--frames n]
-/// [--capture dir] [--capture-every n] [--wav file]`.
+/// [--capture dir] [--capture-every n] [--wav file] [--input script]`.
 ///
 /// Display lists and audio command lists always go through the graphics
 /// and audio interpreters. With `--capture`, every n-th finished frame (60
 /// by default) is rendered off screen and saved as a PNG in `dir`; with
-/// `--wav`, the sound is recorded to a file. Nothing is shown or played.
+/// `--wav`, the sound is recorded to a file; `--input` plays a controller
+/// script against retrace numbers. Nothing is shown or played.
 ///
 /// System routines are replaced by role name. Their addresses come from the
 /// per-game config (`name = 0xADDR` lines, found by us) and from symbol
@@ -219,6 +220,7 @@ pub fn main_with(game: Game, devices: Option<Box<dyn devices::Devices>>) -> Exit
     let mut capture = None;
     let mut every = 60;
     let mut wav = None;
+    let mut input = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -227,13 +229,14 @@ pub fn main_with(game: Game, devices: Option<Box<dyn devices::Devices>>) -> Exit
             "--frames" => frames = it.next().and_then(|v| v.parse().ok()).unwrap_or(frames),
             "--capture" => capture = it.next().map(PathBuf::from),
             "--wav" => wav = it.next().map(PathBuf::from),
+            "--input" => input = it.next().map(PathBuf::from),
             "--capture-every" => every = it.next().and_then(|v| v.parse().ok()).unwrap_or(every),
             s => rom_path = Some(PathBuf::from(s)),
         }
     }
     let Some(rom_path) = rom_path else {
         eprintln!(
-            "usage: <game> <rom> [--symbols file]... [--config file] [--frames n] [--local dir] [--capture dir] [--capture-every n] [--wav file]"
+            "usage: <game> <rom> [--symbols file]... [--config file] [--frames n] [--local dir] [--capture dir] [--capture-every n] [--wav file] [--input script]"
         );
         return ExitCode::from(2);
     };
@@ -293,7 +296,26 @@ pub fn main_with(game: Game, devices: Option<Box<dyn devices::Devices>>) -> Exit
     // The context lives in a box that is never freed: guest threads keep
     // using it until the process exits.
     let ctx: &'static mut Ctx = Box::leak(Box::new(ctx));
-    let devices = devices.unwrap_or_else(|| Box::new(media::Media::new(capture, every, wav)));
+    let script = match input.as_ref().map(|p| {
+        std::fs::read_to_string(p)
+            .map_err(|e| e.to_string())
+            .and_then(|t| n64rusty_host::script::parse(&t))
+            .map_err(|e| format!("{}: {e}", p.display()))
+    }) {
+        Some(Err(e)) => {
+            eprintln!("error: input script {e}");
+            return ExitCode::from(2);
+        }
+        Some(Ok(events)) => Some(events),
+        None => None,
+    };
+    // The alternative audio library has its own command set; tell them
+    // apart by the library's routine names in the local symbol map.
+    let n_audio = ["n_alSynNew", "n_alAudioFrame"]
+        .iter()
+        .any(|n| by_name.contains_key(*n));
+    let devices = devices
+        .unwrap_or_else(|| Box::new(media::Media::new(capture, every, wav, n_audio, script)));
     let (outcome, report, frames_run) = os::run(ctx, game.entry, rom_bytes, frames, devices);
     let (_, dma, threads, device_summary) = os::summary();
     if let Err(e) = record_run(&local, &dma, &outcome) {
