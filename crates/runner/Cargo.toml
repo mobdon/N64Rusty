@@ -12,5 +12,7 @@ rust-version = "1.88"
 n64rusty-runtime.workspace = true
 n64rusty-rom = { path = "../rom" }
 n64rusty-gfx = { path = "../gfx" }
-n64rusty-audio = { path = "../audio" }
+n64rusty-audio = { path = "../audio", features = ["speaker"] }
 n64rusty-host = { path = "../host" }
+softbuffer = "0.4"
+winit = "0.30"
