@@ -5,8 +5,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-rust-version.workspace = true
+# The graphics crate needs a newer compiler than the rest of the workspace.
+rust-version = "1.88"
 
 [dependencies]
 n64rusty-runtime.workspace = true
 n64rusty-rom = { path = "../rom" }
+n64rusty-gfx = { path = "../gfx" }
+n64rusty-audio = { path = "../audio" }

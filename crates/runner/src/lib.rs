@@ -8,6 +8,7 @@
 //! opened and no sound is played.
 
 pub mod devices;
+pub mod media;
 pub mod os;
 
 use std::collections::BTreeMap;
@@ -191,35 +192,48 @@ pub fn crash_report(ctx: &Ctx) -> String {
 }
 
 /// Entry point for a generated game binary:
-/// `game <rom> [--symbols file]... [--config file] [--frames n]`.
+/// `game <rom> [--symbols file]... [--config file] [--frames n]
+/// [--capture dir] [--capture-every n] [--wav file]`.
+///
+/// Display lists and audio command lists always go through the graphics
+/// and audio interpreters. With `--capture`, every n-th finished frame (60
+/// by default) is rendered off screen and saved as a PNG in `dir`; with
+/// `--wav`, the sound is recorded to a file. Nothing is shown or played.
 ///
 /// System routines are replaced by role name. Their addresses come from the
 /// per-game config (`name = 0xADDR` lines, found by us) and from symbol
 /// maps read from a local file; neither is ever committed.
 pub fn main(game: Game) -> ExitCode {
-    main_with(game, Box::new(devices::Headless))
+    main_with(game, None)
 }
 
-/// Like [`main`], with the given devices for graphics, audio and input.
-pub fn main_with(game: Game, devices: Box<dyn devices::Devices>) -> ExitCode {
+/// Like [`main`], with the given devices for graphics, audio and input
+/// (`None` for the default interpreter and capture).
+pub fn main_with(game: Game, devices: Option<Box<dyn devices::Devices>>) -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut rom_path = None;
     let mut symbols = Vec::new();
     let mut frames = 600;
     // The per-game folder: config, and run logs the translator reads.
     let mut local = PathBuf::from("..");
+    let mut capture = None;
+    let mut every = 60;
+    let mut wav = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--symbols" | "--config" => symbols.extend(it.next().map(PathBuf::from)),
             "--local" => local = it.next().map(PathBuf::from).unwrap_or(local),
             "--frames" => frames = it.next().and_then(|v| v.parse().ok()).unwrap_or(frames),
+            "--capture" => capture = it.next().map(PathBuf::from),
+            "--wav" => wav = it.next().map(PathBuf::from),
+            "--capture-every" => every = it.next().and_then(|v| v.parse().ok()).unwrap_or(every),
             s => rom_path = Some(PathBuf::from(s)),
         }
     }
     let Some(rom_path) = rom_path else {
         eprintln!(
-            "usage: <game> <rom> [--symbols file]... [--config file] [--frames n] [--local dir]"
+            "usage: <game> <rom> [--symbols file]... [--config file] [--frames n] [--local dir] [--capture dir] [--capture-every n] [--wav file]"
         );
         return ExitCode::from(2);
     };
@@ -279,8 +293,9 @@ pub fn main_with(game: Game, devices: Box<dyn devices::Devices>) -> ExitCode {
     // The context lives in a box that is never freed: guest threads keep
     // using it until the process exits.
     let ctx: &'static mut Ctx = Box::leak(Box::new(ctx));
+    let devices = devices.unwrap_or_else(|| Box::new(media::Media::new(capture, every, wav)));
     let (outcome, report, frames_run) = os::run(ctx, game.entry, rom_bytes, frames, devices);
-    let (_, dma, threads) = os::summary();
+    let (_, dma, threads, device_summary) = os::summary();
     if let Err(e) = record_run(&local, &dma, &outcome) {
         eprintln!(
             "warning: could not write the run log in {}: {e}",
@@ -293,6 +308,7 @@ pub fn main_with(game: Game, devices: Box<dyn devices::Devices>) -> ExitCode {
         println!("  rom {rom_off:#09x} -> {ram:#010x} len {len:#x}");
     }
     println!("threads:\n{threads}");
+    print!("{device_summary}");
     match outcome {
         os::Outcome::Frames(n) => {
             println!("ran {n} frames without a panic");

@@ -24,8 +24,8 @@ pub struct Pad {
 pub trait Devices: Send {
     /// A task was started on the RSP (`osSpTaskStartGo`). `task` is the
     /// guest address of the `OSTask`; type 1 is graphics, 2 is audio.
-    /// RAM can be read through `ctx.mem`.
-    fn rsp_task(&mut self, ctx: &Ctx, task: u32) {
+    /// RAM is `ctx.mem`; audio tasks write their output there.
+    fn rsp_task(&mut self, ctx: &mut Ctx, task: u32) {
         let _ = (ctx, task);
     }
 
@@ -44,6 +44,18 @@ pub trait Devices: Send {
     /// asked to show.
     fn retrace(&mut self, frame: u64, framebuffer: u32) {
         let _ = (frame, framebuffer);
+    }
+
+    /// The game asked to show the framebuffer at `framebuffer`
+    /// (`osViSwapBuffer`) during retrace number `frame`: one finished frame.
+    fn swap_buffer(&mut self, ctx: &Ctx, frame: u64, framebuffer: u32) {
+        let _ = (ctx, frame, framebuffer);
+    }
+
+    /// Called once when the run ends: finish any output and return a few
+    /// lines for the report.
+    fn summary(&mut self) -> String {
+        String::new()
     }
 
     /// Controller state for the four ports.
