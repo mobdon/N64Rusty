@@ -3,10 +3,12 @@
 //! audio tasks through the audio command interpreter (output optionally
 //! recorded to a WAV file). Nothing opens a window or plays sound.
 
+use std::fs::File;
+use std::io::BufWriter;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 
-use n64rusty_audio::{AudioOut, AudioRsp};
+use n64rusty_audio::{AudioRsp, Wav};
 use n64rusty_gfx::{write_png, Frame, Interpreter, Renderer};
 use n64rusty_runtime::Ctx;
 
@@ -25,7 +27,12 @@ const TASK_DATA_SIZE: u32 = 0x34;
 /// capture and WAV recording, one controller with nothing pressed.
 pub struct Media {
     sound: AudioRsp,
-    out: AudioOut,
+    /// Where to record, and the recording once the first buffer arrives.
+    /// (The audio crate's player can also drive speakers, which is not
+    /// `Send` everywhere and never wanted here.)
+    wav_path: Option<PathBuf>,
+    wav: Option<Wav<BufWriter<File>>>,
+    rate: u32,
     audio_tasks: u64,
     audio_buffers: u64,
     /// Set when the audio interpreter stopped on a command it lacks; audio
@@ -49,13 +56,11 @@ impl Media {
     /// Saves every `every`-th finished frame to `capture`, and records the
     /// sound to `wav`, when given.
     pub fn new(capture: Option<PathBuf>, every: u64, wav: Option<PathBuf>) -> Self {
-        let mut out = AudioOut::new();
-        if let Some(w) = wav {
-            out.record_wav(w);
-        }
         Media {
             sound: AudioRsp::new(),
-            out,
+            wav_path: wav,
+            wav: None,
+            rate: 0,
             audio_tasks: 0,
             audio_buffers: 0,
             audio_failed: None,
@@ -141,14 +146,28 @@ impl Devices for Media {
 
     fn audio(&mut self, ctx: &Ctx, addr: u32, len: u32) {
         self.audio_buffers += 1;
-        if let Err(e) = self.out.play(&ctx.mem, addr, len) {
+        let Some(path) = &self.wav_path else {
+            return;
+        };
+        // Whole left/right frames of big-endian 16-bit samples.
+        let samples: Vec<i16> = (0..(len & !3) / 2)
+            .map(|i| ctx.mem.read_u16(addr + 2 * i) as i16)
+            .collect();
+        let result = (|| {
+            if self.wav.is_none() {
+                self.wav = Some(Wav::new(BufWriter::new(File::create(path)?), self.rate)?);
+            }
+            self.wav.as_mut().map_or(Ok(()), |w| w.write(&samples))
+        })();
+        if let Err(e) = result {
             self.audio_failed
                 .get_or_insert_with(|| format!("recording: {e}"));
+            self.wav_path = None;
         }
     }
 
     fn audio_rate(&mut self, hz: u32) {
-        self.out.set_frequency(hz);
+        self.rate = hz;
     }
 
     fn swap_buffer(&mut self, _ctx: &Ctx, frame: u64, _framebuffer: u32) {
@@ -183,14 +202,12 @@ impl Devices for Media {
         }
         s.push_str(&format!(
             "audio: {} tasks, {} buffers at {} Hz\n",
-            self.audio_tasks,
-            self.audio_buffers,
-            self.out.frequency()
+            self.audio_tasks, self.audio_buffers, self.rate
         ));
         if let Some(e) = &self.audio_failed {
             s.push_str(&format!("  audio stopped: {e}\n"));
         }
-        if let Err(e) = self.out.finish() {
+        if let Some(Err(e)) = self.wav.take().map(|w| w.finish()) {
             s.push_str(&format!("  recording not finished: {e}\n"));
         }
         for p in &self.saved {
