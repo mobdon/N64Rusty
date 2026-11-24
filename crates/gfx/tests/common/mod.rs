@@ -238,8 +238,12 @@ impl Dl {
             tile << 24,
         )
     }
+    pub fn prim_depth(&mut self, z: u16) -> &mut Self {
+        self.c(0xEE << 24, (z as u32) << 16)
+    }
+    /// Load block for textures whose rows are one 64-bit word (dxt 1.0).
     pub fn load_block(&mut self, tile: u32, texels: u32) -> &mut Self {
-        self.c(0xF3 << 24, tile << 24 | (texels - 1) << 12)
+        self.c(0xF3 << 24, tile << 24 | (texels - 1) << 12 | 0x800)
     }
     pub fn load_tlut(&mut self, tile: u32, count: u32) -> &mut Self {
         self.c(0xF0 << 24, tile << 24 | ((count - 1) << 2) << 12)
