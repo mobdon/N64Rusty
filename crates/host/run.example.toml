@@ -1,0 +1,25 @@
+# Example run config: one file describes one run. Every key is optional.
+# Copy it next to your per-game files and pass its path to the runner.
+
+# frames = 600                  # stop after this many frames
+# frame_rate = 59.94            # host frames per second (NTSC default)
+# replay = "intro.txt"          # play this input script instead of live input
+# record = "take.txt"           # write this run's input here
+# debug_port = "127.0.0.1:6464" # loopback only; the run starts paused
+
+[window]
+title = "n64rusty"
+scale = 2                       # 320x240 times this
+
+# Ports 1 to 4, in order. Sources: "keyboard", "gamepad0", "gamepad1", ...
+[[port]]
+sources = ["keyboard", "gamepad0"]
+# keys = { KeyJ = "A", KeyK = "B" }  # replaces the default layout; winit key
+#                                     # names (KeyW, Space, ShiftLeft, Digit1).
+#                                     # Arrow keys are refused: movement is WASD.
+[[port]]
+sources = ["gamepad1"]
+[[port]]
+sources = ["gamepad2"]
+[[port]]
+sources = ["gamepad3"]
