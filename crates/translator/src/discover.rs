@@ -224,6 +224,33 @@ fn looks_like_prologue(w: u32) -> bool {
     i.op == Op::Addiu && i.rs == 29 && i.rt == 29 && i.simm() < 0
 }
 
+/// Places that start a function by their layout: the image's first word,
+/// or the first non-zero word after a `jr $ra` and its delay slot, when it
+/// opens a stack frame (`addiu $sp, $sp, -n`). For code copied in at run
+/// time, whose functions are mostly reached through pointers set up by code.
+pub fn function_starts(img: &Image) -> Vec<u32> {
+    const JR_RA: u32 = 0x03E0_0008;
+    let end = img.base.wrapping_add(img.bytes.len() as u32 & !3);
+    let mut out = Vec::new();
+    let mut a = img.base;
+    let mut after_return = true;
+    while a < end {
+        let w = img.word(a).unwrap_or(0);
+        if after_return && w != 0 {
+            if looks_like_prologue(w) {
+                out.push(a);
+            }
+            after_return = false;
+        }
+        if w == JR_RA {
+            after_return = true;
+            a += 4; // the delay slot
+        }
+        a += 4;
+    }
+    out
+}
+
 /// Words anywhere in the image that point inside it at something that starts
 /// like a function (`addiu $sp, $sp, -n`): function pointers in data tables.
 /// Pass them to [`discover`] as hints.
@@ -372,6 +399,34 @@ mod tests {
     }
     const JR_RA: u32 = 0x03E0_0008;
     const NOP: u32 = 0;
+
+    #[test]
+    fn function_starts_follow_returns() {
+        const FRAME: u32 = 0x27BD_FFF8; // addiu $sp,$sp,-8
+                                        // A function, padding, a function, a leaf (no frame), then data
+                                        // after a return that does not open a frame.
+        let words = [
+            FRAME,
+            JR_RA,
+            NOP,
+            NOP,
+            NOP, // 0x00, padding at 0x0c
+            FRAME,
+            JR_RA,
+            0x27BD_0008, // 0x14, delay slot pops the frame
+            0x2402_0001,
+            JR_RA,
+            NOP, // 0x20: leaf
+            0x1234_5678,
+            FRAME, // data, then a frame-like word not after a return
+        ];
+        let bytes = image(&words);
+        let img = Image {
+            base: BASE,
+            bytes: &bytes,
+        };
+        assert_eq!(function_starts(&img), [BASE, BASE + 0x14]);
+    }
 
     #[test]
     fn data_pointers_find_prologues() {
