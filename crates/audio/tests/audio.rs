@@ -299,3 +299,20 @@ fn audio_out_records_wav_and_mute_leaves_recording() {
         [0x34, 0x12, 0xFF, 0xFF, 5, 0, 6, 0, 0x34, 0x12, 0xFF, 0xFF]
     );
 }
+
+#[test]
+fn audio_out_needs_a_frequency_and_plays_whole_frames() {
+    let mut ram = ram();
+    put(&mut ram, OUT, &[1, 2, 3, 4]);
+    let path =
+        std::env::temp_dir().join(format!("n64rusty-audio-frames-{}.wav", std::process::id()));
+    let mut ai = AudioOut::new();
+    ai.record_wav(&path);
+    assert!(ai.play(&ram, OUT, 8).is_err(), "no frequency set yet");
+    ai.set_frequency(32000);
+    ai.play(&ram, OUT, 6).unwrap();
+    ai.finish().unwrap();
+    let b = std::fs::read(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(&b[44..], [1, 0, 2, 0], "the half frame is dropped");
+}

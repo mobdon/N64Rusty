@@ -70,7 +70,8 @@ impl AudioOut {
     /// 16-bit samples at `addr` in guest RAM, as the game does when it
     /// queues the next AI buffer.
     pub fn play(&mut self, ram: &Memory, addr: u32, len: u32) -> io::Result<()> {
-        let samples: Vec<i16> = (0..len / 2)
+        // Whole left/right frames only, so a stray length never swaps channels.
+        let samples: Vec<i16> = (0..(len & !3) / 2)
             .map(|i| ram.read_u16(addr + 2 * i) as i16)
             .collect();
         if let (None, Some(path)) = (&self.wav, &self.wav_path) {
