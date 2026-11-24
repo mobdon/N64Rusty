@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::OnceLock;
 
 use crate::combiner::{shader, ShaderKey};
 use crate::{mat_mul, Command, Frame, RenderState, Wrap};
@@ -147,6 +148,34 @@ fn factor(f: u8) -> wgpu::BlendFactor {
     }
 }
 
+/// The process-wide instance and adapter, found once.
+///
+/// Every renderer opens its own device on this adapter. Enumerating
+/// adapters again for each renderer let one thread's enumeration unload a
+/// driver while another renderer's device was calling into it (the Vulkan
+/// loader drops drivers it probed), which crashed parallel tests on Linux.
+fn adapter() -> Result<&'static wgpu::Adapter, RenderError> {
+    static ADAPTER: OnceLock<Result<(wgpu::Instance, wgpu::Adapter), String>> = OnceLock::new();
+    let found = ADAPTER.get_or_init(|| {
+        let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
+        desc.backends = wgpu::Backends::VULKAN
+            | wgpu::Backends::METAL
+            | wgpu::Backends::DX12
+            | wgpu::Backends::GL;
+        let instance = wgpu::Instance::new(desc);
+        let mut opts = wgpu::RequestAdapterOptions::default();
+        let adapter = pollster::block_on(instance.request_adapter(&opts)).or_else(|_| {
+            opts.force_fallback_adapter = true;
+            pollster::block_on(instance.request_adapter(&opts)).map_err(|e| e.to_string())
+        })?;
+        Ok((instance, adapter))
+    });
+    match found {
+        Ok((_, adapter)) => Ok(adapter),
+        Err(e) => Err(RenderError::NoAdapter(e.clone())),
+    }
+}
+
 /// A headless wgpu renderer for [`Frame`]s.
 pub struct Renderer {
     device: wgpu::Device,
@@ -168,23 +197,7 @@ impl Renderer {
     }
 
     async fn new_async() -> Result<Self, RenderError> {
-        let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
-        desc.backends = wgpu::Backends::VULKAN
-            | wgpu::Backends::METAL
-            | wgpu::Backends::DX12
-            | wgpu::Backends::GL;
-        let instance = wgpu::Instance::new(desc);
-        let mut opts = wgpu::RequestAdapterOptions::default();
-        let adapter = match instance.request_adapter(&opts).await {
-            Ok(a) => a,
-            Err(_) => {
-                opts.force_fallback_adapter = true;
-                instance
-                    .request_adapter(&opts)
-                    .await
-                    .map_err(|e| RenderError::NoAdapter(e.to_string()))?
-            }
-        };
+        let adapter = adapter()?;
         let info = adapter.get_info();
         let adapter_name = format!("{} ({:?})", info.name, info.backend);
         let (device, queue) = adapter

@@ -279,3 +279,28 @@ fn scissor_limits_drawing() {
         assert_px(&img, 150 * scale, 200 * scale, BLUE);
     }
 }
+
+/// Renderers made and used on many threads at once, as parallel tests and
+/// a runner with several outputs do. Adapter discovery used to run per
+/// renderer and could unload a driver another thread was using.
+#[test]
+fn renderers_on_many_threads_at_once() {
+    let Some(_) = renderer() else { return };
+    let threads: Vec<_> = (0..8)
+        .map(|_| {
+            std::thread::spawn(|| {
+                for _ in 0..3 {
+                    let mut ram = Ram::default();
+                    let dl = scene(&mut ram, |_, _| {});
+                    let f = frame(&mut ram, &dl);
+                    let mut r = Renderer::new().unwrap();
+                    let img = r.render(&f, 64, 48).unwrap();
+                    assert_px(&img, 32, 24, BLUE);
+                }
+            })
+        })
+        .collect();
+    for t in threads {
+        t.join().unwrap();
+    }
+}
