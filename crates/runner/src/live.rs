@@ -212,6 +212,15 @@ pub fn play(
     media: Media,
     run: impl FnOnce(Box<dyn Devices>) -> u8 + Send + 'static,
 ) -> ExitCode {
+    // A crash closes the window and often the console with it: keep the
+    // message in crash.txt in the per-game folder as well.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_hook(info);
+        let thread = std::thread::current().name().unwrap_or("?").to_string();
+        let trace = std::backtrace::Backtrace::force_capture();
+        let _ = std::fs::write("crash.txt", format!("thread {thread}: {info}\n\n{trace}\n"));
+    }));
     let (live, screen) = pair(media);
     std::thread::Builder::new()
         .name("game".into())

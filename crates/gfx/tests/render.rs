@@ -319,3 +319,16 @@ fn window_path_letterboxes_at_window_size() {
     assert_px(&img, 90, 10, BLUE);
     assert_px(&img, 710, 470, BLUE);
 }
+
+#[test]
+fn window_path_draws_at_full_screen_sizes() {
+    let Some(mut r) = renderer() else { return };
+    let mut ram = Ram::default();
+    let dl = scene(&mut ram, |_, _| {});
+    let f = frame(&mut ram, &dl);
+    // A 4K full-screen window: wider and taller than the 2048 the lowest
+    // GPU limits allow, which crashed going full screen.
+    let img = r.render_letterboxed(&f, 3840, 2160).unwrap();
+    assert_px(&img, 100, 1080, [0, 0, 0, 255]);
+    assert_px(&img, 1920, 1080, BLUE);
+}

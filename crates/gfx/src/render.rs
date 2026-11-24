@@ -207,7 +207,9 @@ impl Renderer {
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("n64rusty-gfx"),
-                required_limits: wgpu::Limits::downlevel_defaults(),
+                // All the adapter offers: the lowest limits cap textures at
+                // 2048 pixels, smaller than a full-screen window.
+                required_limits: adapter.limits(),
                 ..Default::default()
             })
             .await
@@ -951,7 +953,8 @@ impl Renderer {
         width: u32,
         height: u32,
     ) -> Result<(), RenderError> {
-        if width == 0 || height == 0 {
+        let max = self.device.limits().max_texture_dimension_2d;
+        if width == 0 || height == 0 || width > max || height > max {
             return Ok(());
         }
         if win.size != Some((width, height)) {
