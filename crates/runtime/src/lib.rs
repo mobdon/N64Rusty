@@ -172,6 +172,34 @@ impl Ctx {
         }
     }
 
+    /// For a crash report: the overlays whose RAM range holds `addr`, and
+    /// whether each one is loaded or hidden there by a later copy.
+    fn overlays_at(&self, addr: u32) -> String {
+        let mut s = String::new();
+        for (i, o) in self.overlays.iter().enumerate() {
+            if addr < o.ram || addr >= o.ram.wrapping_add(o.len) {
+                continue;
+            }
+            let state = match self.loaded.iter().find(|(j, _)| *j == i) {
+                None => "not loaded".to_string(),
+                Some((_, dead)) => match dead.iter().find(|&&(lo, hi)| addr >= lo && addr < hi) {
+                    Some((lo, hi)) => format!("loaded, but {lo:#010x}..{hi:#010x} was copied over"),
+                    None => "loaded".to_string(),
+                },
+            };
+            let has = if o.funcs.contains_key(&addr) {
+                "has it"
+            } else {
+                "lacks it"
+            };
+            s.push_str(&format!(
+                "\n  overlay rom {:#x} -> {:#010x} len {:#x}: {state}, {has}",
+                o.rom, o.ram, o.len
+            ));
+        }
+        s
+    }
+
     /// The function at `addr`: an override, a loaded overlay's, or a
     /// registered one.
     fn lookup(&self, addr: u32) -> Option<GuestFn> {
@@ -208,7 +236,10 @@ impl Ctx {
                 f(self);
                 self.depth -= 1;
             }
-            None => panic!("call to unknown guest function {addr:#010x}"),
+            None => panic!(
+                "call to unknown guest function {addr:#010x}{}",
+                self.overlays_at(addr)
+            ),
         }
     }
 
@@ -428,6 +459,22 @@ mod tests {
         assert!(c.has_function(0x8010_0000));
         c.overlay_loaded(0x9000, 0x800F_0000, 0x10_0000);
         assert!(!c.has_function(0x8010_0000));
+    }
+
+    #[test]
+    fn unknown_call_names_the_overlays_there() {
+        fn a(_: &mut Ctx) {}
+        let mut c = Ctx::new(Memory::new(16));
+        c.register_overlay(0x1000, 0x8010_0000, 0x100, &[(0x8010_0000, a)]);
+        c.overlay_loaded(0x1000, 0x8010_0000, 0x100);
+        assert_eq!(
+            c.overlays_at(0x8010_0040),
+            "\n  overlay rom 0x1000 -> 0x80100000 len 0x100: loaded, lacks it"
+        );
+        c.overlay_loaded(0x9000, 0x8010_0000, 0x10);
+        assert!(c
+            .overlays_at(0x8010_0000)
+            .contains("was copied over, has it"));
     }
 
     #[test]

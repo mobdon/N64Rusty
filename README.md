@@ -100,7 +100,9 @@ one connected controller with nothing pressed. Nothing is shown or played:
 ./target/debug/n64rusty-game-<hash> your.z64 --capture frames/ --capture-every 30 --wav run.wav
 ```
 
-saves every 30th finished frame as a PNG and records the sound. Captures
+saves every 30th finished frame as a PNG and records the sound.
+`--capture-scale 4` renders the saved frames at four times the game's
+resolution (the geometry is drawn again at that size, not stretched). Captures
 and recordings are game output: keep them in the git-ignored local folder.
 The audio command set follows the game's audio library: when the symbol map
 names the alternative library's routines (`n_alSynNew`, `n_alAudioFrame`),

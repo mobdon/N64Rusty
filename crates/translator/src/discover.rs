@@ -302,6 +302,23 @@ pub fn discover(img: &Image, entries: &[u32], hints: &[u32], code_end: Option<u3
             known.insert(a);
             fresh.push(a);
         }
+        // Third: compiled code is laid out function after function, so
+        // code in a gap between two functions found so far (after any zero
+        // padding) starts a function too: one reached only through a
+        // pointer built in code, often a small leaf without a prologue.
+        // Only gaps between functions; data follows the last one.
+        if fresh.is_empty() {
+            let starts: Vec<u32> = done.keys().copied().collect();
+            for pair in starts.windows(2) {
+                let mut a = done[&pair[0]].end;
+                while a < pair[1] && img.word(a) == Some(0) {
+                    a += 4;
+                }
+                if a < pair[1] && a < code_end && !inside_known(a) && known.insert(a) {
+                    fresh.push(a);
+                }
+            }
+        }
         if fresh.is_empty() {
             break;
         }
@@ -381,6 +398,33 @@ mod tests {
             .collect();
         assert_eq!(got, vec![(BASE, 4), (BASE + 16, 2)]);
         assert_eq!(d.text_end, BASE + 24);
+    }
+
+    #[test]
+    fn code_between_functions_is_a_function() {
+        // f: jal h ; nop ; jr ra ; nop | pad | g (reached by no call):
+        // jr ra ; nop | h: jr ra ; nop | (data after the last function)
+        let bytes = image(&[
+            jal(BASE + 32),
+            NOP,
+            JR_RA,
+            NOP,
+            0,
+            0,
+            JR_RA,
+            NOP,
+            JR_RA,
+            NOP,
+            0x1234_5678,
+            JR_RA,
+        ]);
+        let img = Image {
+            base: BASE,
+            bytes: &bytes,
+        };
+        let d = discover(&img, &[BASE], &[], None);
+        let starts: Vec<u32> = d.functions.iter().map(|f| f.addr).collect();
+        assert_eq!(starts, vec![BASE, BASE + 24, BASE + 32]);
     }
 
     #[test]

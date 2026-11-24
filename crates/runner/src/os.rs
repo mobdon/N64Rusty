@@ -251,6 +251,11 @@ fn put_message(c: &mut Ctx, st: &mut State, mq: u32, msg: u32, jam: bool) -> boo
     if count == 0 || valid >= count {
         return false;
     }
+    assert!(
+        first < count && count <= 0x1_0000,
+        "message queue {mq:#010x} is not set up: valid {valid}, first {first}, count {count}, buffer {buf:#010x}, called from {:#010x}",
+        c.r[31] as u32
+    );
     if jam {
         let f = (first + count - 1) % count;
         c.mem.write_u32(buf + 4 * f, msg);
@@ -434,9 +439,12 @@ fn reschedule(c: &mut Ctx, mut st: MutexGuard<'static, State>) -> MutexGuard<'st
 }
 
 /// Waits forever: the run is over and the main thread is reporting.
-fn park(st: MutexGuard<'static, State>) -> ! {
-    let _g = os().cv.wait_while(st, |_| true);
-    unreachable!()
+fn park(mut st: MutexGuard<'static, State>) -> ! {
+    // A panic on another guest thread poisons the lock; keep waiting so
+    // that panic is the one reported.
+    loop {
+        st = os().cv.wait(st).unwrap_or_else(|e| e.into_inner());
+    }
 }
 
 fn spawn_thread(id: u32) {
