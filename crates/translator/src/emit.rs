@@ -153,6 +153,8 @@ fn simple(i: &Inst, pc: u32) -> String {
         Swc1 => format!("ctx.mem.write_u32({}, ctx.fw({t}));", addr(i)),
         Sdc1 => format!("ctx.mem.write_u64({}, ctx.fl({t}));", addr(i)),
         Cop1 => cop1(i, pc),
+        Mfc0 => set(t, &format!("ctx.mfc0({d})")),
+        Mtc0 => format!("ctx.mtc0({d}, {});", r(t)),
         Syscall | Break | Unknown => {
             format!("ctx.unimplemented({pc:#010x}, {:#010x});", i.word)
         }

@@ -1,6 +1,24 @@
 //! Big-endian guest RAM.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use crate::sx32;
+
+/// What lies outside RAM, for hosts that run real games: the RSP's memory,
+/// the cartridge ROM, and every other hardware register as plain storage
+/// (writes are kept, reads give the last value written or zero). Device
+/// behaviour belongs in the host, which replaces the system routines that
+/// depend on it.
+#[derive(Clone)]
+pub struct Io {
+    /// RSP data and instruction memory, 8 KiB at physical 0x0400_0000.
+    pub sp_mem: Vec<u8>,
+    /// Cartridge ROM at physical 0x1000_0000, read-only.
+    pub rom: Arc<[u8]>,
+    /// Other registers, by word address.
+    pub regs: HashMap<u32, u32>,
+}
 
 /// Guest RAM, stored big-endian as on the console.
 ///
@@ -12,6 +30,7 @@ use crate::sx32;
 #[derive(Clone)]
 pub struct Memory {
     bytes: Vec<u8>,
+    io: Option<Box<Io>>,
 }
 
 impl Memory {
@@ -19,12 +38,62 @@ impl Memory {
     pub fn new(size: usize) -> Self {
         Self {
             bytes: vec![0; size],
+            io: None,
         }
     }
 
     /// RAM with the given contents, in big-endian order.
     pub fn from_bytes(bytes: Vec<u8>) -> Self {
-        Self { bytes }
+        Self { bytes, io: None }
+    }
+
+    /// Maps the space outside RAM. Without this, such accesses panic.
+    pub fn set_io(&mut self, io: Io) {
+        self.io = Some(Box::new(io));
+    }
+
+    /// The space outside RAM, if mapped.
+    pub fn io_mut(&mut self) -> Option<&mut Io> {
+        self.io.as_deref_mut()
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn io_get(&self, vaddr: u32, p: usize, out: &mut [u8]) {
+        let Some(io) = &self.io else {
+            out_of_range(vaddr)
+        };
+        for (k, b) in out.iter_mut().enumerate() {
+            let a = p + k;
+            *b = match a {
+                0x0400_0000..=0x0400_1FFF => io.sp_mem[a - 0x0400_0000],
+                0x1000_0000..=0x1FBF_FFFF => io.rom.get(a - 0x1000_0000).copied().unwrap_or(0),
+                _ => {
+                    let w = io.regs.get(&(a as u32 & !3)).copied().unwrap_or(0);
+                    (w >> (8 * (3 - (a & 3)))) as u8
+                }
+            };
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn io_put(&mut self, vaddr: u32, p: usize, data: &[u8]) {
+        let Some(io) = &mut self.io else {
+            out_of_range(vaddr)
+        };
+        for (k, &b) in data.iter().enumerate() {
+            let a = p + k;
+            match a {
+                0x0400_0000..=0x0400_1FFF => io.sp_mem[a - 0x0400_0000] = b,
+                0x1000_0000..=0x1FBF_FFFF => {}
+                _ => {
+                    let w = io.regs.entry(a as u32 & !3).or_insert(0);
+                    let sh = 8 * (3 - (a & 3));
+                    *w = (*w & !(0xFF << sh)) | (u32::from(b) << sh);
+                }
+            }
+        }
     }
 
     /// The raw big-endian contents.
@@ -38,29 +107,34 @@ impl Memory {
     }
 
     #[inline(always)]
-    fn phys(&self, vaddr: u32, len: usize) -> usize {
+    fn phys(vaddr: u32, len: usize) -> usize {
         let p = (vaddr & 0x1FFF_FFFF) as usize;
         if p & (len - 1) != 0 {
             misaligned(vaddr, len);
-        }
-        if p + len > self.bytes.len() {
-            out_of_range(vaddr);
         }
         p
     }
 
     #[inline(always)]
     fn get<const N: usize>(&self, vaddr: u32) -> [u8; N] {
-        let p = self.phys(vaddr, N);
+        let p = Self::phys(vaddr, N);
         let mut b = [0; N];
-        b.copy_from_slice(&self.bytes[p..p + N]);
+        if p + N <= self.bytes.len() {
+            b.copy_from_slice(&self.bytes[p..p + N]);
+        } else {
+            self.io_get(vaddr, p, &mut b);
+        }
         b
     }
 
     #[inline(always)]
     fn put<const N: usize>(&mut self, vaddr: u32, b: [u8; N]) {
-        let p = self.phys(vaddr, N);
-        self.bytes[p..p + N].copy_from_slice(&b);
+        let p = Self::phys(vaddr, N);
+        if p + N <= self.bytes.len() {
+            self.bytes[p..p + N].copy_from_slice(&b);
+        } else {
+            self.io_put(vaddr, p, &b);
+        }
     }
 
     #[inline(always)]
@@ -231,6 +305,28 @@ mod tests {
         assert_eq!(m.read_u64(0x8000_0000), 0x1122_3344_5566_A1B2);
         m.sdr(0x8000_0001, 0xA1B2_C3D4_E5F6_0718);
         assert_eq!(m.read_u64(0x8000_0000), 0x0718_3344_5566_A1B2);
+    }
+
+    #[test]
+    fn io_space_when_mapped() {
+        let mut m = ram();
+        m.set_io(Io {
+            sp_mem: vec![0; 0x2000],
+            rom: Arc::from(vec![1u8, 2, 3, 4]),
+            regs: HashMap::new(),
+        });
+        m.write_u32(0xA480_0018, 0x1234_5678);
+        assert_eq!(m.read_u32(0xA480_0018), 0x1234_5678);
+        assert_eq!(m.read_u8(0xA480_001B), 0x78);
+        assert_eq!(m.read_u32(0xB000_0000), 0x0102_0304);
+        m.write_u16(0xA400_0010, 0xBEEF);
+        assert_eq!(m.read_u16(0xA400_0010), 0xBEEF);
+    }
+
+    #[test]
+    #[should_panic(expected = "outside RAM")]
+    fn unmapped_io_panics() {
+        ram().read_u32(0xA480_0018);
     }
 
     #[test]

@@ -81,6 +81,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "n64rusty-host"
+version = "0.0.0"
+dependencies = [
+ "n64rusty-rom",
+ "n64rusty-runtime",
+]
+
+[[package]]
 name = "n64rusty-refcpu"
 version = "0.0.0"
 
