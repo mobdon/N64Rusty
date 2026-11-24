@@ -24,7 +24,7 @@ through one small interface.
 | `n64rusty-rom` | `crates/rom` | ROM loading: byte order, SHA-256, header, boot code variant |
 | `n64rusty-refcpu` | `crates/refcpu` | Reference VR4300 interpreter, used only by tests |
 | `n64rusty-conformance` | `crates/conformance` | Per-instruction tests: translated code against the reference CPU |
-| `n64rusty-host` | `crates/host` | Runs a recompiled game: boot, threads, messages, timers, DMA and the system library replaced in Rust; devices plug in through one trait |
+| `n64rusty-runner` | `crates/runner` | Runs a recompiled game: boot, threads, messages, timers, DMA and the system library replaced in Rust; devices plug in through one trait |
 
 ```
 cargo build --workspace
@@ -85,7 +85,7 @@ only through a pointer is added. Repeat until the run reaches its frame
 limit.
 
 Graphics, audio and input are separate crates that implement
-`n64rusty_host::devices::Devices` (RSP tasks, audio buffers, retrace and
+`n64rusty_runner::devices::Devices` (RSP tasks, audio buffers, retrace and
 controller state). The default, `Headless`, ignores output and reports one
 connected controller with nothing pressed.
 

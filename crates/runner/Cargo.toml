@@ -1,6 +1,6 @@
 [package]
-name = "n64rusty-host"
-description = "Headless host that runs recompiled N64 code and replaces system routines"
+name = "n64rusty-runner"
+description = "Runs recompiled N64 code headless and replaces system routines"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
