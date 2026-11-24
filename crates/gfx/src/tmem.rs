@@ -195,7 +195,7 @@ impl Tmem {
             (2, 1) => self.palette(at(0) as u32, tlut),
             (3, 0) => {
                 let n = nib();
-                let i = (n >> 1) * 255 / 7;
+                let i = ((n >> 1) as u16 * 255 / 7) as u8;
                 [i, i, i, (n & 1) * 255]
             }
             (3, 1) => {
@@ -298,5 +298,23 @@ fn wrap_mask(c: u32, mask: u32, cm: u32) -> u32 {
 impl Hash for Texture {
     fn hash<H: Hasher>(&self, state: &mut H) {
         (self.width, self.height, &self.rgba, self.wrap).hash(state);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ia4_texels_use_full_intensity_range() {
+        let mut m = Tmem::default();
+        m.mem[0] = 0xF6; // texels 0xF (i 7, a 1) and 0x6 (i 3, a 0)
+        let t = Tile {
+            fmt: 3,
+            siz: 0,
+            ..Tile::default()
+        };
+        assert_eq!(m.texel(&t, 0, 0, 0), [255, 255, 255, 255]);
+        assert_eq!(m.texel(&t, 1, 0, 0), [109, 109, 109, 0]);
     }
 }
