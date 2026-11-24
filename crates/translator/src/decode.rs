@@ -107,6 +107,20 @@ pub enum Op {
     Bc1t,
     Bc1fl,
     Bc1tl,
+    // COP1 moves, loads and stores.
+    Mfc1,
+    Dmfc1,
+    Cfc1,
+    Mtc1,
+    Dmtc1,
+    Ctc1,
+    Lwc1,
+    Ldc1,
+    Swc1,
+    Sdc1,
+    /// COP1 arithmetic, conversion or compare: format in `rs`, operation in
+    /// the funct field.
+    Cop1,
     /// Anything not decoded yet (coprocessors, traps, LL/SC, ...).
     Unknown,
 }
@@ -208,12 +222,26 @@ impl Inst {
                 0x13 => Op::Bgezall,
                 _ => Op::Unknown,
             },
-            0x11 if rs == 0x08 => match rt & 3 {
-                0 => Op::Bc1f,
-                1 => Op::Bc1t,
-                2 => Op::Bc1fl,
-                _ => Op::Bc1tl,
+            0x11 => match rs {
+                0x00 => Op::Mfc1,
+                0x01 => Op::Dmfc1,
+                0x02 => Op::Cfc1,
+                0x04 => Op::Mtc1,
+                0x05 => Op::Dmtc1,
+                0x06 => Op::Ctc1,
+                0x08 => match rt & 3 {
+                    0 => Op::Bc1f,
+                    1 => Op::Bc1t,
+                    2 => Op::Bc1fl,
+                    _ => Op::Bc1tl,
+                },
+                0x10 | 0x11 | 0x14 | 0x15 => Op::Cop1,
+                _ => Op::Unknown,
             },
+            0x31 => Op::Lwc1,
+            0x35 => Op::Ldc1,
+            0x39 => Op::Swc1,
+            0x3D => Op::Sdc1,
             0x02 => Op::J,
             0x03 => Op::Jal,
             0x04 => Op::Beq,
@@ -295,9 +323,9 @@ impl Inst {
             | Add | Addu | Sub | Subu | And | Or | Xor | Nor | Slt | Sltu | Dadd | Daddu | Dsub
             | Dsubu | Dsll | Dsrl | Dsra | Dsll32 | Dsrl32 | Dsra32 => self.rd,
             Addi | Addiu | Slti | Sltiu | Andi | Ori | Xori | Lui | Daddi | Daddiu | Ldl | Ldr
-            | Lb | Lh | Lwl | Lw | Lbu | Lhu | Lwr | Lwu | Ld => self.rt,
-            // Coprocessor moves such as MFC0/MFC1 write rt; be conservative.
-            Unknown if self.word >> 26 == 0x10 || self.word >> 26 == 0x11 => self.rt,
+            | Lb | Lh | Lwl | Lw | Lbu | Lhu | Lwr | Lwu | Ld | Mfc1 | Dmfc1 | Cfc1 => self.rt,
+            // COP0 moves such as MFC0 write rt; be conservative.
+            Unknown if self.word >> 26 == 0x10 => self.rt,
             _ => return None,
         };
         (d != 0).then_some(d)

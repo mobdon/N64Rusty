@@ -362,5 +362,126 @@ pub fn all() -> Vec<Program> {
         fixed: vec![],
     });
 
+    // Floating point. Doubles use even registers (odd ones are undefined
+    // for doubles when FR is clear); singles also use odd registers.
+    let arith = [
+        ("add", 0),
+        ("sub", 1),
+        ("mul", 2),
+        ("div", 3),
+        ("sqrt", 4),
+        ("abs", 5),
+        ("mov", 6),
+        ("neg", 7),
+        ("round.l", 8),
+        ("trunc.l", 9),
+        ("ceil.l", 10),
+        ("floor.l", 11),
+        ("round.w", 12),
+        ("trunc.w", 13),
+        ("ceil.w", 14),
+        ("floor.w", 15),
+        ("cvt.w", 36),
+        ("cvt.l", 37),
+    ];
+    for (name, funct) in arith {
+        for (fmt, suffix) in [(16, "s"), (17, "d")] {
+            let regs: &[(u32, u32, u32)] = if fmt == 16 {
+                &[(0, 2, 4), (2, 2, 4), (1, 3, 5), (6, 7, 6)]
+            } else {
+                &[(0, 2, 4), (2, 2, 4), (6, 8, 6)]
+            };
+            for &(fd, fs, ft) in regs {
+                // Results of .l conversions are doubles: keep them even.
+                if ((8..=11).contains(&funct) || funct == 37) && fd % 2 == 1 {
+                    continue;
+                }
+                v.push(single(
+                    format!("{name}.{suffix} $f{fd}, $f{fs}, $f{ft}"),
+                    vec![cop1(fmt, ft, fs, fd, funct)],
+                ));
+            }
+        }
+    }
+    let converts = [
+        ("cvt.s.d", 17, 32),
+        ("cvt.s.w", 20, 32),
+        ("cvt.s.l", 21, 32),
+        ("cvt.d.s", 16, 33),
+        ("cvt.d.w", 20, 33),
+        ("cvt.d.l", 21, 33),
+    ];
+    for (name, fmt, funct) in converts {
+        for (fd, fs) in [(0, 2), (2, 2), (4, 6)] {
+            v.push(single(
+                format!("{name} $f{fd}, $f{fs}"),
+                vec![cop1(fmt, 0, fs, fd, funct)],
+            ));
+        }
+        if fmt == 16 || fmt == 20 {
+            v.push(single(
+                format!("{name} $f1, $f3"),
+                vec![cop1(fmt, 0, 3, if funct == 32 { 1 } else { 0 }, funct)],
+            ));
+        }
+    }
+    for cond in 0..16 {
+        for (fmt, suffix) in [(16, "s"), (17, "d")] {
+            for (fs, ft) in [(2, 4), (4, 4)] {
+                v.push(single(
+                    format!("c.{cond}.{suffix} $f{fs}, $f{ft}"),
+                    vec![cop1(fmt, ft, fs, 0, 48 + cond)],
+                ));
+            }
+        }
+    }
+    for (name, kind) in [("bc1f", 0), ("bc1t", 1), ("bc1fl", 2), ("bc1tl", 3)] {
+        // Directly on the random condition bit, and after a compare.
+        for pre in [vec![], vec![cop1(16, 4, 2, 0, 60)]] {
+            let mut body = pre.clone();
+            body.extend([bc1(kind, 2), addiu(2, 2, 1), addiu(3, 0, 7), addiu(5, 0, 9)]);
+            let label = if pre.is_empty() { "" } else { " after c.lt.s" };
+            v.push(single(format!("{name}{label}"), body));
+        }
+    }
+    for (name, sub, regs) in [
+        ("mfc1", 0, &[(2u32, 3u32), (2, 4), (0, 5)][..]),
+        ("dmfc1", 1, &[(2, 4), (3, 6)][..]),
+        ("cfc1", 2, &[(2, 31), (3, 0)][..]),
+        ("mtc1", 4, &[(4, 3), (4, 6)][..]),
+        ("dmtc1", 5, &[(4, 6), (5, 0)][..]),
+        ("ctc1", 6, &[(4, 31)][..]),
+    ] {
+        for &(rt, fs) in regs {
+            v.push(single(
+                format!("{name} ${rt}, $f{fs}"),
+                vec![cop1_move(sub, rt, fs)],
+            ));
+        }
+    }
+    // ctc1 then a rounding conversion that reads the new mode.
+    v.push(single(
+        "ctc1 then cvt.w.s".into(),
+        vec![cop1_move(6, 4, 31), NOP, cop1(16, 0, 2, 0, 36)],
+    ));
+    for (name, op, size) in [
+        ("lwc1", 0x31, 4),
+        ("ldc1", 0x35, 8),
+        ("swc1", 0x39, 4),
+        ("sdc1", 0x3D, 8),
+    ] {
+        for k in [0, 1, -5] {
+            for ft in [2, 3, 6] {
+                if size == 8 && ft % 2 == 1 {
+                    continue;
+                }
+                v.push(mem(
+                    format!("{name} $f{ft}, {}($4)", k * size),
+                    vec![itype(op, 4, ft, k * size)],
+                ));
+            }
+        }
+    }
+
     v
 }

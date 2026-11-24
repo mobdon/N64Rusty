@@ -18,6 +18,12 @@ pub struct Cpu {
     pub lo: u64,
     pub pc: u32,
     next_pc: u32,
+    /// Floating-point registers as 64-bit cells.
+    pub f: [u64; 32],
+    /// FCR31.
+    pub fcr31: u32,
+    /// Status FR bit.
+    pub fr: bool,
     /// Big-endian RAM, addressed by virtual address with the top 3 bits
     /// dropped.
     pub mem: Vec<u8>,
@@ -46,6 +52,9 @@ impl Cpu {
             lo: 0,
             pc: 0,
             next_pc: 4,
+            f: [0; 32],
+            fcr31: 0,
+            fr: true,
             mem,
         }
     }
@@ -76,6 +85,174 @@ impl Cpu {
 
     fn byte(&self, addr: u32, pc: u32) -> Result<u8, Stop> {
         Ok(self.load(addr, 1, pc)? as u8)
+    }
+
+    // Floating-point register file. With FR clear the register file is
+    // sixteen 64-bit pairs: single n lives in half (n & 1) of pair n / 2.
+    fn get_w(&self, n: u32) -> u32 {
+        let (cell, half) = if self.fr { (n, 0) } else { (n & !1, n & 1) };
+        (self.f[cell as usize] >> (32 * half)) as u32
+    }
+
+    fn put_w(&mut self, n: u32, v: u32) {
+        let (cell, half) = if self.fr { (n, 0) } else { (n & !1, n & 1) };
+        let shift = 32 * half;
+        let keep = !(0xFFFF_FFFFu64 << shift);
+        let c = &mut self.f[cell as usize];
+        *c = (*c & keep) | (u64::from(v) << shift);
+    }
+
+    fn get_l(&self, n: u32) -> u64 {
+        self.f[if self.fr { n } else { n & !1 } as usize]
+    }
+
+    fn put_l(&mut self, n: u32, v: u64) {
+        self.f[if self.fr { n } else { n & !1 } as usize] = v;
+    }
+
+    /// Integer conversion with an explicit rounding: 0 nearest-even,
+    /// 1 toward zero, 2 up, 3 down. Out of range or NaN gives the maximum
+    /// positive value, the MIPS default for an invalid conversion.
+    fn to_int(x: f64, mode: u32, bits: u32) -> u64 {
+        let r = match mode {
+            0 => {
+                let fl = x.floor();
+                let diff = x - fl;
+                if diff > 0.5 || (diff == 0.5 && fl % 2.0 != 0.0) {
+                    fl + 1.0
+                } else {
+                    fl
+                }
+            }
+            1 => x.trunc(),
+            2 => x.ceil(),
+            _ => x.floor(),
+        };
+        let limit = if bits == 32 {
+            2147483648.0
+        } else {
+            9223372036854775808.0
+        };
+        let max = if bits == 32 {
+            0x7FFF_FFFF
+        } else {
+            0x7FFF_FFFF_FFFF_FFFF
+        };
+        if !(r >= -limit && r < limit) {
+            return max;
+        }
+        if bits == 32 {
+            u64::from(r as i32 as u32)
+        } else {
+            r as i64 as u64
+        }
+    }
+
+    fn cop1(&mut self, word: u32, unimpl: Stop) -> Result<(), Stop> {
+        let fmt = (word >> 21) & 31;
+        let ft = (word >> 16) & 31;
+        let fs = (word >> 11) & 31;
+        let fd = (word >> 6) & 31;
+        let funct = word & 63;
+        let single = fmt == 16;
+        let double = fmt == 17;
+        if !(single || double) {
+            // W and L sources: only conversions to S and D.
+            let v = match fmt {
+                20 => f64::from(self.get_w(fs) as i32),
+                21 => {
+                    let l = self.get_l(fs) as i64;
+                    match funct {
+                        32 => {
+                            self.put_w(fd, (l as f32).to_bits());
+                            return Ok(());
+                        }
+                        33 => l as f64,
+                        _ => return Err(unimpl),
+                    }
+                }
+                _ => return Err(unimpl),
+            };
+            match funct {
+                // i32 -> f64 is exact; f64 -> f32 then rounds once.
+                32 => self.put_w(fd, (v as f32).to_bits()),
+                33 => self.put_l(fd, v.to_bits()),
+                _ => return Err(unimpl),
+            }
+            return Ok(());
+        }
+        let a32 = f32::from_bits(self.get_w(fs));
+        let b32 = f32::from_bits(self.get_w(ft));
+        let a64 = f64::from_bits(self.get_l(fs));
+        let b64 = f64::from_bits(self.get_l(ft));
+        let (a, b) = if single {
+            (f64::from(a32), f64::from(b32))
+        } else {
+            (a64, b64)
+        };
+        macro_rules! arith {
+            ($op:tt) => {
+                if single {
+                    self.put_w(fd, (a32 $op b32).to_bits())
+                } else {
+                    self.put_l(fd, (a64 $op b64).to_bits())
+                }
+            };
+        }
+        match funct {
+            0 => arith!(+),
+            1 => arith!(-),
+            2 => arith!(*),
+            3 => arith!(/),
+            4 => {
+                if single {
+                    self.put_w(fd, a32.sqrt().to_bits())
+                } else {
+                    self.put_l(fd, a64.sqrt().to_bits())
+                }
+            }
+            // ABS and NEG act on the sign bit only.
+            5 => {
+                if single {
+                    self.put_w(fd, self.get_w(fs) & 0x7FFF_FFFF)
+                } else {
+                    self.put_l(fd, self.get_l(fs) & 0x7FFF_FFFF_FFFF_FFFF)
+                }
+            }
+            6 => {
+                if single {
+                    self.put_w(fd, self.get_w(fs))
+                } else {
+                    self.put_l(fd, self.get_l(fs))
+                }
+            }
+            7 => {
+                if single {
+                    self.put_w(fd, self.get_w(fs) ^ 0x8000_0000)
+                } else {
+                    self.put_l(fd, self.get_l(fs) ^ 0x8000_0000_0000_0000)
+                }
+            }
+            8..=11 => self.put_l(fd, Self::to_int(a, funct & 3, 64)),
+            12..=15 => self.put_w(fd, Self::to_int(a, funct & 3, 32) as u32),
+            32 if double => self.put_w(fd, (a64 as f32).to_bits()),
+            33 if single => self.put_l(fd, a.to_bits()),
+            36 => self.put_w(fd, Self::to_int(a, self.fcr31 & 3, 32) as u32),
+            37 => self.put_l(fd, Self::to_int(a, self.fcr31 & 3, 64)),
+            48..=63 => {
+                let unordered = a.is_nan() || b.is_nan();
+                let c = (funct & 1 != 0 && unordered)
+                    || (funct & 2 != 0 && !unordered && a == b)
+                    || (funct & 4 != 0 && !unordered && a < b);
+                if c {
+                    self.fcr31 |= 1 << 23;
+                } else {
+                    self.fcr31 &= !(1 << 23);
+                }
+            }
+            _ => return Err(unimpl),
+        }
+        Ok(())
     }
 
     fn set(&mut self, n: u32, v: u64) {
@@ -357,6 +534,42 @@ impl Cpu {
                 }
             }
             0x2F => {}
+            0x11 => match rs {
+                0 => self.set(rt, se32(self.get_w(rd))),
+                1 => self.set(rt, self.get_l(rd)),
+                2 => {
+                    let v = match rd {
+                        0 => 0x0A00,
+                        31 => self.fcr31,
+                        _ => 0,
+                    };
+                    self.set(rt, se32(v))
+                }
+                4 => self.put_w(rd, t as u32),
+                5 => self.put_l(rd, t),
+                6 => {
+                    if rd == 31 {
+                        self.fcr31 = t as u32;
+                    }
+                }
+                8 => {
+                    let c = self.fcr31 & (1 << 23) != 0;
+                    let want_true = rt & 1 != 0;
+                    branch = Some((c == want_true, rt & 2 != 0));
+                }
+                16 | 17 | 20 | 21 => self.cop1(word, unimpl)?,
+                _ => return Err(unimpl),
+            },
+            0x31 => {
+                let v = self.load(ea, 4, pc)?;
+                self.put_w(rt, v as u32)
+            }
+            0x35 => {
+                let v = self.load(ea, 8, pc)?;
+                self.put_l(rt, v)
+            }
+            0x39 => self.store(ea, 4, u64::from(self.get_w(rt)), pc)?,
+            0x3D => self.store(ea, 8, self.get_l(rt), pc)?,
             _ => return Err(unimpl),
         }
 

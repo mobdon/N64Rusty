@@ -45,6 +45,55 @@ impl Rng {
     }
 }
 
+impl Rng {
+    /// Float register contents: special singles in either half, special
+    /// doubles, or noise.
+    fn freg(&mut self) -> u64 {
+        const SINGLES: [u32; 14] = [
+            0,
+            0x8000_0000,
+            0x3F80_0000, // 1.0
+            0xBF80_0000, // -1.0
+            0x3FC0_0000, // 1.5
+            0x4020_0000, // 2.5
+            0xC020_0000, // -2.5
+            0x7F80_0000, // inf
+            0xFF80_0000, // -inf
+            0x7FC0_0000, // NaN
+            0x0000_0001, // denormal
+            0x4F00_0000, // 2^31
+            0xCF00_0000, // -2^31
+            0x5F00_0000, // 2^63
+        ];
+        const DOUBLES: [u64; 12] = [
+            0,
+            0x8000_0000_0000_0000,
+            0x3FF0_0000_0000_0000, // 1.0
+            0x3FF8_0000_0000_0000, // 1.5
+            0x4004_0000_0000_0000, // 2.5
+            0xC004_0000_0000_0000, // -2.5
+            0x7FF0_0000_0000_0000, // inf
+            0x7FF8_0000_0000_0000, // NaN
+            0x0000_0000_0000_0001, // denormal
+            0x41E0_0000_0000_0000, // 2^31
+            0xC1E0_0000_0000_0000, // -2^31
+            0x43E0_0000_0000_0000, // 2^63
+        ];
+        let single = |r: &mut Rng| match r.next() % 3 {
+            0 => SINGLES[(r.next() % SINGLES.len() as u64) as usize],
+            // An ordinary value of moderate size.
+            1 => ((r.next() as f32 / u64::MAX as f32 - 0.5) * 4096.0).to_bits(),
+            _ => r.next() as u32,
+        };
+        match self.next() % 4 {
+            0 => DOUBLES[(self.next() % DOUBLES.len() as u64) as usize],
+            1 => ((self.next() as f64 / u64::MAX as f64 - 0.5) * 1e6).to_bits(),
+            2 => (u64::from(single(self)) << 32) | u64::from(single(self)),
+            _ => self.next(),
+        }
+    }
+}
+
 fn noop(_: &mut Ctx) {}
 
 fn run_one(p: &Program, register: fn(&mut Ctx), rng: &mut Rng) {
@@ -70,11 +119,21 @@ fn run_one(p: &Program, register: fn(&mut Ctx), rng: &mut Rng) {
     }
     regs[31] = sx32(SENTINEL);
     let (hi, lo_reg) = (rng.reg(), rng.reg());
+    let mut fregs = [0u64; 32];
+    for f in &mut fregs {
+        *f = rng.freg();
+    }
+    // Rounding mode and condition bit at random; both register modes.
+    let fcr31 = (rng.next() as u32 & 3) | if rng.next() % 2 == 0 { 1 << 23 } else { 0 };
+    let fr = rng.next() % 2 == 0;
 
     let mut cpu = Cpu::new(ram.clone());
     cpu.r = regs;
     cpu.hi = hi;
     cpu.lo = lo_reg;
+    cpu.f = fregs;
+    cpu.fcr31 = fcr31;
+    cpu.fr = fr;
     cpu.run(p.funcs[0].0, SENTINEL, 10_000)
         .unwrap_or_else(|e| panic!("{}: reference CPU stopped: {e:?}", p.name));
 
@@ -82,6 +141,9 @@ fn run_one(p: &Program, register: fn(&mut Ctx), rng: &mut Rng) {
     ctx.r = regs;
     ctx.hi = hi;
     ctx.lo = lo_reg;
+    ctx.f = fregs;
+    ctx.fcr31 = fcr31;
+    ctx.fr = fr;
     register(&mut ctx);
     ctx.register(SENTINEL, noop);
     ctx.call(p.funcs[0].0);
@@ -94,6 +156,20 @@ fn run_one(p: &Program, register: fn(&mut Ctx), rng: &mut Rng) {
                 ctx.r[n], cpu.r[n]
             ));
         }
+    }
+    for n in 0..32 {
+        if ctx.f[n] != cpu.f[n] {
+            diffs.push(format!(
+                "  f{n}: translated {:#018x}, reference {:#018x}",
+                ctx.f[n], cpu.f[n]
+            ));
+        }
+    }
+    if ctx.fcr31 != cpu.fcr31 {
+        diffs.push(format!(
+            "  fcr31: translated {:#010x}, reference {:#010x}",
+            ctx.fcr31, cpu.fcr31
+        ));
     }
     if ctx.hi != cpu.hi {
         diffs.push(format!(
@@ -124,10 +200,11 @@ fn run_one(p: &Program, register: fn(&mut Ctx), rng: &mut Rng) {
             .map(|(n, v)| format!("r{n}={v:#x}"))
             .collect();
         panic!(
-            "{}: translated code differs from the reference CPU\n{}\n  start: {} hi={hi:#x} lo={lo_reg:#x}",
+            "{}: translated code differs from the reference CPU\n{}\n  start: {} hi={hi:#x} lo={lo_reg:#x} fr={fr} fcr31={fcr31:#x}\n  floats: {:x?}",
             p.name,
             diffs.join("\n"),
-            init.join(" ")
+            init.join(" "),
+            fregs
         );
     }
 }
