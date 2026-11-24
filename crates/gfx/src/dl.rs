@@ -328,9 +328,18 @@ impl Interpreter {
         match index {
             0x02 => self.num_lights = (w1 / 24).min(7) as usize,
             0x06 => self.segments[(offset / 4) as usize & 0xF] = w1 & 0x00FF_FFFF,
-            // Fog factors, light colours, clip ratio, perspective norm: not
+            // Fog factors, clip ratio, perspective norm: not
             // needed by this renderer.
-            0x04 | 0x08 | 0x0A | 0x0C | 0x0E => {}
+            // Light colour (`gSPLightColor`): light n's two colour words
+            // are at n * 24 and n * 24 + 4; the second is a copy.
+            0x0A => {
+                if offset % 24 == 0 {
+                    if let Some(l) = self.lights.get_mut((offset / 24) as usize) {
+                        l.color = [24, 16, 8].map(|s| ((w1 >> s) & 0xFF) as f32 / 255.0);
+                    }
+                }
+            }
+            0x04 | 0x08 | 0x0C | 0x0E => {}
             _ => self.warn(format!("moveword {index:#x} at {at:#010x}")),
         }
     }
