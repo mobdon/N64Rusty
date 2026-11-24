@@ -24,9 +24,10 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Audio headers (Linux)
+      - name: Install Linux libraries
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+        # Gamepad support (gilrs) links against libudev; speaker output (cpal) against ALSA.
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev libasound2-dev
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy

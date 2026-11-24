@@ -66,3 +66,15 @@ Read for instruction behaviour; no text or tables are copied.
 Every new source gets an entry here before its influence lands: name, link,
 licence, what it was used for, and the full licence text when the licence asks
 for it. Emulators may be read as a reference for hardware behaviour only.
+
+## Host crates (crates/host)
+
+Used as ordinary dependencies, not copied:
+
+- winit (https://github.com/rust-windowing/winit), Apache-2.0: windows and keyboard input.
+- gilrs (https://gitlab.com/gilrs-project/gilrs), MIT OR Apache-2.0: gamepads.
+- serde (https://serde.rs) and toml (https://github.com/toml-rs/toml), MIT OR Apache-2.0: the run config file.
+
+The controller's button word layout follows the public documentation on the
+N64brew wiki (https://n64brew.dev), on the controller protocol. The keyboard and
+gamepad layouts, script format and debug port are our own.
