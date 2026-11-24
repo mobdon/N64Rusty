@@ -5,10 +5,11 @@ code (MIPS VR4300, big-endian) and writes Rust, which links against a small
 runtime crate and builds into a native program. You supply your own legally
 obtained ROM; this repository contains no game data.
 
-Status: **step 1, CPU translator.** The VR4300 integer instruction set
+Status: **step 2, ROM loader.** The VR4300 integer instruction set
 translates to Rust, with branch delay slots, and is tested per instruction
-against a reference interpreter. Floating point, ROM loading and the rest of
-the console come next.
+against a reference interpreter. ROMs load in any byte order, and the boot
+segment's functions are found from the entry point and written out as a Rust
+crate that compiles. Floating point and the rest of the console come next.
 
 ## Layout
 
@@ -17,6 +18,7 @@ the console come next.
 | `n64rusty-translator` | `crates/translator` | MIPS machine code to Rust source |
 | `n64rusty-runtime` | `crates/runtime` | Tiny runtime that generated Rust links against. Kept separate so generated code is not rebuilt when the tool changes |
 | `n64rusty` | `crates/cli` | Command-line front end |
+| `n64rusty-rom` | `crates/rom` | ROM loading: byte order, SHA-256, header, boot code variant |
 | `n64rusty-refcpu` | `crates/refcpu` | Reference VR4300 interpreter, used only by tests |
 | `n64rusty-conformance` | `crates/conformance` | Per-instruction tests: translated code against the reference CPU |
 
@@ -25,6 +27,25 @@ cargo build --workspace
 cargo test --workspace
 cargo run -p n64rusty -- version
 ```
+
+With your own ROM:
+
+```
+cargo run -p n64rusty -- info path/to/your.z64
+cargo run -p n64rusty -- translate path/to/your.z64 [--symbols local-map.txt]
+cd local/<sha256>/out && cargo build
+```
+
+`translate` finds functions by following calls and branches from the entry
+point through the boot segment (the first 1 MiB the boot code copies to
+RAM), resolves jump tables and jumps to constant addresses, and also takes
+function pointers built with `lui`/`addiu` that point at a function prologue.
+`--symbols` adds function addresses from a symbol map (lines like
+`name = 0x80001234;`) read from your own local checkout of a decompilation
+project; it is never copied into this repository. Output goes to the
+git-ignored `local/<sha256>/` folder: `out/` (the generated crate, one file
+per 64 KiB of address space, rewritten only when its contents change),
+`report.txt` and a `config.toml` template.
 
 ## How translation works
 
@@ -41,7 +62,7 @@ every 32-bit result is sign-extended, as on the VR4300.
   point, so any guest function can be overridden by address with
   `Ctx::set_override`. `jr $ra` returns; jumps and branches that leave the
   function are tail calls.
-- **Not modelled yet.** Overflow exceptions (ADD, ADDI, SUB and their
+- **Not modelled yet.** Floating point (COP1) is the biggest gap. Overflow exceptions (ADD, ADDI, SUB and their
   64-bit forms behave like the unsigned forms), traps, LL/SC, the TLB, and
   coprocessor instructions. These emit a call that panics with the address,
   so the first one a game reaches is easy to find.

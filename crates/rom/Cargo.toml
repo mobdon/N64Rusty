@@ -1,0 +1,11 @@
+[package]
+name = "n64rusty-rom"
+description = "Loads N64 ROM images: byte order, hashing, header and boot segment"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sha2 = "0.10"

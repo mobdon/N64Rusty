@@ -13,6 +13,7 @@
 use std::fmt;
 
 pub mod decode;
+pub mod discover;
 pub mod emit;
 
 pub use decode::{Flow, Inst, Op};
@@ -27,6 +28,22 @@ pub struct Function {
     pub addr: u32,
     /// Instruction words from `addr` up to the function end.
     pub words: Vec<u32>,
+    /// Extra block starts found by analysis, such as jump table targets.
+    pub jump_targets: Vec<u32>,
+    /// Optional name, written as a doc comment.
+    pub name: Option<String>,
+}
+
+impl Function {
+    /// A function with no extra block starts and no name.
+    pub fn new(addr: u32, words: Vec<u32>) -> Self {
+        Self {
+            addr,
+            words,
+            jump_targets: Vec::new(),
+            name: None,
+        }
+    }
 }
 
 /// A translation failure at a guest address.
@@ -89,10 +106,7 @@ mod tests {
     #[test]
     fn rejects_branch_in_delay_slot() {
         // beq $0, $0, +1 ; beq $0, $0, +1
-        let f = Function {
-            addr: 0x8000_1000,
-            words: vec![0x1000_0001, 0x1000_0001, 0, 0],
-        };
+        let f = Function::new(0x8000_1000, vec![0x1000_0001, 0x1000_0001, 0, 0]);
         let e = translate_function(&f).unwrap_err();
         assert_eq!(e.addr, 0x8000_1004);
     }
@@ -100,10 +114,7 @@ mod tests {
     #[test]
     fn emits_register_function() {
         // jr $ra ; nop
-        let f = Function {
-            addr: 0x8000_1000,
-            words: vec![0x03E0_0008, 0],
-        };
+        let f = Function::new(0x8000_1000, vec![0x03E0_0008, 0]);
         let src = translate_module(&[f]).unwrap();
         assert!(src.contains("pub fn f_80001000("));
         assert!(src.contains("ctx.register(0x80001000, f_80001000);"));

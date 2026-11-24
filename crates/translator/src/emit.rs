@@ -145,14 +145,15 @@ fn simple(i: &Inst, pc: u32) -> String {
             format!("ctx.unimplemented({pc:#010x}, {:#010x});", i.word)
         }
         J | Jal | Jr | Jalr | Beq | Bne | Blez | Bgtz | Bltz | Bgez | Bltzl | Bgezl | Bltzal
-        | Bgezal | Bltzall | Bgezall | Beql | Bnel | Blezl | Bgtzl => {
+        | Bgezal | Bltzall | Bgezall | Beql | Bnel | Blezl | Bgtzl | Bc1f | Bc1t | Bc1fl
+        | Bc1tl => {
             unreachable!("control flow handled by the block emitter")
         }
     }
 }
 
 /// Condition of a conditional branch, evaluated before its delay slot.
-fn condition(i: &Inst) -> String {
+fn condition(i: &Inst, pc: u32) -> String {
     use Op::*;
     let (s, t) = (r(i.rs), r(i.rt));
     match i.op {
@@ -162,7 +163,7 @@ fn condition(i: &Inst) -> String {
         Bgtz | Bgtzl => format!("({s} as i64) > 0"),
         Bltz | Bltzl | Bltzal | Bltzall => format!("({s} as i64) < 0"),
         Bgez | Bgezl | Bgezal | Bgezall => format!("({s} as i64) >= 0"),
-        _ => unreachable!(),
+        _ => format!("ctx.unimplemented({pc:#010x}, {:#010x})", i.word),
     }
 }
 
@@ -242,7 +243,7 @@ impl Emitter<'_> {
                 }
                 Flow::Branch { likely, link } => {
                     let target = i.branch_target(a);
-                    self.line(4, &format!("let take = {};", condition(&i)));
+                    self.line(4, &format!("let take: bool = {};", condition(&i, a)));
                     if link {
                         self.line(4, &format!("ctx.r[31] = {};", sx_lit(ret)));
                     }
@@ -299,6 +300,11 @@ fn block_starts(f: &Function, end: u32) -> BTreeSet<u32> {
     let mut starts = BTreeSet::new();
     starts.insert(f.addr);
     let inside = |a: u32| a >= f.addr && a < end;
+    for &t in &f.jump_targets {
+        if inside(t) && t % 4 == 0 {
+            starts.insert(t);
+        }
+    }
     for (n, &w) in f.words.iter().enumerate() {
         let a = f.addr + 4 * n as u32;
         let i = Inst::decode(w);
@@ -345,6 +351,9 @@ pub fn function(f: &Function) -> Result<String, TranslateError> {
         out: String::new(),
     };
     e.line(0, &format!("/// Guest function at {:#010x}.", f.addr));
+    if let Some(name) = &f.name {
+        e.line(0, &format!("/// Symbol: `{name}`."));
+    }
     e.line(
         0,
         "#[allow(unused_mut, unused_variables, unused_assignments, unused_comparisons, unreachable_code, clippy::all)]",
