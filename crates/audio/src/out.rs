@@ -108,28 +108,68 @@ mod speaker {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     use cpal::{FromSample, SampleFormat, SizedSample, Stream, StreamConfig};
 
+    /// Frames waiting for the device. The game hands over one buffer per
+    /// video frame while the device pulls steadily, so playback keeps a
+    /// cushion of `TARGET` seconds and nudges its speed to hold it there.
     #[derive(Default)]
     struct Queue {
         frames: VecDeque<[f32; 2]>,
         rate: u32,
         pos: f64,
+        /// False while filling the cushion, at the start and after running dry.
+        playing: bool,
     }
+
+    /// Seconds of sound kept queued.
+    const TARGET: f64 = 0.08;
+    /// Most the playback speed is nudged: 0.5%, too little to hear.
+    const NUDGE: f64 = 0.005;
 
     impl Queue {
         /// Next frame at the device rate, linearly interpolated from the
-        /// game's rate. Silence when the game has not supplied enough.
+        /// game's rate. Silence while the cushion fills.
         fn next(&mut self, dev_rate: u32) -> [f32; 2] {
-            if self.frames.len() < 2 || self.rate == 0 {
+            if self.rate == 0 || dev_rate == 0 {
+                return [0.0; 2];
+            }
+            let target = self.rate as f64 * TARGET;
+            if !self.playing {
+                if (self.frames.len() as f64) < target {
+                    return [0.0; 2];
+                }
+                self.playing = true;
+            }
+            if self.frames.len() < 2 {
+                self.playing = false;
                 return [0.0; 2];
             }
             let t = self.pos as f32;
             let (a, b) = (self.frames[0], self.frames[1]);
-            self.pos += self.rate as f64 / dev_rate as f64;
+            // Play faster when more than the cushion is queued, slower when less,
+            // so the device and game clocks can drift without gaps or drops.
+            let off = (self.frames.len() as f64 - target) / target;
+            let speed = 1.0 + (off * NUDGE).clamp(-NUDGE, NUDGE);
+            self.pos += speed * self.rate as f64 / dev_rate as f64;
             while self.pos >= 1.0 && self.frames.len() > 1 {
                 self.pos -= 1.0;
                 self.frames.pop_front();
             }
             [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]
+        }
+
+        /// Queues interleaved left/right samples at `rate` Hz.
+        fn push(&mut self, rate: u32, samples: &[i16]) {
+            self.rate = rate;
+            let f = |s: i16| s as f32 / 32768.0;
+            self.frames
+                .extend(samples.chunks_exact(2).map(|c| [f(c[0]), f(c[1])]));
+            // Far behind (after a stall): skip back to the cushion in one jump
+            // rather than clipping a little off every buffer.
+            if self.frames.len() > (rate / 2).max(1) as usize {
+                let keep = (rate as f64 * TARGET) as usize;
+                let drop = self.frames.len() - keep;
+                self.frames.drain(..drop);
+            }
         }
     }
 
@@ -165,23 +205,16 @@ mod speaker {
             })
         }
 
-        /// Queues interleaved left/right samples at `rate` Hz. Keeps at most
-        /// half a second queued so output never drifts behind the game.
+        /// Queues interleaved left/right samples at `rate` Hz.
         pub fn push(&self, rate: u32, samples: &[i16]) {
-            let mut q = self.queue.lock().unwrap();
-            q.rate = rate;
-            let f = |s: i16| s as f32 / 32768.0;
-            q.frames
-                .extend(samples.chunks_exact(2).map(|c| [f(c[0]), f(c[1])]));
-            let max = (rate / 2).max(1) as usize;
-            while q.frames.len() > max {
-                q.frames.pop_front();
-            }
+            self.queue.lock().unwrap().push(rate, samples);
         }
 
         /// Drops everything queued.
         pub fn clear(&self) {
-            self.queue.lock().unwrap().frames.clear();
+            let mut q = self.queue.lock().unwrap();
+            q.frames.clear();
+            q.playing = false;
         }
     }
 
@@ -211,5 +244,54 @@ mod speaker {
             |e| eprintln!("audio output error: {e}"),
             None,
         )
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// The game hands over a buffer per video frame at 60 Hz of its own
+        /// time while the device plays at its own clock, `drift` faster.
+        fn play(drift: f64) -> (usize, usize) {
+            let (rate, dev) = (32000u32, 48000u32);
+            let mut q = Queue::default();
+            let buf = vec![16384i16; (rate / 60 * 2) as usize];
+            let (mut silent, mut most) = (0, 0);
+            let per_push = dev as f64 / 60.0 * (1.0 + drift);
+            let mut owed = 0.0;
+            for n in 0..60 * 120 {
+                q.push(rate, &buf);
+                most = most.max(q.frames.len());
+                owed += per_push;
+                while owed >= 1.0 {
+                    owed -= 1.0;
+                    let [l, _] = q.next(dev);
+                    if n > 60 && l != 0.5 {
+                        silent += 1;
+                    }
+                }
+            }
+            (silent, most)
+        }
+
+        #[test]
+        fn clock_drift_never_starves_or_overflows_the_queue() {
+            // NTSC pacing (59.94 Hz) against 60 Hz of game time, both ways,
+            // plus a device clock that is off by a little.
+            for drift in [0.001, -0.001, 0.003, -0.003] {
+                let (silent, most) = play(drift);
+                assert_eq!(silent, 0, "gaps at drift {drift}");
+                assert!(most < 16000, "queue grew to {most} at drift {drift}");
+            }
+        }
+
+        #[test]
+        fn waits_for_the_cushion_before_playing() {
+            let mut q = Queue::default();
+            q.push(32000, &[16384; 2 * 100]);
+            assert_eq!(q.next(48000), [0.0; 2]);
+            q.push(32000, &[16384; 2 * 3000]);
+            assert_eq!(q.next(48000), [0.5; 2]);
+        }
     }
 }
