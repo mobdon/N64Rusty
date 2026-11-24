@@ -20,7 +20,12 @@ use crate::session::{Guest, Pacer, Session, Tick};
 
 /// Opens a window and runs the game at the configured frame rate until the
 /// window is closed, the frame limit is reached or the debug port quits.
+/// With `headless = true` in the config it opens nothing and runs
+/// [`crate::run_headless`] instead.
 pub fn run_windowed<G: Guest>(guest: G, cfg: &RunConfig) -> Result<G, String> {
+    if cfg.headless {
+        return crate::run_headless(guest, cfg);
+    }
     let session = Session::new(guest, cfg)?;
     if let Some(addr) = session.debug_addr() {
         eprintln!("debug port listening on {addr}");

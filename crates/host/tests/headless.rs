@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::thread;
 
 use n64rusty_host::pad::button;
-use n64rusty_host::{run_headless, Guest, Pad, Pads, RunConfig, Session, Tick};
+use n64rusty_host::{run_headless, run_windowed, Guest, Pad, Pads, RunConfig, Session, Tick};
 
 /// Stands in for a game: remembers what it was given.
 #[derive(Default)]
@@ -72,19 +72,22 @@ fn debug_port_steps_one_frame_at_a_time() {
         let stream = TcpStream::connect(addr).unwrap();
         let mut out = stream.try_clone().unwrap();
         let mut lines = BufReader::new(stream).lines();
-        let mut ask = |cmd: &str| {
-            writeln!(out, "{cmd}").unwrap();
+        let mut ask = |cmd: &[u8]| {
+            out.write_all(cmd).unwrap();
+            out.write_all(b"\n").unwrap();
             lines.next().unwrap().unwrap()
         };
-        assert_eq!(ask("frame"), "ok 0");
-        assert_eq!(ask("step"), "ok 1");
-        assert_eq!(ask("pad 2 B+L -5 7"), "ok");
-        assert_eq!(ask("step 3"), "ok 4");
-        assert_eq!(ask("release 2"), "ok");
-        assert_eq!(ask("step"), "ok 5");
-        assert!(ask("pad 9 - 0 0").starts_with("err"));
-        assert!(ask("jump").starts_with("err"));
-        assert_eq!(ask("quit"), "ok 5");
+        assert_eq!(ask(b"frame"), "ok 0");
+        assert_eq!(ask(b"step"), "ok 1");
+        assert_eq!(ask(b"pad 2 B+L -5 7"), "ok");
+        assert_eq!(ask(b"step 3"), "ok 4");
+        assert_eq!(ask(b"release 2"), "ok");
+        assert_eq!(ask(b"step"), "ok 5");
+        assert!(ask(b"pad 9 - 0 0").starts_with("err"));
+        assert!(ask(b"jump").starts_with("err"));
+        assert!(ask(b"st\xffep").starts_with("err"));
+        assert_eq!(ask(b"frame"), "ok 5"); // the connection survived
+        assert_eq!(ask(b"quit"), "ok 5");
     });
 
     // A paused session blocks on the port, so this loop runs only as fast as
@@ -106,4 +109,21 @@ fn debug_port_steps_one_frame_at_a_time() {
         );
     }
     assert_eq!(log[4].1[1], Pad::default());
+}
+
+#[test]
+fn headless_config_never_opens_a_window() {
+    // A window would need an event loop; a headless run must not make one.
+    let cfg = RunConfig::parse("headless = true\nframes = 3", "".as_ref()).unwrap();
+    struct NoWindow(u64);
+    impl Guest for NoWindow {
+        fn frame(&mut self, _: u64, _: &Pads) {
+            self.0 += 1;
+        }
+        fn attach_window(&mut self, _: std::sync::Arc<winit::window::Window>) {
+            panic!("a headless run opened a window");
+        }
+    }
+    let guest = run_windowed(NoWindow(0), &cfg).unwrap();
+    assert_eq!(guest.0, 3);
 }
