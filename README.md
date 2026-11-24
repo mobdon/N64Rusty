@@ -61,7 +61,7 @@ it).
   (frame limit, frame rate, replay and record files, debug port, window size,
   where each port's input comes from, key layout) is in one TOML file, so a run
   can be repeated from that file. Unknown keys are errors. See
-  `crates/host/src/config.rs` for the format.
+  `crates/host/run.example.toml`.
 - **Controllers.** Four ports. By default port 1 is the keyboard plus the
   first gamepad, and ports 2 to 4 are the next gamepads. Keyboard: WASD moves
   the stick (left Shift for half tilt), J is A, K is B, Space is Z, Enter is

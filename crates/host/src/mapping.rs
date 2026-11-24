@@ -38,7 +38,13 @@ impl Binding {
 }
 
 /// Parses a physical key by its winit name, such as `KeyW` or `Space`.
+/// Arrow keys are refused: movement is WASD.
 pub fn parse_key(name: &str) -> Result<KeyCode, String> {
+    if name.starts_with("Arrow") {
+        return Err(format!(
+            "`{name}`: arrow keys are not used, movement is WASD"
+        ));
+    }
     KeyCode::deserialize(StrDeserializer::<serde::de::value::Error>::new(name))
         .map_err(|_| format!("unknown key `{name}` (use names like KeyW, Space, Enter)"))
 }
@@ -190,6 +196,7 @@ mod tests {
     fn keys_and_bindings_parse() {
         assert_eq!(parse_key("KeyW"), Ok(KeyCode::KeyW));
         assert!(parse_key("Nope").is_err());
+        assert!(parse_key("ArrowUp").unwrap_err().contains("WASD"));
         assert_eq!(Binding::parse("cleft"), Ok(Binding::Button(button::C_LEFT)));
         assert_eq!(Binding::parse("stick_up"), Ok(Binding::StickUp));
         assert!(Binding::parse("jump").is_err());

@@ -210,6 +210,13 @@ mod tests {
     }
 
     #[test]
+    fn example_file_parses() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("run.example.toml");
+        let cfg = RunConfig::load(&path).unwrap();
+        assert_eq!(cfg.ports[0].keyboard, Some(KeyMap::default()));
+    }
+
+    #[test]
     fn full_file() {
         let text = r#"
             frames = 600
