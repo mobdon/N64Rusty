@@ -244,7 +244,7 @@ impl Interpreter {
                     pc += 16;
                     self.texture_rect(w0, w1, h1, h2, w0 >> 24 == 0xE5);
                 }
-                0xEE => self.prim_depth = (w1 >> 16) as f32 / 32767.0,
+                0xEE => self.prim_depth = ((w1 >> 16) & 0x7FFF) as f32 / 32767.0, // 15-bit depth
                 0xEF => {
                     self.state.other_h = w0 & 0x00FF_FFFF;
                     self.state.other_l = w1;

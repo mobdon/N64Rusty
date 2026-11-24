@@ -125,6 +125,16 @@ impl Tmem {
         }
     }
 
+    /// Swap the 32-bit halves of the 64-bit TMEM words in `len` bytes from
+    /// `at`, as the hardware stores odd texture rows.
+    fn swap_words(&mut self, at: usize, len: usize) {
+        for w in (at..at + len).step_by(8) {
+            for k in 0..4 {
+                self.mem.swap((w + k) & 0xFFF, (w + k + 4) & 0xFFF);
+            }
+        }
+    }
+
     pub fn load_block(&mut self, rdram: &[u8], w0: u32, w1: u32) {
         self.cache.clear();
         let tile = self.tiles[((w1 >> 24) & 7) as usize];
@@ -134,7 +144,19 @@ impl Tmem {
         let texels = lrs.saturating_sub(uls) as usize + 1;
         let start = ((ult * width + uls) * bits(siz) / 8) as usize;
         let len = (texels * bits(siz) as usize).div_ceil(8);
-        self.copy(rdram, addr as usize + start, tile.tmem as usize * 8, len);
+        let dst = tile.tmem as usize * 8;
+        self.copy(rdram, addr as usize + start, dst, len);
+        // The load counts rows with `dxt` (1.11 fixed point per 64-bit word)
+        // and swaps the words of odd rows; with dxt 0 the game pre-swapped them.
+        // shortcut: 32-bit texels are kept unswapped, fine until a game loads them with dxt 0.
+        if siz < 3 {
+            let dxt = w1 & 0xFFF;
+            for w in 0..len.div_ceil(8) {
+                if (w as u32 * dxt) & 0x800 != 0 {
+                    self.swap_words(dst + w * 8, 8);
+                }
+            }
+        }
     }
 
     pub fn load_tile(&mut self, rdram: &[u8], w0: u32, w1: u32) {
@@ -148,6 +170,9 @@ impl Tmem {
             let src = addr + (y * width + uls) * bits(siz) / 8;
             let dst = tile.tmem as usize * 8 + r * Self::stride(&tile);
             self.copy(rdram, src as usize, dst, row_bytes);
+            if r % 2 == 1 && siz < 3 {
+                self.swap_words(dst, row_bytes);
+            }
         }
     }
 
@@ -180,7 +205,9 @@ impl Tmem {
     fn texel(&self, t: &Tile, x: u32, y: u32, tlut: u32) -> [u8; 4] {
         let row = t.tmem as usize * 8 + y as usize * Self::stride(t);
         let bitpos = x as usize * bits(t.siz) as usize;
-        let at = |k: usize| self.mem[(row + bitpos / 8 + k) & 0xFFF];
+        // Odd rows are stored with their 32-bit words swapped.
+        let swap = if y % 2 == 1 && t.siz < 3 { 4 } else { 0 };
+        let at = |k: usize| self.mem[((row + bitpos / 8 + k) ^ swap) & 0xFFF];
         let nib = || {
             if bitpos.is_multiple_of(8) {
                 at(0) >> 4
@@ -316,5 +343,27 @@ mod tests {
         };
         assert_eq!(m.texel(&t, 0, 0, 0), [255, 255, 255, 255]);
         assert_eq!(m.texel(&t, 1, 0, 0), [109, 109, 109, 0]);
+    }
+
+    /// Odd rows are stored swapped but read back in order, whether the load
+    /// swapped them (load block with dxt, load tile) or the game did (dxt 0).
+    #[test]
+    fn odd_rows_read_back_in_order() {
+        // 4x2 IA16, texel i has low byte i + 1.
+        let lin: Vec<u8> = (1u16..=8).flat_map(|t| t.to_be_bytes()).collect();
+        let mut pre = lin.clone();
+        pre[8..16].rotate_left(4);
+        for (ram, load) in [(&lin, 0xF3_0800), (&pre, 0xF3_0000), (&lin, 0xF4)] {
+            let mut m = Tmem::default();
+            m.set_image(2 << 19 | 3, 0);
+            m.set_tile(3 << 21 | 2 << 19 | 1 << 9, 0);
+            match load {
+                0xF4 => m.load_tile(ram, 0, 12 << 12 | 4),
+                _ => m.load_block(ram, 0, 7 << 12 | (load & 0xFFF)),
+            }
+            let t = m.tiles[0];
+            let got: Vec<u8> = (0..8).map(|i| m.texel(&t, i % 4, i / 4, 0)[3]).collect();
+            assert_eq!(got, [1, 2, 3, 4, 5, 6, 7, 8], "load {load:#x}");
+        }
     }
 }

@@ -341,6 +341,25 @@ fn texture_rectangle_maps_texels_to_pixels() {
     );
 }
 
+/// The depth field is 15 bits; games send 0xFFFF for "farthest".
+#[test]
+fn primitive_depth_stays_in_the_depth_range() {
+    let mut ram = Ram::default();
+    let mut dl = Dl::default();
+    setup(&mut ram, &mut dl);
+    dl.other_modes(CYCLE_1, 0)
+        .prim_depth(0xFFFF)
+        .tex_rect(0, [10, 20, 18, 28], [0, 0], [1 << 10, 1 << 10])
+        .end();
+    let addr = ram.dl(&dl);
+    let f = run(&ram, addr);
+    assert!(
+        f.vertices.iter().all(|v| v.pos[2] == 1.0),
+        "{:?}",
+        f.vertices[0]
+    );
+}
+
 #[test]
 fn malformed_lengths_from_guest_data_do_not_panic() {
     let mut ram = Ram::default();
