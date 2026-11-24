@@ -194,12 +194,13 @@ pub fn crash_report(ctx: &Ctx) -> String {
 
 /// Entry point for a generated game binary:
 /// `game <rom> [--symbols file]... [--config file] [--frames n]
-/// [--capture dir] [--capture-every n] [--wav file] [--input script]
+/// [--capture dir] [--capture-every n] [--capture-scale n] [--wav file] [--input script]
 /// [--window] [--run run.toml]`.
 ///
 /// Display lists and audio command lists always go through the graphics
 /// and audio interpreters. With `--capture`, every n-th finished frame (60
-/// by default) is rendered off screen and saved as a PNG in `dir`; with
+/// by default) is rendered off screen and saved as a PNG in `dir`
+/// (`--capture-scale n` renders at n times the game's resolution); with
 /// `--wav`, the sound is recorded to a file; `--input` plays a controller
 /// script against retrace numbers. Nothing is shown or played.
 ///
@@ -228,6 +229,7 @@ pub fn main_with(game: Game, devices: Option<Box<dyn devices::Devices>>) -> Exit
     let mut local = PathBuf::from("..");
     let mut capture = None;
     let mut every = 60;
+    let mut scale = 1;
     let mut wav = None;
     let mut input = None;
     let mut it = args.iter();
@@ -253,15 +255,15 @@ pub fn main_with(game: Game, devices: Option<Box<dyn devices::Devices>>) -> Exit
             "--wav" => wav = Some(PathBuf::from(v)),
             "--input" => input = Some(PathBuf::from(v)),
             "--run" => run_config = Some(PathBuf::from(v)),
-            "--frames" | "--capture-every" => {
+            "--frames" | "--capture-every" | "--capture-scale" => {
                 let Some(n) = number() else {
                     eprintln!("error: {flag} needs a number, not {v:?}");
                     return ExitCode::from(2);
                 };
-                if flag == "--frames" {
-                    frames = Some(n);
-                } else {
-                    every = n;
+                match flag {
+                    "--frames" => frames = Some(n),
+                    "--capture-every" => every = n,
+                    _ => scale = n.min(8) as u32,
                 }
             }
             _ => {
@@ -275,7 +277,7 @@ pub fn main_with(game: Game, devices: Option<Box<dyn devices::Devices>>) -> Exit
     }
     let Some(rom_path) = rom_path else {
         eprintln!(
-            "usage: <game> <rom> [--symbols file]... [--config file] [--frames n] [--local dir] [--capture dir] [--capture-every n] [--wav file] [--input script] [--window] [--run run.toml]"
+            "usage: <game> <rom> [--symbols file]... [--config file] [--frames n] [--local dir] [--capture dir] [--capture-every n] [--capture-scale n] [--wav file] [--input script] [--window] [--run run.toml]"
         );
         return ExitCode::from(2);
     };
@@ -363,7 +365,7 @@ pub fn main_with(game: Game, devices: Option<Box<dyn devices::Devices>>) -> Exit
     let n_audio = ["n_alSynNew", "n_alAudioFrame"]
         .iter()
         .any(|n| by_name.contains_key(*n));
-    let media = media::Media::new(capture, every, wav, n_audio, script);
+    let media = media::Media::new(capture, every, wav, n_audio, script).with_scale(scale);
     let entry = game.entry;
     if window {
         return live::play(&run_config, media, move |devices| {

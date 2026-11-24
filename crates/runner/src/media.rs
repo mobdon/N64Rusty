@@ -48,6 +48,8 @@ pub struct Media {
     gfx: Interpreter,
     capture: Option<PathBuf>,
     every: u64,
+    /// Saved frames are this many times the game's resolution.
+    scale: u32,
     renderer: Option<Renderer>,
     renderer_failed: bool,
     tasks: u64,
@@ -96,6 +98,7 @@ impl Media {
             gfx: Interpreter::new(),
             capture,
             every: every.max(1),
+            scale: 1,
             renderer: None,
             renderer_failed: false,
             tasks: 0,
@@ -107,6 +110,12 @@ impl Media {
             warnings: Vec::new(),
             shown: None,
         }
+    }
+
+    /// Saves frames at `scale` times the game's resolution (1 to 8).
+    pub fn with_scale(mut self, scale: u32) -> Self {
+        self.scale = scale.clamp(1, 8);
+        self
     }
 
     /// Hands every finished frame to `slot`, replacing one not yet taken.
@@ -130,7 +139,7 @@ impl Media {
         let Some(r) = self.renderer.as_mut() else {
             return;
         };
-        let (w, h) = (f.width.max(1), f.height());
+        let (w, h) = (f.width.max(1) * self.scale, f.height() * self.scale);
         let result = r
             .render(f, w, h)
             .map_err(|e| e.to_string())
