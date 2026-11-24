@@ -21,6 +21,7 @@ crate that compiles. Floating point and the rest of the console come next.
 | `n64rusty-rom` | `crates/rom` | ROM loading: byte order, SHA-256, header, boot code variant |
 | `n64rusty-refcpu` | `crates/refcpu` | Reference VR4300 interpreter, used only by tests |
 | `n64rusty-conformance` | `crates/conformance` | Per-instruction tests: translated code against the reference CPU |
+| `n64rusty-host` | `crates/host` | Window, frame pacing, controllers, input record and replay, per-run config, debug port |
 
 ```
 cargo build --workspace
@@ -46,6 +47,41 @@ project; it is never copied into this repository. Output goes to the
 git-ignored `local/<sha256>/` folder: `out/` (the generated crate, one file
 per 64 KiB of address space, rewritten only when its contents change),
 `report.txt` and a `config.toml` template.
+
+On Linux, building needs `libudev-dev` (for gamepads).
+
+## Window and input
+
+`crates/host` runs the frame loop around a game. A game plugs in through the
+`Guest` trait: it gets each frame's four controller states, and once the
+window exists, the window itself (so a renderer can make a wgpu surface on
+it).
+
+- **One config file per run.** Everything that decides how a run goes
+  (frame limit, frame rate, replay and record files, debug port, window size,
+  where each port's input comes from, key layout) is in one TOML file, so a run
+  can be repeated from that file. Unknown keys are errors. See
+  `crates/host/src/config.rs` for the format.
+- **Controllers.** Four ports. By default port 1 is the keyboard plus the
+  first gamepad, and ports 2 to 4 are the next gamepads. Keyboard: WASD moves
+  the stick (left Shift for half tilt), J is A, K is B, Space is Z, Enter is
+  Start, Q and E are L and R, T F G H (or numpad 8 4 5 6) are the C buttons
+  and 1 to 4 the D-pad. The arrow keys are not used. Keys can be remapped per
+  port. Gamepads: south face button A, west B, left trigger Z, shoulders L and
+  R, right stick the C buttons.
+- **Record and replay.** Input scripts are plain text anchored on frame
+  numbers (`frame port buttons x y`, one change per line), so they can be
+  written by hand as well as recorded. A recording is written as the run goes,
+  so the input that led to a crash is kept.
+- **Debug port.** A loopback-only TCP port with one-line commands (`step`,
+  `frame`, `pad`, `release`, `run`, `quit`) lets a test or tool drive the game
+  one frame at a time.
+- **Pacing.** Windowed runs start frames on fixed deadlines at the configured
+  rate (NTSC 59.94 by default). If the host falls behind, the game slows
+  down; it never runs fast to catch up. Headless runs are unpaced.
+
+Tests use the headless path only. To try the window and your controllers by
+hand: `cargo run -p n64rusty-host --example window [run.toml]`.
 
 ## How translation works
 
