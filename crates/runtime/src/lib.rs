@@ -11,8 +11,10 @@
 
 use std::collections::HashMap;
 
+mod fpu;
 mod memory;
 
+pub use fpu::{cvt_l, cvt_w, fcmp, Round};
 pub use memory::Memory;
 
 /// Crate version, checked against the version recorded in generated code.
@@ -36,6 +38,17 @@ pub struct Ctx {
     pub hi: u64,
     /// Multiply/divide result register LO.
     pub lo: u64,
+    /// Floating-point registers, raw. See [`Ctx::fr`] for how singles and
+    /// doubles map onto them.
+    pub f: [u64; 32],
+    /// Floating-point control/status register (FCR31): rounding mode in
+    /// bits 0-1, compare condition in bit 23.
+    pub fcr31: u32,
+    /// The Status register's FR bit. `true`: 32 registers of 64 bits.
+    /// `false`: MIPS II layout, where single `n` (odd) is the high half of
+    /// `f[n - 1]` and doubles live in even registers. The console's boot
+    /// code sets FR, so it defaults to `true`.
+    pub fr: bool,
     /// Guest RAM.
     pub mem: Memory,
     funcs: HashMap<u32, GuestFn>,
@@ -49,6 +62,9 @@ impl Ctx {
             r: [0; 32],
             hi: 0,
             lo: 0,
+            f: [0; 32],
+            fcr31: 0,
+            fr: true,
             mem,
             funcs: HashMap::new(),
             overrides: HashMap::new(),

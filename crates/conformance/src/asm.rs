@@ -59,3 +59,18 @@ pub fn j(target: u32) -> u32 {
 pub fn jal(target: u32) -> u32 {
     jtype(0x03, target)
 }
+
+/// COP1 arithmetic: `fmt` 16 S, 17 D, 20 W, 21 L.
+pub fn cop1(fmt: u32, ft: u32, fs: u32, fd: u32, funct: u32) -> u32 {
+    (0x11 << 26) | (fmt << 21) | (ft << 16) | (fs << 11) | (fd << 6) | funct
+}
+
+/// COP1 move: `sub` 0 MFC1, 1 DMFC1, 2 CFC1, 4 MTC1, 5 DMTC1, 6 CTC1.
+pub fn cop1_move(sub: u32, rt: u32, fs: u32) -> u32 {
+    (0x11 << 26) | (sub << 21) | (rt << 16) | (fs << 11)
+}
+
+/// BC1F (0), BC1T (1), BC1FL (2), BC1TL (3).
+pub fn bc1(kind: u32, off: i32) -> u32 {
+    (0x11 << 26) | (0x08 << 21) | (kind << 16) | (off as u32 & 0xFFFF)
+}

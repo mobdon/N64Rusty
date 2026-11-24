@@ -141,6 +141,18 @@ fn simple(i: &Inst, pc: u32) -> String {
         Sdr => format!("ctx.mem.sdr({}, {});", addr(i), r(t)),
         // Caches and memory ordering have no effect on the host.
         Cache | Sync => String::new(),
+        // COP1 moves, loads and stores. `ft` is the rt field, `fs` the rd field.
+        Mfc1 => set(t, &sx(format!("ctx.fw({d})"))),
+        Dmfc1 => set(t, &format!("ctx.fl({d})")),
+        Cfc1 => set(t, &sx(format!("ctx.cfc1({d})"))),
+        Mtc1 => format!("ctx.set_fw({d}, {} as u32);", r(t)),
+        Dmtc1 => format!("ctx.set_fl({d}, {});", r(t)),
+        Ctc1 => format!("ctx.ctc1({d}, {} as u32);", r(t)),
+        Lwc1 => format!("ctx.set_fw({t}, ctx.mem.read_u32({}));", addr(i)),
+        Ldc1 => format!("ctx.set_fl({t}, ctx.mem.read_u64({}));", addr(i)),
+        Swc1 => format!("ctx.mem.write_u32({}, ctx.fw({t}));", addr(i)),
+        Sdc1 => format!("ctx.mem.write_u64({}, ctx.fl({t}));", addr(i)),
+        Cop1 => cop1(i, pc),
         Syscall | Break | Unknown => {
             format!("ctx.unimplemented({pc:#010x}, {:#010x});", i.word)
         }
@@ -149,6 +161,82 @@ fn simple(i: &Inst, pc: u32) -> String {
         | Bc1tl => {
             unreachable!("control flow handled by the block emitter")
         }
+    }
+}
+
+/// COP1 arithmetic, conversions and compares.
+fn cop1(i: &Inst, pc: u32) -> String {
+    let fmt = i.rs; // 16 S, 17 D, 20 W, 21 L
+    let ft = i.rt;
+    let fs = i.rd;
+    let fd = i.sa;
+    let funct = i.word & 0x3F;
+    let unimpl = format!("ctx.unimplemented({pc:#010x}, {:#010x});", i.word);
+    // Typed read and write for the S and D formats.
+    let (get, put) = match fmt {
+        16 => ("fs", "set_fs"),
+        17 => ("fd", "set_fd"),
+        _ => ("", ""),
+    };
+    let g = |n: u8| format!("ctx.{get}({n})");
+    let p = |e: String| format!("ctx.{put}({fd}, {e});");
+    // The source widened to f64 (exact for singles).
+    let wide = |n: u8| match fmt {
+        16 => format!("(ctx.fs({n}) as f64)"),
+        _ => format!("ctx.fd({n})"),
+    };
+    let float = fmt == 16 || fmt == 17;
+    let round = |mode: &str, long: bool| {
+        let (f, set) = if long {
+            ("cvt_l", "set_fl")
+        } else {
+            ("cvt_w", "set_fw")
+        };
+        format!("ctx.{set}({fd}, {RT}::{f}({}, {mode}));", wide(fs))
+    };
+    match funct {
+        0 if float => p(format!("{} + {}", g(fs), g(ft))),
+        1 if float => p(format!("{} - {}", g(fs), g(ft))),
+        2 if float => p(format!("{} * {}", g(fs), g(ft))),
+        3 if float => p(format!("{} / {}", g(fs), g(ft))),
+        4 if float => p(format!("{}.sqrt()", g(fs))),
+        5 if float => p(format!("{}.abs()", g(fs))),
+        6 if fmt == 16 => format!("ctx.set_fw({fd}, ctx.fw({fs}));"),
+        6 if fmt == 17 => format!("ctx.set_fl({fd}, ctx.fl({fs}));"),
+        7 if float => p(format!("-{}", g(fs))),
+        8..=15 if float => {
+            let mode = match funct & 3 {
+                0 => "Nearest",
+                1 => "Zero",
+                2 => "Up",
+                _ => "Down",
+            };
+            round(&format!("{RT}::Round::{mode}"), funct < 12)
+        }
+        // CVT.S
+        32 => match fmt {
+            17 => format!("ctx.set_fs({fd}, ctx.fd({fs}) as f32);"),
+            20 => format!("ctx.set_fs({fd}, ctx.fw({fs}) as i32 as f32);"),
+            21 => format!("ctx.set_fs({fd}, ctx.fl({fs}) as i64 as f32);"),
+            _ => unimpl,
+        },
+        // CVT.D
+        33 => match fmt {
+            16 => format!("ctx.set_fd({fd}, ctx.fs({fs}) as f64);"),
+            20 => format!("ctx.set_fd({fd}, ctx.fw({fs}) as i32 as f64);"),
+            21 => format!("ctx.set_fd({fd}, ctx.fl({fs}) as i64 as f64);"),
+            _ => unimpl,
+        },
+        // CVT.W and CVT.L use the rounding mode in FCR31.
+        36 if float => round(&format!("{RT}::Round::from_fcr31(ctx.fcr31)"), false),
+        37 if float => round(&format!("{RT}::Round::from_fcr31(ctx.fcr31)"), true),
+        48..=63 if float => format!(
+            "ctx.set_c1({RT}::fcmp({}, {}, {}));",
+            wide(fs),
+            wide(ft),
+            funct & 15
+        ),
+        _ => unimpl,
     }
 }
 
@@ -163,6 +251,8 @@ fn condition(i: &Inst, pc: u32) -> String {
         Bgtz | Bgtzl => format!("({s} as i64) > 0"),
         Bltz | Bltzl | Bltzal | Bltzall => format!("({s} as i64) < 0"),
         Bgez | Bgezl | Bgezal | Bgezall => format!("({s} as i64) >= 0"),
+        Bc1t | Bc1tl => "ctx.c1()".to_string(),
+        Bc1f | Bc1fl => "!ctx.c1()".to_string(),
         _ => format!("ctx.unimplemented({pc:#010x}, {:#010x})", i.word),
     }
 }
@@ -356,7 +446,7 @@ pub fn function(f: &Function) -> Result<String, TranslateError> {
     }
     e.line(
         0,
-        "#[allow(unused_mut, unused_variables, unused_assignments, unused_comparisons, unreachable_code, clippy::all)]",
+        "#[allow(unused_mut, unused_variables, unused_assignments, unused_comparisons, unused_parens, unreachable_code, clippy::all)]",
     );
     e.line(
         0,

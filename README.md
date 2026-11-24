@@ -5,9 +5,9 @@ code (MIPS VR4300, big-endian) and writes Rust, which links against a small
 runtime crate and builds into a native program. You supply your own legally
 obtained ROM; this repository contains no game data.
 
-Status: **step 2, ROM loader.** The VR4300 integer instruction set
-translates to Rust, with branch delay slots, and is tested per instruction
-against a reference interpreter. ROMs load in any byte order, and the boot
+Status: **step 2, ROM loader.** The VR4300 integer and floating-point
+instruction sets translate to Rust, with branch delay slots, and are tested
+per instruction against a reference interpreter. ROMs load in any byte order, and the boot
 segment's functions are found from the entry point and written out as a Rust
 crate that compiles. Floating point and the rest of the console come next.
 
@@ -62,9 +62,15 @@ every 32-bit result is sign-extended, as on the VR4300.
   point, so any guest function can be overridden by address with
   `Ctx::set_override`. `jr $ra` returns; jumps and branches that leave the
   function are tail calls.
-- **Not modelled yet.** Floating point (COP1) is the biggest gap. Overflow exceptions (ADD, ADDI, SUB and their
-  64-bit forms behave like the unsigned forms), traps, LL/SC, the TLB, and
-  coprocessor instructions. These emit a call that panics with the address,
+- **Floating point.** All COP1 moves, loads, stores, arithmetic,
+  conversions, compares and branches, in both register layouts (the Status
+  FR bit, on by default as the boot code leaves it). Arithmetic rounds to
+  nearest; float-to-integer conversions honour the FCR31 rounding mode.
+  FPU exceptions and cause/flag bits are not modelled; an invalid conversion
+  gives the largest positive integer, the MIPS default result.
+- **Not modelled yet.** COP0 (system control), overflow exceptions (ADD, ADDI, SUB and their
+  64-bit forms behave like the unsigned forms), traps (BREAK, SYSCALL), LL/SC and
+  the TLB. These emit a call that panics with the address,
   so the first one a game reaches is easy to find.
 
 ### Tests
@@ -72,8 +78,9 @@ every 32-bit result is sign-extended, as on the VR4300.
 `crates/conformance` writes several hundred tiny programs by hand with a
 built-in encoder (one or a few instructions each, plus branch, loop, call and
 tail-call shapes), translates them at build time, and runs each 64 times from
-random register and memory states. The translated code and the reference CPU
-must agree on every register, HI, LO and every byte of memory. The reference
+random register, float register, FCR31, FR-mode and memory states. The
+translated code and the reference CPU must agree on every register, HI, LO,
+float register, FCR31 and every byte of memory. The reference
 CPU is a separate implementation with its own decoder and byte-by-byte
 unaligned accesses, so a mistake in one shows up as a mismatch. No game code
 or data is used.
