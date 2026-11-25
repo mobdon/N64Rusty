@@ -1294,7 +1294,13 @@ fn format_guest(c: &Ctx, fmt: u32, first: usize) -> String {
             'o' => format!("{:o}", next()),
             'p' => format!("{:08x}", next()),
             'c' => char::from(next() as u8).to_string(),
-            's' => guest_str(c, next()),
+            's' => {
+                let t = guest_str(c, next());
+                match prec {
+                    Some(p) => t.chars().take(p).collect(),
+                    None => t,
+                }
+            }
             'f' | 'e' | 'g' | 'F' | 'E' | 'G' => {
                 // Doubles take an even pair of argument slots.
                 k += k % 2;
@@ -1302,10 +1308,7 @@ fn format_guest(c: &Ctx, fmt: u32, first: usize) -> String {
                 let lo = u64::from(arg(c, k + 1));
                 k += 2;
                 let v = f64::from_bits(hi << 32 | lo);
-                match conv {
-                    'e' | 'E' => format!("{v:.*e}", prec.unwrap_or(6)),
-                    _ => format!("{v:.*}", prec.unwrap_or(6)),
-                }
+                c_float(v, conv, prec.unwrap_or(6))
             }
             other => format!("%{spec}{other}"),
         };
@@ -1313,12 +1316,67 @@ fn format_guest(c: &Ctx, fmt: u32, first: usize) -> String {
         if left {
             out.push_str(&body);
             out.extend(std::iter::repeat_n(' ', pad));
+        } else if zero && conv != 's' && conv != 'c' {
+            // Zeros go after the sign.
+            let digits = body.strip_prefix('-').map_or(&body[..], |d| {
+                out.push('-');
+                d
+            });
+            out.extend(std::iter::repeat_n('0', pad));
+            out.push_str(digits);
         } else {
-            out.extend(std::iter::repeat_n(if zero { '0' } else { ' ' }, pad));
+            out.extend(std::iter::repeat_n(' ', pad));
             out.push_str(&body);
         }
     }
     out
+}
+
+/// `v` as C's `printf` writes it with conversion `conv` (f e g F E G) and
+/// precision `prec`.
+fn c_float(v: f64, conv: char, prec: usize) -> String {
+    // C writes the exponent with a sign and at least two digits.
+    let exp = |p: usize| {
+        let t = format!("{v:.p$e}");
+        let (m, e) = t.split_once('e').unwrap_or((&t, "0"));
+        let e: i32 = e.parse().unwrap_or(0);
+        format!("{m}e{}{:02}", if e < 0 { '-' } else { '+' }, e.abs())
+    };
+    let t = match conv.to_ascii_lowercase() {
+        'e' => exp(prec),
+        'g' => {
+            let p = prec.max(1);
+            let x = if v == 0.0 {
+                0
+            } else {
+                format!("{v:.*e}", p - 1)
+                    .split_once('e')
+                    .and_then(|(_, e)| e.parse::<i32>().ok())
+                    .unwrap_or(0)
+            };
+            // Trailing zeros (and a bare point) are dropped.
+            let trim = |t: String| {
+                if t.contains('.') {
+                    t.trim_end_matches('0').trim_end_matches('.').to_string()
+                } else {
+                    t
+                }
+            };
+            if x < -4 || x >= p as i32 {
+                let t = exp(p - 1);
+                let (m, e) = t.split_once('e').unwrap_or((&t, ""));
+                format!("{}e{e}", trim(m.to_string()))
+            } else {
+                trim(format!("{v:.*}", (p as i32 - 1 - x).max(0) as usize))
+            }
+        }
+        _ => format!("{v:.prec$}"),
+    };
+    if conv.is_ascii_uppercase() {
+        t.to_uppercase()
+    } else {
+        t
+    }
 }
 
 fn ret_zero(c: &mut Ctx) {
@@ -1452,6 +1510,21 @@ mod tests {
             format_guest(&c, 0x8000_0100, 1),
             "load at 000000AB: -5% z  | 2.50"
         );
+        put(&mut c, 0x100, "%05d|%.2s");
+        c.r[5] = (-42i32) as u32 as u64;
+        c.r[6] = 0x8000_0200;
+        assert_eq!(format_guest(&c, 0x8000_0100, 1), "-0042|lo");
+    }
+
+    #[test]
+    fn floats_print_as_c_does() {
+        assert_eq!(c_float(1.5, 'e', 6), "1.500000e+00");
+        assert_eq!(c_float(0.00012, 'E', 2), "1.20E-04");
+        assert_eq!(c_float(2.5, 'g', 6), "2.5");
+        assert_eq!(c_float(1234567.0, 'g', 6), "1.23457e+06");
+        assert_eq!(c_float(0.0001, 'g', 6), "0.0001");
+        assert_eq!(c_float(100.0, 'G', 6), "100");
+        assert_eq!(c_float(-3.25, 'f', 1), "-3.2");
     }
 
     #[test]
