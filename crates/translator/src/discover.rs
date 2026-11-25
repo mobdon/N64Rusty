@@ -261,20 +261,24 @@ pub fn function_starts(img: &Image) -> Vec<u32> {
     let mut out = Vec::new();
     let mut a = img.base;
     let mut after_return = true;
-    // Furthest place a branch so far jumps forward to: code up to there
-    // still belongs to the function before, even past a return.
-    let mut reach = 0;
+    let mut leaves = Vec::new();
+    // Every branch as the span it crosses: code inside one still belongs
+    // to the function before, even past a return.
+    let mut spans = Vec::new();
     while a < end {
         let w = img.word(a).unwrap_or(0);
         if after_return && w != 0 {
-            if opens_frame(img, a) || (a > reach && is_leaf(img, a)) {
+            if opens_frame(img, a) {
                 out.push(a);
+            } else if is_leaf(img, a) {
+                leaves.push(a);
             }
             after_return = false;
         }
         let i = Inst::decode(w);
         if matches!(i.flow(), Flow::Branch { link: false, .. }) {
-            reach = reach.max(i.branch_target(a));
+            let t = i.branch_target(a);
+            spans.push((a.min(t), a.max(t)));
         }
         if w == JR_RA {
             after_return = true;
@@ -282,6 +286,12 @@ pub fn function_starts(img: &Image) -> Vec<u32> {
         }
         a += 4;
     }
+    out.extend(
+        leaves
+            .into_iter()
+            .filter(|&l| !spans.iter().any(|&(lo, hi)| lo < l && l <= hi)),
+    );
+    out.sort_unstable();
     out
 }
 
@@ -552,6 +562,14 @@ mod tests {
         assert_eq!(function_starts(&img), [BASE, BASE + 0x14, BASE + 0x20]);
         // Code after a return that a branch before it reaches is not a leaf.
         let words = [0x1080_0003, NOP, JR_RA, NOP, 0x2402_0001, JR_RA, NOP];
+        let bytes = image(&words);
+        let img = Image {
+            base: BASE,
+            bytes: &bytes,
+        };
+        assert_eq!(function_starts(&img), [BASE]);
+        // Nor is code after a return that a later branch loops back over.
+        let words = [JR_RA, NOP, 0x2402_0001, JR_RA, NOP, 0x1000_FFFB, NOP];
         let bytes = image(&words);
         let img = Image {
             base: BASE,
