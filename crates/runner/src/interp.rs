@@ -232,7 +232,7 @@ mod tests {
         for (k, w) in code.iter().enumerate() {
             ctx.mem.write_u32(0x8000_3000 + 4 * k as u32, *w);
         }
-        install(&mut ctx, Box::new(|_, a| Some((a, a + 16))));
+        install(&mut ctx, Box::new(|_, a| Some((a, a + 32))));
         ctx.r[4] = 0x1234;
         ctx.r[31] = sx32(0x8000_0F00);
         ctx.call(0x8000_3000);

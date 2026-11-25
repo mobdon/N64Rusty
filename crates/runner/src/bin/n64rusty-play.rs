@@ -61,13 +61,14 @@ fn play(args: &mut Vec<String>, dir: &Path, plain: bool) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    if plain {
-        let _ = std::fs::write(&last, &args[0]);
-    }
     let local = dir.join("games").join(&rom.sha256);
     if let Err(e) = routines(args, dir, &rom, &local) {
         eprintln!("error: {e}");
         return ExitCode::from(2);
+    }
+    // Remembered once it is known to be a ROM the player can set up.
+    if plain {
+        let _ = std::fs::write(&last, &args[0]);
     }
     if !args.iter().any(|a| a == "--local") {
         args.extend(["--local".into(), local.display().to_string()]);
