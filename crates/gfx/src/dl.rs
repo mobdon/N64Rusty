@@ -119,6 +119,8 @@ struct Drawn {
     /// The handed-over frame that last drew into it, for an image read in
     /// a later frame (a picture drawn once, shown for many frames).
     frame: Option<std::sync::Arc<Frame>>,
+    /// Read back into RAM since it was last drawn into.
+    read: bool,
 }
 
 impl Drawn {
@@ -695,6 +697,10 @@ impl Interpreter {
             Some(k) => {
                 let mut d = self.drawn.remove(k);
                 d.height = d.height.max(h);
+                // A frame buffer is also drawn over as an 8-bit image for a
+                // pass of its own; it is read back at its full pixel size.
+                d.siz = d.siz.max(siz);
+                d.read = false;
                 self.drawn.push(d);
             }
             None => self.drawn.push(Drawn {
@@ -703,6 +709,7 @@ impl Interpreter {
                 siz,
                 height: h,
                 frame: None,
+                read: false,
             }),
         }
         let first = self.frame.vertices.len() as u32;
@@ -723,17 +730,29 @@ impl Interpreter {
     /// Reads back a colour image drawn on the GPU that the coming texture
     /// load starts inside.
     fn read_back(&mut self, ram: &mut [u8], rb: &mut dyn Readback) {
-        let (src, _, src_siz) = self.tmem.image();
+        let (src, src_width, src_siz) = self.tmem.image();
         // A load of another pixel size is a texture that only lies inside
         // the image's guessed extent (its height is a guess from its width),
         // not the picture read back.
-        let Some(k) = self.drawn.iter().rposition(|d| {
+        let inside = |d: &Drawn| {
             let len = d.width * d.height * if d.siz == 3 { 4 } else { 2 };
             src >= d.image && src < d.image + len && src_siz == d.siz
-        }) else {
+        };
+        // Images of other widths can share the address: the load's own row
+        // width names the one it reads.
+        let Some(k) = (self.drawn.iter())
+            .rposition(|d| inside(d) && d.width == src_width)
+            .or_else(|| self.drawn.iter().rposition(inside))
+        else {
             return;
         };
-        let d = self.drawn.remove(k);
+        // Kept once read: the loads after it (one strip of the image each)
+        // must not fall through to another image at the same address.
+        if self.drawn[k].read {
+            return;
+        }
+        self.drawn[k].read = true;
+        let d = self.drawn[k].clone();
         let here = self.frame.draws().any(|x| d.drawn_by(x));
         let Some(from) = (if here {
             Some(&self.frame)
