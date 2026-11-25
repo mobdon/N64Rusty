@@ -15,7 +15,7 @@ mod fpu;
 mod memory;
 
 pub use fpu::{cvt_l, cvt_w, fcmp, Round};
-pub use memory::{Io, Memory};
+pub use memory::{Flash, FlashOp, Io, Memory};
 
 /// Crate version, checked against the version recorded in generated code.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
