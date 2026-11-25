@@ -155,7 +155,7 @@ pub struct PadMap {
 }
 
 impl Default for PadMap {
-    /// Xbox layout: A is A, X is B, B and Y are C-down and C-up, LT and RB
+    /// Xbox layout: A is A, B is B, X and Y are C-down and C-up, LT and RB
     /// are Z, LB is L, RT is R. The left stick is the stick, the right
     /// stick the four C buttons, the d-pad the d-pad.
     fn default() -> Self {
@@ -163,8 +163,8 @@ impl Default for PadMap {
         PadMap {
             buttons: vec![
                 (Button::South, B(button::A)),
-                (Button::West, B(button::B)),
-                (Button::East, B(button::C_DOWN)),
+                (Button::East, B(button::B)),
+                (Button::West, B(button::C_DOWN)),
                 (Button::North, B(button::C_UP)),
                 (Button::LeftTrigger2, B(button::Z)),
                 (Button::RightTrigger, B(button::Z)),
@@ -284,7 +284,12 @@ mod tests {
     #[test]
     fn gamepad_layout() {
         let pad = PadMap::default().pad(
-            |b| matches!(b, Button::South | Button::LeftTrigger2),
+            |b| {
+                matches!(
+                    b,
+                    Button::South | Button::East | Button::West | Button::LeftTrigger2
+                )
+            },
             |a| match a {
                 Axis::LeftStickX => 1.0,
                 Axis::RightStickY => 0.9,
@@ -294,7 +299,7 @@ mod tests {
         assert_eq!(
             pad,
             Pad {
-                buttons: button::A | button::Z | button::C_UP,
+                buttons: button::A | button::B | button::C_DOWN | button::Z | button::C_UP,
                 x: STICK_MAX,
                 y: 0
             }
