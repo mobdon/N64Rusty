@@ -80,12 +80,18 @@ fn play(args: &mut Vec<String>, dir: &Path, plain: bool) -> ExitCode {
     }
     // Menu choices are saved in the game's own run.toml, else in
     // settings.toml next to the program, shared by every game.
-    if !local.join("run.toml").exists() && !args.iter().any(|a| a == "--run") {
+    // The folder the run uses: the given --local, else the game's.
+    let used = args
+        .windows(2)
+        .find(|w| w[0] == "--local")
+        .map(|w| PathBuf::from(&w[1]))
+        .unwrap_or(local);
+    if !used.join("run.toml").exists() && !args.iter().any(|a| a == "--run") {
         let settings = dir.join("settings.toml");
-        if !settings.exists() {
-            let _ = std::fs::write(&settings, "");
+        // A folder it cannot write to just plays with the defaults.
+        if settings.exists() || std::fs::write(&settings, "").is_ok() {
+            args.extend(["--run".into(), settings.display().to_string()]);
         }
-        args.extend(["--run".into(), settings.display().to_string()]);
     }
     // Like a console with the Expansion Pak: games that need it run, and
     // the others only see more free memory.
