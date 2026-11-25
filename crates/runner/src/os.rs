@@ -498,7 +498,9 @@ fn spawn_thread(id: u32, generation: u64) {
             };
             c.r = [0; 32];
             c.r[4] = sx32(arg);
-            c.r[29] = sx32(sp);
+            // osCreateThread starts the stack 16 bytes below the top it is
+            // given: the entry function keeps its arguments there.
+            c.r[29] = sx32(sp.wrapping_sub(16));
             // The boot code runs as the boot ROM left it, with 64-bit FPU
             // registers (Status.FR set). Threads start from the context the
             // system library builds, whose Status has FR clear: doubles

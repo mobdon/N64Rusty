@@ -378,6 +378,9 @@ pub fn discover(img: &Image, entries: &[u32], hints: &[u32], code_end: Option<u3
     known.extend(&queue);
     let mut text_end = 0;
     let mut first_pass = true;
+    // Past the first pass, calls beyond the code reached from the entries go
+    // to code the game loads there later: the image holds other bytes.
+    let mut call_end = u32::MAX;
     loop {
         while let Some(s) = queue.pop() {
             if done.contains_key(&s) {
@@ -385,7 +388,7 @@ pub fn discover(img: &Image, entries: &[u32], hints: &[u32], code_end: Option<u3
             }
             let ex = explore(img, s, &known);
             for &c in &ex.calls {
-                if img.contains(c) && known.insert(c) {
+                if c < call_end && img.contains(c) && known.insert(c) {
                     queue.push(c);
                 }
             }
@@ -396,6 +399,7 @@ pub fn discover(img: &Image, entries: &[u32], hints: &[u32], code_end: Option<u3
             first_pass = false;
         }
         let code_end = code_end.unwrap_or(text_end);
+        call_end = code_end;
         // Second pass: hints and pointer pairs inside the code found so far,
         // not inside a function already found.
         let inside_known = |a: u32| {
@@ -606,6 +610,21 @@ mod tests {
         let d = discover(&img, &[BASE], &[], None);
         let starts: Vec<u32> = d.functions.iter().map(|f| f.addr).collect();
         assert_eq!(starts, vec![BASE, BASE + 20]);
+    }
+
+    #[test]
+    fn pointer_found_code_does_not_call_past_the_code() {
+        // f: jr ra ; nop | g (only a hint): jal past ; nop ; jr ra ; nop |
+        // past the code: bytes loaded over later, which here call into g.
+        let past = BASE + 32;
+        let bytes = image(&[JR_RA, NOP, jal(past), NOP, JR_RA, NOP, 0, 0, jal(BASE + 12), NOP, JR_RA, NOP]);
+        let img = Image {
+            base: BASE,
+            bytes: &bytes,
+        };
+        let d = discover(&img, &[BASE], &[BASE + 8], Some(BASE + 24));
+        let starts: Vec<u32> = d.functions.iter().map(|f| f.addr).collect();
+        assert_eq!(starts, vec![BASE, BASE + 8]);
     }
 
     #[test]
