@@ -195,14 +195,16 @@ pub fn crash_report(ctx: &Ctx) -> String {
 
 /// Entry point for a generated game binary:
 /// `game <rom> [--symbols file]... [--config file] [--frames n]
-/// [--capture dir] [--capture-every n] [--capture-scale n] [--capture-wide] [--wav file] [--input script]
+/// [--capture dir] [--capture-every n] [--capture-scale n] [--capture-wide] [--capture-between] [--wav file] [--input script]
 /// [--save file] [--window] [--run run.toml]`.
 ///
 /// Display lists and audio command lists always go through the graphics
 /// and audio interpreters. With `--capture`, every n-th finished frame (60
 /// by default) is rendered off screen and saved as a PNG in `dir`
 /// (`--capture-scale n` renders at n times the game's resolution,
-/// `--capture-wide` 16:9 as the window's widescreen option draws it); with
+/// `--capture-wide` 16:9 as the window's widescreen option draws it,
+/// `--capture-between` also the picture half-way from the frame before, as
+/// a high refresh rate window blends it); with
 /// `--wav`, the sound is recorded to a file; `--input` plays a controller
 /// script against retrace numbers. Nothing is shown or played.
 ///
@@ -240,6 +242,7 @@ pub fn main_with(game: Game, devices: Option<Box<dyn devices::Devices>>) -> Exit
     let mut input = None;
     let mut save = None;
     let mut wide = false;
+    let mut between = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let flag = a.as_str();
@@ -253,6 +256,10 @@ pub fn main_with(game: Game, devices: Option<Box<dyn devices::Devices>>) -> Exit
         }
         if flag == "--capture-wide" {
             wide = true;
+            continue;
+        }
+        if flag == "--capture-between" {
+            between = true;
             continue;
         }
         let Some(v) = it.next() else {
@@ -290,7 +297,7 @@ pub fn main_with(game: Game, devices: Option<Box<dyn devices::Devices>>) -> Exit
     }
     let Some(rom_path) = rom_path else {
         eprintln!(
-            "usage: <game> <rom> [--symbols file]... [--config file] [--frames n] [--local dir] [--capture dir] [--capture-every n] [--capture-scale n] [--capture-wide] [--wav file] [--input script] [--save file] [--window] [--run run.toml]"
+            "usage: <game> <rom> [--symbols file]... [--config file] [--frames n] [--local dir] [--capture dir] [--capture-every n] [--capture-scale n] [--capture-wide] [--capture-between] [--wav file] [--input script] [--save file] [--window] [--run run.toml]"
         );
         return ExitCode::from(2);
     };
@@ -397,7 +404,8 @@ pub fn main_with(game: Game, devices: Option<Box<dyn devices::Devices>>) -> Exit
         .any(|n| by_name.contains_key(*n));
     let media = media::Media::new(capture, every, wav, n_audio, script)
         .with_scale(scale)
-        .with_widescreen(wide);
+        .with_widescreen(wide)
+        .with_between(between);
     let entry = game.entry;
     if window {
         return live::play(&run_config, media, move |devices| {

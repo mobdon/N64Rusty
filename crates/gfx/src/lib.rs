@@ -164,6 +164,50 @@ impl Frame {
     }
 }
 
+/// The transforms of `cur` moved back towards `prev`: `t` = 0 gives
+/// `prev`'s matrices, 1 gives `cur`'s. Transforms are matched by
+/// [`Transform::tag`], the n-th use of a tag in `cur` with the n-th in
+/// `prev`; one with no match keeps `cur`'s matrices. Only placement is
+/// blended, so game logic and game speed are untouched.
+///
+/// shortcut: matrices are blended element by element, which shrinks a
+/// fast-turning object a little mid-way and blends across camera cuts;
+/// decompose into rotation/scale/translation and skip large jumps if that
+/// shows.
+pub fn interpolate(prev: &Frame, cur: &Frame, t: f32) -> Vec<Transform> {
+    use std::collections::HashMap;
+    let mut by_tag: HashMap<u32, Vec<&Transform>> = HashMap::new();
+    for p in &prev.transforms {
+        by_tag.entry(p.tag).or_default().push(p);
+    }
+    let mut used: HashMap<u32, usize> = HashMap::new();
+    let lerp = |a: f32, b: f32| a + (b - a) * t;
+    let mat = |a: &Mat4, b: &Mat4| -> Mat4 {
+        std::array::from_fn(|i| std::array::from_fn(|j| lerp(a[i][j], b[i][j])))
+    };
+    let pair = |a: [f32; 2], b: [f32; 2]| [lerp(a[0], b[0]), lerp(a[1], b[1])];
+    cur.transforms
+        .iter()
+        .map(|c| {
+            let n = used.entry(c.tag).or_default();
+            let p = by_tag.get(&c.tag).and_then(|v| v.get(*n));
+            *n += 1;
+            match p {
+                Some(p) => Transform {
+                    modelview: mat(&p.modelview, &c.modelview),
+                    projection: mat(&p.projection, &c.projection),
+                    viewport: Viewport {
+                        scale: pair(p.viewport.scale, c.viewport.scale),
+                        trans: pair(p.viewport.trans, c.viewport.trans),
+                    },
+                    tag: c.tag,
+                },
+                None => c.clone(),
+            }
+        })
+        .collect()
+}
+
 /// Multiply two N64 matrices (`a` applied first).
 pub fn mat_mul(a: &Mat4, b: &Mat4) -> Mat4 {
     let mut r = [[0.0; 4]; 4];
@@ -181,3 +225,41 @@ pub const IDENTITY: Mat4 = [
     [0.0, 0.0, 1.0, 0.0],
     [0.0, 0.0, 0.0, 1.0],
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tf(tag: u32, x: f32) -> Transform {
+        let mut modelview = IDENTITY;
+        modelview[3][0] = x;
+        Transform {
+            modelview,
+            projection: IDENTITY,
+            viewport: Viewport {
+                scale: [160.0, 120.0],
+                trans: [160.0, 120.0],
+            },
+            tag,
+        }
+    }
+
+    fn frame(transforms: Vec<Transform>) -> Frame {
+        Frame {
+            transforms,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn interpolate_matches_by_tag_and_use() {
+        // Tag 7 is used twice (one routine drawing two objects); tag 9
+        // only exists in the newer frame.
+        let prev = frame(vec![tf(7, 0.0), tf(7, 10.0), tf(5, 100.0)]);
+        let cur = frame(vec![tf(5, 200.0), tf(7, 4.0), tf(7, 20.0), tf(9, 50.0)]);
+        let x = |t: &[Transform]| t.iter().map(|t| t.modelview[3][0]).collect::<Vec<_>>();
+        assert_eq!(x(&interpolate(&prev, &cur, 0.5)), [150.0, 2.0, 15.0, 50.0]);
+        assert_eq!(x(&interpolate(&prev, &cur, 0.0)), [100.0, 0.0, 10.0, 50.0]);
+        assert_eq!(interpolate(&prev, &cur, 1.0), cur.transforms);
+    }
+}

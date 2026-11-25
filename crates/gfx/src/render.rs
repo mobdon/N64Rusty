@@ -438,7 +438,7 @@ impl Renderer {
     /// Draw `frame` at `width` x `height` pixels and read it back. The
     /// frame's native framebuffer is scaled to fill the image.
     pub fn render(&mut self, frame: &Frame, width: u32, height: u32) -> Result<Image, RenderError> {
-        let (target, encoder) = self.draw(frame, width, height);
+        let (target, encoder) = self.draw(frame, &frame.transforms, width, height);
         self.read_back(encoder, &target)
     }
 
@@ -502,6 +502,7 @@ impl Renderer {
     fn draw(
         &mut self,
         frame: &Frame,
+        transforms: &[crate::Transform],
         width: u32,
         height: u32,
     ) -> (wgpu::Texture, wgpu::CommandEncoder) {
@@ -546,7 +547,7 @@ impl Renderer {
                 stretch[range].fill(Some((x0, x1)));
             }
         }
-        let clip = clip_matrices(frame);
+        let clip = clip_matrices(frame, transforms);
         let mut verts = Vec::with_capacity(frame.vertices.len() * VERTEX_FLOATS);
         for (v, stretch) in frame.vertices.iter().zip(stretch) {
             let mut p = clip
@@ -792,10 +793,9 @@ fn floats(v: &[f32]) -> Vec<u8> {
 
 /// Per transform: model-view times projection times the viewport, mapping
 /// object space to wgpu clip space (y up, depth 0 to 1).
-fn clip_matrices(frame: &Frame) -> Vec<crate::Mat4> {
+fn clip_matrices(frame: &Frame, transforms: &[crate::Transform]) -> Vec<crate::Mat4> {
     let (w, h) = (frame.width as f32, frame.height() as f32);
-    frame
-        .transforms
+    transforms
         .iter()
         .map(|t| {
             let [sx, sy] = t.viewport.scale;
@@ -1025,6 +1025,33 @@ impl Renderer {
         width: u32,
         height: u32,
     ) -> Result<(), RenderError> {
+        self.present_with(frame, &frame.transforms, win, width, height)
+    }
+
+    /// Draws a picture `t` of the way (0 to 1) from game frame `prev` to
+    /// game frame `cur`, for refresh rates above the game's: `cur` with
+    /// its matrices blended from `prev` (see [`crate::interpolate`]).
+    pub fn present_between(
+        &mut self,
+        prev: &Frame,
+        cur: &Frame,
+        t: f32,
+        win: &mut WindowTarget,
+        width: u32,
+        height: u32,
+    ) -> Result<(), RenderError> {
+        let transforms = crate::interpolate(prev, cur, t);
+        self.present_with(cur, &transforms, win, width, height)
+    }
+
+    fn present_with(
+        &mut self,
+        frame: &Frame,
+        transforms: &[crate::Transform],
+        win: &mut WindowTarget,
+        width: u32,
+        height: u32,
+    ) -> Result<(), RenderError> {
         let max = self.device.limits().max_texture_dimension_2d;
         if width == 0 || height == 0 || width > max || height > max {
             return Ok(());
@@ -1066,7 +1093,7 @@ impl Renderer {
             ..Default::default()
         });
         let rect = self.place(frame, width, height);
-        let (src, mut encoder) = self.draw(frame, rect.2, rect.3);
+        let (src, mut encoder) = self.draw(frame, transforms, rect.2, rect.3);
         blit.record(&self.device, &mut encoder, &src, &view, rect);
         self.queue.submit([encoder.finish()]);
         self.queue.present(texture);
@@ -1081,6 +1108,30 @@ impl Renderer {
         width: u32,
         height: u32,
     ) -> Result<Image, RenderError> {
+        self.letterboxed_with(frame, &frame.transforms, width, height)
+    }
+
+    /// Like [`Renderer::present_between`], into an off-screen image, for
+    /// tests.
+    pub fn render_between(
+        &mut self,
+        prev: &Frame,
+        cur: &Frame,
+        t: f32,
+        width: u32,
+        height: u32,
+    ) -> Result<Image, RenderError> {
+        let transforms = crate::interpolate(prev, cur, t);
+        self.letterboxed_with(cur, &transforms, width, height)
+    }
+
+    fn letterboxed_with(
+        &mut self,
+        frame: &Frame,
+        transforms: &[crate::Transform],
+        width: u32,
+        height: u32,
+    ) -> Result<Image, RenderError> {
         let dst = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("letterboxed"),
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
@@ -1092,7 +1143,7 @@ impl Renderer {
         });
         let blit = Blit::new(&self.device, COLOR_FORMAT);
         let rect = self.place(frame, width, height);
-        let (src, mut encoder) = self.draw(frame, rect.2, rect.3);
+        let (src, mut encoder) = self.draw(frame, transforms, rect.2, rect.3);
         blit.record(
             &self.device,
             &mut encoder,

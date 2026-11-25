@@ -52,6 +52,11 @@ pub struct Media {
     scale: u32,
     /// Saved frames are 16:9 widescreen.
     wide: bool,
+    /// Also save the picture half-way from the frame before each saved one,
+    /// as a high refresh rate window would show it.
+    between: bool,
+    /// The frame before the next one to save, kept when `between` is set.
+    prev: Option<Frame>,
     renderer: Option<Renderer>,
     renderer_failed: bool,
     tasks: u64,
@@ -102,6 +107,8 @@ impl Media {
             every: every.max(1),
             scale: 1,
             wide: false,
+            between: false,
+            prev: None,
             renderer: None,
             renderer_failed: false,
             tasks: 0,
@@ -127,12 +134,27 @@ impl Media {
         self
     }
 
+    /// Also saves `frame_<n>_half.png`: half-way from frame n-1 to frame n.
+    pub fn with_between(mut self, on: bool) -> Self {
+        self.between = on;
+        self
+    }
+
     /// Hands every finished frame to `slot`, replacing one not yet taken.
     pub fn show_frames(&mut self, slot: Arc<Mutex<Option<Frame>>>) {
         self.shown = Some(slot);
     }
 
     fn save(&mut self, frame: u64, f: &Frame) {
+        let prev = self.prev.take();
+        self.save_as(&format!("frame_{frame:05}.png"), f, None);
+        if let Some(p) = prev {
+            self.save_as(&format!("frame_{frame:05}_half.png"), f, Some(&p));
+        }
+    }
+
+    /// Renders `f` (half-way from `prev`, if given) and saves it as `name`.
+    fn save_as(&mut self, name: &str, f: &Frame, prev: Option<&Frame>) {
         let Some(dir) = self.capture.clone() else {
             return;
         };
@@ -155,18 +177,19 @@ impl Media {
         if self.wide {
             w = (h * 16 / 9).max(w);
         }
-        let result = r
-            .render(f, w, h)
-            .map_err(|e| e.to_string())
-            .and_then(|img| {
-                std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-                let path = dir.join(format!("frame_{frame:05}.png"));
-                write_png(&path, &img).map_err(|e| e.to_string())?;
-                Ok(path)
-            });
+        let img = match prev {
+            Some(p) => r.render_between(p, f, 0.5, w, h),
+            None => r.render(f, w, h),
+        };
+        let result = img.map_err(|e| e.to_string()).and_then(|img| {
+            std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            let path = dir.join(name);
+            write_png(&path, &img).map_err(|e| e.to_string())?;
+            Ok(path)
+        });
         match result {
             Ok(p) => self.saved.push(p),
-            Err(e) => eprintln!("warning: frame {frame} not saved: {e}"),
+            Err(e) => eprintln!("warning: {name} not saved: {e}"),
         }
     }
 }
@@ -268,6 +291,9 @@ impl Devices for Media {
         }
         if self.swaps.is_multiple_of(self.every) {
             self.save(frame, &f);
+        }
+        if self.between && self.capture.is_some() && (self.swaps + 1).is_multiple_of(self.every) {
+            self.prev = Some(f.clone());
         }
         if let Some(slot) = &self.shown {
             *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(f);

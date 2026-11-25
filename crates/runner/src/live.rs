@@ -12,6 +12,12 @@
 //!   bars;
 //! - each audio buffer goes to the speakers on a thread of its own.
 //!
+//! With `refresh` in the window config above the game's rate, the window is
+//! drawn that often: each picture blends object placement from the
+//! previous game frame to the newest one by how much of a game frame has
+//! passed (see `n64rusty_gfx::interpolate`). The game still runs at its
+//! own rate; what is shown trails it by one game frame.
+//!
 //! With `headless = true` in the run config nothing is opened: frames run
 //! as fast as the game allows and input comes from the replay script, which
 //! is how this path is tested.
@@ -19,7 +25,7 @@
 use std::process::ExitCode;
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use n64rusty_gfx::{Frame, Renderer, WindowTarget};
 use n64rusty_host::{Guest, Pads, RunConfig};
@@ -112,6 +118,12 @@ pub struct Screen {
     sound: Option<Receiver<Sound>>,
     window: Option<(Arc<Window>, Renderer, WindowTarget)>,
     widescreen: bool,
+    /// One game frame, when pictures are blended between game frames.
+    blend: Option<Duration>,
+    /// The game frame before the newest one.
+    prev: Option<Frame>,
+    /// The newest game frame and when it arrived.
+    cur: Option<(Frame, Instant)>,
 }
 
 /// Connects the two sides. `media` supplies graphics, audio and capture.
@@ -135,6 +147,9 @@ pub fn pair(mut media: Media) -> (Live, Screen) {
         sound: Some(sound_rx),
         window: None,
         widescreen: false,
+        blend: None,
+        prev: None,
+        cur: None,
     };
     (live, screen)
 }
@@ -155,7 +170,33 @@ impl Guest for Screen {
                 Err(TrySendError::Disconnected(_)) => return,
             }
         }
-        self.present();
+        if self.blend.is_some() {
+            self.redraw();
+        } else {
+            self.present();
+        }
+    }
+
+    fn redraw(&mut self) {
+        let Some(period) = self.blend else { return };
+        let taken = self.shown.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(f) = taken {
+            self.prev = self.cur.take().map(|(f, _)| f);
+            self.cur = Some((f, Instant::now()));
+        }
+        let (Some((window, renderer, target)), Some((cur, at))) = (&mut self.window, &self.cur)
+        else {
+            return;
+        };
+        let size = window.inner_size();
+        let t = (at.elapsed().as_secs_f32() / period.as_secs_f32()).min(1.0);
+        let r = match &self.prev {
+            Some(prev) => renderer.present_between(prev, cur, t, target, size.width, size.height),
+            None => renderer.present(cur, target, size.width, size.height),
+        };
+        if let Err(e) = r {
+            eprintln!("warning: frame not shown: {e}");
+        }
     }
 
     fn attach_window(&mut self, window: Arc<Window>) {
@@ -226,6 +267,11 @@ pub fn play(
     }));
     let (live, mut screen) = pair(media);
     screen.widescreen = cfg.window.widescreen;
+    screen.blend = cfg
+        .window
+        .refresh
+        .filter(|&r| r > cfg.frame_rate)
+        .map(|_| Duration::from_secs_f64(1.0 / cfg.frame_rate));
     std::thread::Builder::new()
         .name("game".into())
         .spawn(move || std::process::exit(run(Box::new(live)).into()))
