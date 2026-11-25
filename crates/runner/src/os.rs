@@ -20,7 +20,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 
-use n64rusty_runtime::{sx32, Ctx, GuestFn};
+use n64rusty_runtime::{sx32, Ctx, Flash, FlashOp, GuestFn};
 
 use crate::devices::{Devices, Pad};
 use crate::save::Save;
@@ -171,6 +171,8 @@ pub struct State {
     pif: [u8; 64],
     /// Report text for a panic, filled by the panicking thread.
     report: String,
+    /// The page buffer of a flash save chip.
+    flash_page: [u8; 128],
 }
 
 struct Os {
@@ -271,7 +273,10 @@ impl State {
                 format!("  thread {:#010x} pri {} {:?}{from}", t.id, t.pri, t.state)
             })
             .chain(self.timers.iter().map(|(k, t)| {
-                format!("  timer {k:#010x} due at count {:#x} posts to {:#010x}", t.at, t.mq)
+                format!(
+                    "  timer {k:#010x} due at count {:#x} posts to {:#010x}",
+                    t.at, t.mq
+                )
             }))
             .collect::<Vec<_>>()
             .join("\n")
@@ -348,6 +353,7 @@ fn post_event(c: &mut Ctx, st: &mut State, e: u32) {
 /// Delivers retraces and timers that are due by the current clock.
 fn deliver_due(c: &mut Ctx, st: &mut State) {
     while c.clock >= st.next_vi {
+        flash_ops(c, st);
         st.next_vi += TICKS_PER_FRAME;
         st.frames += 1;
         st.devices.retrace(st.frames, st.framebuffer);
@@ -576,6 +582,7 @@ pub fn run(
                 dma_log: Vec::new(),
                 pif: [0; 64],
                 report: String::new(),
+                flash_page: [0xFF; 128],
             }),
             cv: Condvar::new(),
             ctx: AtomicPtr::new(ctx as *mut Ctx),
@@ -914,16 +921,48 @@ fn pi_dma(c: &mut Ctx, st: &mut State, dir: u32, dev: u32, ram: u32, len: u32) {
         }
         return;
     };
+    flash_ops(c, st);
     let at = (ram & 0x1FFF_FFFF) as usize;
     let n = len as usize;
-    let bytes = c.mem.bytes_mut();
-    if at + n > bytes.len() {
+    if at + n > c.mem.bytes().len() {
         panic!("save memory DMA at {ram:#010x}+{len:#x} runs past RAM");
     }
-    if dir == 0 {
-        st.save.read(off, &mut bytes[at..at + n]);
-    } else {
-        st.save.write(off, &bytes[at..at + n]);
+    let flash = c
+        .mem
+        .io_mut()
+        .map(|io| io.flash.mode)
+        .filter(|_| flash_used(c));
+    let bytes = c.mem.bytes_mut();
+    match (flash, dir) {
+        (None, 0) => st.save.read(off, &mut bytes[at..at + n]),
+        (None, _) => st.save.write(off, &bytes[at..at + n]),
+        // Flash reads its array at twice the bus offset.
+        (Some(0xF0), 0) => st.save.read(off * 2, &mut bytes[at..at + n]),
+        (Some(0xE1), 0) => {
+            for k in 0..n {
+                bytes[at + k] = Flash::ID[k % 8];
+            }
+        }
+        (Some(0xB4), 1) => {
+            let k = n.min(128);
+            st.flash_page[..k].copy_from_slice(&bytes[at..at + k]);
+        }
+        _ => {}
+    }
+}
+
+fn flash_used(c: &mut Ctx) -> bool {
+    c.mem.io_mut().is_some_and(|io| io.flash.used)
+}
+
+/// Applies the erases and page writes a flash chip was told to do.
+fn flash_ops(c: &mut Ctx, st: &mut State) {
+    let Some(io) = c.mem.io_mut() else { return };
+    for op in std::mem::take(&mut io.flash.ops) {
+        match op {
+            FlashOp::Erase { offset, len } => st.save.write(offset, &vec![0xFF; len]),
+            FlashOp::Program { offset } => st.save.write(offset, &st.flash_page.clone()),
+        }
     }
 }
 
@@ -1068,14 +1107,14 @@ fn os_si_raw_start_dma(c: &mut Ctx) {
     let (dir, buf) = (arg(c, 0), arg(c, 1));
     let mut st = lock();
     if dir == 1 {
-        for k in 0..64 {
-            st.pif[k] = c.mem.read_u8(buf + k as u32);
+        for (k, b) in st.pif.iter_mut().enumerate() {
+            *b = c.mem.read_u8(buf + k as u32);
         }
         let pads = st.devices.pads();
         run_pif(&mut st.pif, &pads);
     } else {
-        for k in 0..64 {
-            c.mem.write_u8(buf + k as u32, st.pif[k]);
+        for (k, &b) in st.pif.iter().enumerate() {
+            c.mem.write_u8(buf + k as u32, b);
         }
     }
     post_event(c, &mut st, event::SI);
@@ -1107,7 +1146,12 @@ fn run_pif(pif: &mut [u8; 64], pads: &[Pad; 4]) {
                 let pad = pads.get(ch).filter(|p| p.connected);
                 let reply: Option<Vec<u8>> = pad.and_then(|p| match pif[cmd] {
                     0x00 | 0xFF => Some(vec![0x05, 0x00, 0x00]),
-                    0x01 => Some(vec![(p.buttons >> 8) as u8, p.buttons as u8, p.stick_x as u8, p.stick_y as u8]),
+                    0x01 => Some(vec![
+                        (p.buttons >> 8) as u8,
+                        p.buttons as u8,
+                        p.stick_x as u8,
+                        p.stick_y as u8,
+                    ]),
                     0x02 => Some([vec![0; 32], vec![0xFF]].concat()),
                     0x03 => Some(vec![0xFF]),
                     _ => None,
@@ -1245,7 +1289,10 @@ pub const HOOKS: &[(&str, GuestFn)] = &[
 /// Installs the replacements over the routines found in `addrs`
 /// (role name and guest address). A name may come more than once: a game can
 /// link a library routine into two segments. Returns the names installed.
-pub fn install<'a>(ctx: &mut Ctx, addrs: impl IntoIterator<Item = (&'a String, &'a u32)>) -> Vec<String> {
+pub fn install<'a>(
+    ctx: &mut Ctx,
+    addrs: impl IntoIterator<Item = (&'a String, &'a u32)>,
+) -> Vec<String> {
     let mut done = Vec::new();
     for (name, &a) in addrs {
         if let Some((_, f)) = HOOKS.iter().find(|(h, _)| h == name) {
@@ -1262,11 +1309,18 @@ mod tests {
 
     #[test]
     fn pif_answers_status_buttons_and_an_empty_pak() {
-        let pad = Pad { connected: true, buttons: 0x1000, stick_x: 5, stick_y: -3 };
+        let pad = Pad {
+            connected: true,
+            buttons: 0x1000,
+            stick_x: 5,
+            stick_y: -3,
+        };
         let pads = [pad, Pad::default(), Pad::default(), Pad::default()];
         // Port 1: status (1 out, 3 back). Port 2: read buttons, unplugged.
         let mut pif = [0u8; 64];
-        let block = [1, 3, 0x00, 0xFF, 0xFF, 0xFF, 1, 4, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE];
+        let block = [
+            1, 3, 0x00, 0xFF, 0xFF, 0xFF, 1, 4, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE,
+        ];
         pif[..block.len()].copy_from_slice(&block);
         run_pif(&mut pif, &pads);
         assert_eq!(pif[3..6], [0x05, 0x00, 0x00]);

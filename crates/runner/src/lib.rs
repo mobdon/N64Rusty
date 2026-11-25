@@ -133,9 +133,13 @@ fn record_run(
             // The copy must still be what is there: the game may have
             // written other code over it since (unpacking, for example).
             let still_there = |r: u32, ram: u32| {
-                let (at, from) = ((addr & 0x1FFF_FFFC) as usize, (r + (addr & !3) - ram) as usize);
+                let (at, from) = (
+                    (addr & 0x1FFF_FFFC) as usize,
+                    (r + (addr & !3) - ram) as usize,
+                );
                 let n = 16.min(ram_now.len().saturating_sub(at));
-                rom.get(from..from + n).is_some_and(|b| b == &ram_now[at..at + n])
+                rom.get(from..from + n)
+                    .is_some_and(|b| b == &ram_now[at..at + n])
             };
             let src = dma
                 .iter()
@@ -189,7 +193,10 @@ fn written_code(ram: &[u8], rom: &[u8], entry: u32, addr: u32) -> Option<(u32, u
     if in_boot {
         return None;
     }
-    let zero_run = |i: usize| ram.get(i..i + GAP).is_some_and(|b| b.iter().all(|&x| x == 0));
+    let zero_run = |i: usize| {
+        ram.get(i..i + GAP)
+            .is_some_and(|b| b.iter().all(|&x| x == 0))
+    };
     let mut lo = at;
     while lo >= 4 && at - lo < MAX && !zero_run(lo.saturating_sub(GAP)) {
         lo -= 4;
@@ -415,6 +422,7 @@ pub fn main_with(game: Game, devices: Option<Box<dyn devices::Devices>>) -> Exit
         sp_mem: vec![0; 0x2000],
         rom: rom_bytes.clone(),
         regs: Default::default(),
+        flash: Default::default(),
     });
     let hooked = os::install(&mut ctx, names.iter().map(|(a, n)| (n, a)));
     println!("replaced {} system routines", hooked.len());
@@ -498,7 +506,10 @@ fn run_and_report(
     }
     println!("threads:\n{threads}");
     // The thread that was on the CPU last keeps its registers in `ctx`.
-    println!("  last on the CPU: call at {:#010x}", (ctx.r[31] as u32).wrapping_sub(8));
+    println!(
+        "  last on the CPU: call at {:#010x}",
+        (ctx.r[31] as u32).wrapping_sub(8)
+    );
     print!("{device_summary}");
     match outcome {
         os::Outcome::Frames(n) => {

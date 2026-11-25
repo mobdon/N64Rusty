@@ -15,7 +15,7 @@ mod fpu;
 mod memory;
 
 pub use fpu::{cvt_l, cvt_w, fcmp, Round};
-pub use memory::{Io, Memory};
+pub use memory::{Flash, FlashOp, Io, Memory};
 
 /// Crate version, checked against the version recorded in generated code.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -580,7 +580,9 @@ mod tests {
         assert_eq!(c.r[2], 0xB);
         c.mem.bytes_mut()[0x10..0x14].copy_from_slice(&[0; 4]);
         c.code_written(0x8000_0012, 1);
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c.call(0x8000_0010))).is_err());
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c.call(0x8000_0010))).is_err()
+        );
     }
 
     #[test]
