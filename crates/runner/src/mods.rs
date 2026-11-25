@@ -190,17 +190,23 @@ mod tests {
 
     extern "C" fn hook(_: *mut c_void) {}
 
+    /// The tests share the hook table: one at a time.
+    static ONE: Mutex<()> = Mutex::new(());
+
     #[test]
     fn a_declined_mod_leaves_no_hooks() {
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
         set_override(0x8000_1000, hook);
         let before = hooked();
         set_override(0x8000_2000, hook);
         drop_hooks_since(&before);
-        assert_eq!(hooked(), vec![0x8000_1000]);
+        let h = hooked();
+        assert!(h.contains(&0x8000_1000) && !h.contains(&0x8000_2000));
     }
 
     #[test]
     fn a_hook_on_a_replaced_routine_wraps_the_replacement() {
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
         fn replacement(c: &mut Ctx) {
             c.r[2] = 7;
         }
