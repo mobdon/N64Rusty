@@ -226,8 +226,12 @@ pub fn ram_hash(ram: &[u8]) -> u64 {
 fn write_hash(c: &Ctx, frame: u64) {
     use std::io::Write;
     if let Some(out) = HASH_OUT.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-        let _ = writeln!(out, "{frame} {:016x}", ram_hash(c.mem.bytes()));
-        let _ = out.flush();
+        // A short file would read as two runs that differ: stop instead.
+        if let Err(e) =
+            writeln!(out, "{frame} {:016x}", ram_hash(c.mem.bytes())).and_then(|()| out.flush())
+        {
+            panic!("--hash-out: {e}");
+        }
     }
 }
 
