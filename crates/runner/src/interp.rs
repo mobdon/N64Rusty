@@ -162,7 +162,9 @@ mod tests {
             n64rusty_runtime::code_hash(&bytes),
             translated,
         );
-        install(&mut ctx, Box::new(|_, _| None));
+        // The same snapshot rule as the other test: they run in parallel and
+        // share the installed rule.
+        install(&mut ctx, Box::new(|_, a| Some((a, a + 32))));
         ctx.r[29] = sx32(0x8000_8000);
         ctx.r[31] = sx32(0x8000_0F00);
         ctx.call(0x8000_3000);
