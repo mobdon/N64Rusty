@@ -192,7 +192,7 @@ it).
   the stick (left Shift for half tilt), J is A, K is B, Space is Z, Enter is
   Start, Q and E are L and R, T F G H (or numpad 8 4 5 6) are the C buttons
   and 1 to 4 the D-pad. The arrow keys are not used. Keys can be remapped per
-  port. Gamepads (Xbox layout): A is A, X is B, B and Y are C-down and C-up,
+  port. Gamepads (Xbox layout): A is A, B is B, X and Y are C-down and C-up,
   LT and RB are Z, LB is L, RT is R, Start is Start, the left stick is the
   stick, the right stick the C buttons and the d-pad the d-pad. Each port's
   pad buttons, stick deadzone and sensitivity can be changed in `run.toml`,
