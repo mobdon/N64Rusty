@@ -16,6 +16,8 @@ use crate::dl::rgba5551;
 use crate::{Texture, Wrap};
 
 const MAX_SIZE: u32 = 1024;
+/// Clamped tiles up to this many texels are decoded exactly (see `bind`).
+const EXACT_TEXELS: u32 = 128 * 128;
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Tile {
@@ -253,15 +255,19 @@ impl Tmem {
         let mut size = [0u32; 2];
         let mut wrap = [Wrap::Repeat; 2];
         let mut scale = [1.0f32; 2];
+        let tile_size = |k: usize| (t.lr[k].saturating_sub(t.ul[k]) >> 2) + 1;
+        // A clamped tile far larger than its mask repeats the masked texels
+        // until the clamp. Small ones are decoded exactly, since the clamp
+        // after the repeats is visible (a mirrored emblem, a face detail).
+        // Big ones would mean hundreds of copies on every draw: decode one
+        // period and let it wrap.
+        // shortcut: on big tiles the clamp at the far edge is lost; decode
+        // it exactly if a game shows a seam there.
+        let big = tile_size(0) * tile_size(1) > EXACT_TEXELS;
         for k in 0..2 {
-            let tile_size = (t.lr[k].saturating_sub(t.ul[k]) >> 2) + 1;
+            let tile_size = tile_size(k);
             let period = 1 << t.mask[k].min(10);
-            // A clamped tile far larger than its mask repeats the masked
-            // texels until the clamp: decode one period and let it wrap,
-            // not hundreds of copies on every draw.
-            // shortcut: the clamp at the tile's far edge is lost; texture
-            // coordinates rarely reach it. Decode it exactly if a game shows a seam.
-            let clamp = t.cm[k] & 2 != 0 && !(t.mask[k] != 0 && tile_size > period);
+            let clamp = t.cm[k] & 2 != 0 && !(big && t.mask[k] != 0 && tile_size > period);
             size[k] = if t.mask[k] != 0 && !clamp {
                 1 << t.mask[k].min(10)
             } else {
@@ -387,5 +393,25 @@ mod tests {
                 assert_eq!(got, [1, 2, 3, 4, 5, 6, 7, 8], "siz {siz} load {load:#x}");
             }
         }
+    }
+
+    /// A small clamped tile twice its mask keeps the clamp: mirrored once,
+    /// then the edge texel, not a third copy.
+    #[test]
+    fn small_clamped_tile_decodes_exactly() {
+        let mut m = Tmem::default();
+        m.tiles[0] = Tile {
+            fmt: 0,
+            siz: 2,
+            cm: [3, 3],
+            mask: [3, 3],
+            lr: [15 << 2, 15 << 2],
+            ..Tile::default()
+        };
+        let mut textures = Vec::new();
+        let b = m.bind(0, 0, &mut textures);
+        let tex = &textures[b.texture as usize];
+        assert_eq!((tex.width, tex.height), (16, 16));
+        assert_eq!(tex.wrap, [Wrap::Clamp; 2]);
     }
 }
