@@ -27,6 +27,25 @@ pub const REFRESH: [(&str, Option<f64>); 4] = [
     ("165 Hz", Some(165.0)),
 ];
 
+/// ROMs played before, newest first: `recent.txt` next to the program,
+/// one path per line (the player keeps it). Only files still there.
+pub fn recent_roms() -> Vec<std::path::PathBuf> {
+    let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+    else {
+        return Vec::new();
+    };
+    // last-rom.txt: the one ROM older players remembered.
+    let read = |f| std::fs::read_to_string(dir.join(f)).unwrap_or_default();
+    let (list, old) = (read("recent.txt"), read("last-rom.txt"));
+    list.lines()
+        .chain(old.lines().filter(|l| !list.lines().any(|r| r == *l)))
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_file())
+        .collect()
+}
+
 /// Window size choices, as multiples of 320x240.
 pub const SCALES: [u32; 3] = [2, 3, 4];
 
@@ -56,6 +75,7 @@ mod imp {
     pub struct Menu {
         _bar: muda::Menu,
         open: MenuItem,
+        games: Vec<(MenuItem, std::path::PathBuf)>,
         refresh: Vec<CheckMenuItem>,
         wide: CheckMenuItem,
         normal: CheckMenuItem,
@@ -77,6 +97,18 @@ mod imp {
             let m = Menu {
                 _bar: muda::Menu::new(),
                 open: MenuItem::new("Open ROM...", true, None),
+                games: recent_roms()
+                    .into_iter()
+                    .map(|p| {
+                        // Windows reads '&' as a shortcut marker.
+                        let name = p
+                            .file_stem()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .replace('&', "&&");
+                        (MenuItem::new(name, true, None), p)
+                    })
+                    .collect(),
                 refresh: REFRESH.iter().map(|(l, _)| check(l)).collect(),
                 wide: check("Widescreen"),
                 normal: check("Normal (4:3)"),
@@ -88,7 +120,13 @@ mod imp {
                     .collect(),
                 full: MenuItem::new("Full screen (F11)", true, None),
             };
-            let game = Submenu::with_items("Game", true, &[&m.open]).ok()?;
+            let sep0 = PredefinedMenuItem::separator();
+            let mut game: Vec<&dyn muda::IsMenuItem> = vec![&m.open];
+            if !m.games.is_empty() {
+                game.push(&sep0);
+            }
+            game.extend(m.games.iter().map(|(i, _)| i as &dyn muda::IsMenuItem));
+            let game = Submenu::with_items("Game", true, &game).ok()?;
             let refresh: Vec<&dyn muda::IsMenuItem> = m
                 .refresh
                 .iter()
@@ -118,6 +156,9 @@ mod imp {
                     .add_filter("N64 ROM", &["z64", "n64", "v64"])
                     .pick_file()?;
                 return Some(Action::OpenRom(rom));
+            }
+            if let Some((_, rom)) = self.games.iter().find(|(i, _)| *i.id() == id) {
+                return Some(Action::OpenRom(rom.clone()));
             }
             if let Some(k) = self.refresh.iter().position(|i| *i.id() == id) {
                 return Some(Action::Refresh(REFRESH[k].1));

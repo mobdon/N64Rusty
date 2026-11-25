@@ -215,13 +215,13 @@ scripted input, which is how this mode is tested.
 `n64rusty-play` plays a ROM with no translate step and no Rust: every
 function runs in the reference interpreter, with system routines replaced
 as usual. On Windows, double-click `n64rusty-play.exe`: it plays a ROM
-dropped on it, else the one picked last time (`last-rom.txt`), else the
+dropped on it, else the one played last (`recent.txt`), else the
 first `.z64`/`.n64`/`.v64` in its own folder, else asks for one in a file
 window. It opens the game with `--window`, and always with `--expansion`
 (8 MB of RAM, as with the Expansion Pak fitted), so games that need it run.
 It needs no settings file: windows default to widescreen, drawing at the
 display's own refresh rate, and crisp textures. On Windows the window has a menu
-bar: Game (open another ROM), Refresh (match the display, 60, 120 or
+bar: Game (open another ROM, or pick one of the last ten played), Refresh (match the display, 60, 120 or
 165 Hz) and View (widescreen or normal 4:3, crisp or console textures,
 window size, full screen, also F11). Choices are saved to `settings.toml`
 next to the program, or to the game's own `games/<sha256>/run.toml` when
