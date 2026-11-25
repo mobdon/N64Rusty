@@ -652,10 +652,15 @@ impl Renderer {
         // A flat overlay facing the camera and covering the whole view (a
         // fade or a flash drawn as triangles) covers the wide view too.
         if wide > 1.0 {
-            for d in frame.draws().filter(|d| !d.state.rect) {
+            for d in frame
+                .draws()
+                .filter(|d| !d.state.rect && d.state.color_image == frame.color_image)
+            {
                 let range = d.first as usize..(d.first + d.count) as usize;
                 let ps: Vec<_> = frame.vertices[range.clone()].iter().map(at).collect();
-                let w = ps[0][3];
+                let Some(w) = ps.first().map(|p| p[3]) else {
+                    continue;
+                };
                 let flat = w > 0.0 && ps.iter().all(|p| (p[3] - w).abs() <= w * 1e-3);
                 let ext = |k: usize, f: fn(f32, f32) -> f32, s: f32| {
                     ps.iter().map(|p| p[k] / p[3]).fold(s, f)
