@@ -130,6 +130,7 @@ fn pipe_key(s: &RenderState) -> PipeKey {
             two_cycle,
             alpha_test,
             flat: !s.rect && s.geometry & 0x0020_0000 == 0,
+            sharp: false,
         },
         blend,
         depth_test: depth && s.other_l & 0x10 != 0,
@@ -193,6 +194,7 @@ pub struct Renderer {
     samplers: HashMap<(Wrap, Wrap, bool), wgpu::Sampler>,
     white: wgpu::TextureView,
     widescreen: bool,
+    sharp: bool,
     /// Colour and depth targets of the last size drawn.
     targets: Option<(u32, u32, wgpu::Texture, wgpu::Texture)>,
 }
@@ -269,6 +271,7 @@ impl Renderer {
             samplers: HashMap::new(),
             white,
             widescreen: false,
+            sharp: true,
             targets: None,
         })
     }
@@ -280,6 +283,14 @@ impl Renderer {
     /// view) is widened to the target. Off by default.
     pub fn set_widescreen(&mut self, on: bool) {
         self.widescreen = on;
+    }
+
+    /// Sharp textures (the default): magnified textures keep crisp texel
+    /// edges with a one-pixel blend between texels, instead of the
+    /// console's soft filtering stretched to the window. Off gives the
+    /// console look.
+    pub fn set_sharp_textures(&mut self, on: bool) {
+        self.sharp = on;
     }
 
     /// How many times wider than the frame's own shape a `width` x
@@ -690,11 +701,12 @@ impl Renderer {
         // Prepare pipelines and texture bindings before recording passes.
         let mut prepared = Vec::with_capacity(draws.len());
         for d in &draws {
-            let key = pipe_key(&d.state);
+            let mut key = pipe_key(&d.state);
+            key.shader.sharp = self.sharp;
             self.pipeline(key);
             let linear = (d.state.other_h >> 20) & 3 != 2
                 && (d.state.other_h >> 12) & 3 != 0
-                && !d.state.texel_exact;
+                && (self.sharp || !d.state.texel_exact);
             let mut entries = Vec::new();
             for (k, slot) in d.state.textures.iter().enumerate() {
                 let (view, wrap) = match slot.and_then(|i| Some((views.get(i as usize)?, i))) {

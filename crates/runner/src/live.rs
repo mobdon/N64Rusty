@@ -118,6 +118,7 @@ pub struct Screen {
     sound: Option<Receiver<Sound>>,
     window: Option<(Arc<Window>, Renderer, WindowTarget)>,
     widescreen: bool,
+    sharp: bool,
     /// One game frame, when pictures are blended between game frames.
     blend: Option<Duration>,
     /// The game frame before the newest one.
@@ -147,6 +148,7 @@ pub fn pair(mut media: Media) -> (Live, Screen) {
         sound: Some(sound_rx),
         window: None,
         widescreen: false,
+        sharp: true,
         blend: None,
         prev: None,
         cur: None,
@@ -202,6 +204,7 @@ impl Guest for Screen {
     fn attach_window(&mut self, window: Arc<Window>) {
         let target = Renderer::new().and_then(|mut r| {
             r.set_widescreen(self.widescreen);
+            r.set_sharp_textures(self.sharp);
             let t = r.window_target(window.clone())?;
             Ok((r, t))
         });
@@ -267,6 +270,7 @@ pub fn play(
     }));
     let (live, mut screen) = pair(media);
     screen.widescreen = cfg.window.widescreen;
+    screen.sharp = !cfg.window.console_filter;
     screen.blend = cfg
         .window
         .refresh
