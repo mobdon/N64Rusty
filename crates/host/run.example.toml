@@ -10,8 +10,8 @@
 [window]
 title = "n64rusty"
 scale = 2                       # 320x240 times this
-# widescreen = true             # fill a wide window, showing more at the sides
-# refresh = 144                 # draw this often, blending between game
+# widescreen = false            # on by default: fills a wide window, showing more at the sides
+# refresh = 144                 # default 0: the display's rate; draw this often, blending between game
 #                               # frames; the game still runs at frame_rate
 
 # Ports 1 to 4, in order. Sources: "keyboard", "gamepad0", "gamepad1", ...

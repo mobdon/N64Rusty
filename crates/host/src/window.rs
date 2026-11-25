@@ -57,6 +57,12 @@ pub fn run_windowed<G: Guest>(guest: G, cfg: &RunConfig) -> Result<G, String> {
         .map_err(|e| format!("writing the recording: {e}"))
 }
 
+/// The refresh rate of the display `window` is on, if the system says.
+pub fn display_rate(window: &Window) -> Option<f64> {
+    let mhz = window.current_monitor()?.refresh_rate_millihertz()?;
+    Some(f64::from(mhz) / 1000.0)
+}
+
 struct App<G> {
     session: Session<G>,
     cfg: RunConfig,
@@ -112,6 +118,11 @@ impl<G: Guest> ApplicationHandler for App<G> {
         match event_loop.create_window(attrs) {
             Ok(window) => {
                 let window = Arc::new(window);
+                if self.cfg.window.refresh == Some(0.0) {
+                    self.redraw = display_rate(&window)
+                        .filter(|&r| r > self.cfg.frame_rate)
+                        .map(|r| Pacer::new(r, Instant::now()));
+                }
                 self.session.guest.attach_window(window.clone());
                 self.window = Some(window);
             }

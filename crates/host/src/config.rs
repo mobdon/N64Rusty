@@ -12,8 +12,9 @@
 //! [window]
 //! title = "n64rusty"
 //! scale = 2                         # window is 320x240 times this
-//! widescreen = false                # fill a wide window, showing more
+//! widescreen = true                 # fill a wide window, showing more
 //! refresh = 144                     # draw this often, blending frames
+//!                                   # (0, the default: the display's rate)
 //!
 //! [[port]]                          # ports 1 to 4, in order
 //! sources = ["keyboard", "gamepad0"]
@@ -56,11 +57,11 @@ pub struct WindowConfig {
     pub title: String,
     pub scale: u32,
     /// Fill a window wider than 4:3 with more of the scene instead of
-    /// black bars.
+    /// black bars. On by default.
     pub widescreen: bool,
     /// Draw the window this many times per second, with pictures blended
-    /// between game frames; the game itself keeps `frame_rate`. None (the
-    /// default) draws once per game frame.
+    /// between game frames; the game itself keeps `frame_rate`. 0 (the
+    /// default) is the display's own rate; None draws once per game frame.
     pub refresh: Option<f64>,
     /// Textures as the console filters them, soft when stretched to the
     /// window. Off (the default) keeps magnified texels crisp.
@@ -72,8 +73,8 @@ impl Default for WindowConfig {
         WindowConfig {
             title: "n64rusty".into(),
             scale: 2,
-            widescreen: false,
-            refresh: None,
+            widescreen: true,
+            refresh: Some(0.0),
             console_filter: false,
         }
     }
@@ -171,8 +172,10 @@ impl RunConfig {
             cfg.frame_rate = rate;
         }
         if let Some(r) = cfg.window.refresh {
-            if !(r.is_finite() && (1.0..=1000.0).contains(&r)) {
-                return Err(format!("window refresh {r} is not between 1 and 1000"));
+            if !(r == 0.0 || r.is_finite() && (1.0..=1000.0).contains(&r)) {
+                return Err(format!(
+                    "window refresh {r} is not 0 (the display's rate) or between 1 and 1000"
+                ));
             }
         }
         if !(1..=16).contains(&cfg.window.scale) {
@@ -326,7 +329,7 @@ mod tests {
             ("debug_port = \"0.0.0.0:6464\"", "loopback"),
             ("frame_rate = 0", "between"),
             ("[window]\nrefresh = inf", "between"),
-            ("[window]\nrefresh = 0", "between"),
+            ("[window]\nrefresh = 0.5", "between"),
             ("[[port]]\nsources = [\"mouse\"]", "unknown source"),
             (
                 "[[port]]\nsources = [\"keyboard\"]\ndeadzone = 0.1",

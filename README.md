@@ -173,15 +173,16 @@ the game slows down. There is no frame limit unless `--frames` is given.
 Window size, frame rate, key layout, gamepad ports and input record/replay
 come from `run.toml` in the per-game folder, or `--run file`.
 
-`widescreen = true` under `[window]` in `run.toml` fills a window wider
-than 4:3 instead of drawing black bars. The 3D scene shows more at the
+Widescreen is on by default (`widescreen = false` under `[window]` in
+`run.toml` turns it off): it fills a window wider than 4:3 instead of drawing black bars. The 3D scene shows more at the
 sides, everything keeps its shape with the 4:3 picture in the middle, and
 full-width backgrounds stretch to the edges. Things the game itself leaves
 out of view (objects it culls past the original edge) stay missing.
 `--capture-wide` saves headless captures in 16:9 the same way.
 
-`refresh = 144` (any rate above the game's) under `[window]` draws the
-window that often. Each picture between two game frames blends where
+When the display refreshes faster than the game (a 144 Hz monitor, say),
+the window draws at the display's rate by default (`refresh = 0`);
+`refresh = 144` under `[window]` picks a rate instead. Each picture between two game frames blends where
 every 3D object is, matched by the display list code that drew it, so
 motion is smoother while the game keeps running at its own rate. What you
 see trails the game by one frame, and 2D elements move only on game frames.
@@ -216,9 +217,9 @@ dropped on it, else the one picked last time (`last-rom.txt`), else the
 first `.z64`/`.n64`/`.v64` in its own folder, else asks for one in a file
 window. It opens the game with `--window`, and always with `--expansion`
 (8 MB of RAM, as with the Expansion Pak fitted), so games that need it run.
-Window settings come from the game's own `games/<sha256>/run.toml`, else
-from `run.toml` next to the program, which it writes the first time with
-widescreen on.
+It needs no settings file: windows default to widescreen, drawing at the
+display's own refresh rate, and crisp textures. A `run.toml` in the game's
+`games/<sha256>/` folder changes any of them.
 
 Its files live next to the program: `games/<sha256>/` per game (the
 routine list `config.toml`, `save.sra`, `run.toml`) and `routines.txt`.

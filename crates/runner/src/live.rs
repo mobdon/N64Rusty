@@ -12,8 +12,9 @@
 //!   bars;
 //! - each audio buffer goes to the speakers on a thread of its own.
 //!
-//! With `refresh` in the window config above the game's rate, the window is
-//! drawn that often: each picture blends object placement from the
+//! With `refresh` in the window config above the game's rate (or 0, the
+//! default, on a display faster than the game), the window is drawn that
+//! often: each picture blends object placement from the
 //! previous game frame to the newest one by how much of a game frame has
 //! passed (see `n64rusty_gfx::interpolate`). The game still runs at its
 //! own rate; what is shown trails it by one game frame.
@@ -119,6 +120,9 @@ pub struct Screen {
     window: Option<(Arc<Window>, Renderer, WindowTarget)>,
     widescreen: bool,
     sharp: bool,
+    /// The game's frame rate, when pictures blend at the display's own rate
+    /// (known once the window is open).
+    auto_blend: Option<f64>,
     /// One game frame, when pictures are blended between game frames.
     blend: Option<Duration>,
     /// The game frame before the newest one.
@@ -149,6 +153,7 @@ pub fn pair(mut media: Media) -> (Live, Screen) {
         window: None,
         widescreen: false,
         sharp: true,
+        auto_blend: None,
         blend: None,
         prev: None,
         cur: None,
@@ -202,6 +207,11 @@ impl Guest for Screen {
     }
 
     fn attach_window(&mut self, window: Arc<Window>) {
+        if let Some(rate) = self.auto_blend {
+            self.blend = n64rusty_host::window::display_rate(&window)
+                .filter(|&r| r > rate)
+                .map(|_| Duration::from_secs_f64(1.0 / rate));
+        }
         let target = Renderer::new().and_then(|mut r| {
             r.set_widescreen(self.widescreen);
             r.set_sharp_textures(self.sharp);
@@ -276,6 +286,7 @@ pub fn play(
         .refresh
         .filter(|&r| r > cfg.frame_rate)
         .map(|_| Duration::from_secs_f64(1.0 / cfg.frame_rate));
+    screen.auto_blend = (cfg.window.refresh == Some(0.0)).then_some(cfg.frame_rate);
     std::thread::Builder::new()
         .name("game".into())
         .spawn(move || std::process::exit(run(Box::new(live)).into()))
