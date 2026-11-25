@@ -224,9 +224,23 @@ fn looks_like_prologue(w: u32) -> bool {
     i.op == Op::Addiu && i.rs == 29 && i.rt == 29 && i.simm() < 0
 }
 
+/// Whether the code at `a` opens a stack frame in its first four
+/// instructions, with no branch or jump before it: compilers often schedule
+/// a `lui` or load ahead of the `addiu $sp, $sp, -n`.
+fn opens_frame(img: &Image, a: u32) -> bool {
+    let plain = |w: u32| {
+        let i = Inst::decode(w);
+        i.op != Op::Unknown && matches!(i.flow(), Flow::Next)
+    };
+    (0..4)
+        .map_while(|k| img.word(a + 4 * k))
+        .take_while(|&w| looks_like_prologue(w) || plain(w))
+        .any(looks_like_prologue)
+}
+
 /// Places that start a function by their layout: the image's first word,
 /// or the first non-zero word after a `jr $ra` and its delay slot, when it
-/// opens a stack frame (`addiu $sp, $sp, -n`). For code copied in at run
+/// opens a stack frame (see [`opens_frame`]). For code copied in at run
 /// time, whose functions are mostly reached through pointers set up by code.
 pub fn function_starts(img: &Image) -> Vec<u32> {
     const JR_RA: u32 = 0x03E0_0008;
@@ -237,7 +251,7 @@ pub fn function_starts(img: &Image) -> Vec<u32> {
     while a < end {
         let w = img.word(a).unwrap_or(0);
         if after_return && w != 0 {
-            if looks_like_prologue(w) {
+            if opens_frame(img, a) {
                 out.push(a);
             }
             after_return = false;
@@ -330,12 +344,12 @@ pub fn overlay_table(rom: &[u8]) -> Vec<(u32, u32, u32)> {
 }
 
 /// Words anywhere in the image that point inside it at something that starts
-/// like a function (`addiu $sp, $sp, -n`): function pointers in data tables.
+/// like a function (it opens a stack frame): function pointers in data tables.
 /// Pass them to [`discover`] as hints.
 pub fn data_pointers(img: &Image) -> Vec<u32> {
     let mut out: Vec<u32> = (0..img.bytes.len() / 4)
         .filter_map(|k| img.word(img.base + 4 * k as u32))
-        .filter(|&v| img.word(v).is_some_and(looks_like_prologue))
+        .filter(|&v| img.contains(v) && opens_frame(img, v))
         .collect();
     out.sort_unstable();
     out.dedup();
@@ -504,6 +518,14 @@ mod tests {
             bytes: &bytes,
         };
         assert_eq!(function_starts(&img), [BASE, BASE + 0x14]);
+        // A frame opened after a scheduled `lui` still starts a function.
+        let words = [JR_RA, NOP, 0x3C0E_800A, FRAME, JR_RA, NOP];
+        let bytes = image(&words);
+        let img = Image {
+            base: BASE,
+            bytes: &bytes,
+        };
+        assert_eq!(function_starts(&img), [BASE + 8]);
     }
 
     #[test]
