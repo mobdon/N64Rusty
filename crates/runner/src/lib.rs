@@ -460,5 +460,12 @@ fn run_and_report(
             println!("panic: {m}\n{report}");
             1
         }
+        os::Outcome::Hang(d) => {
+            println!(
+                "hang: no retrace for {} s of host time, so a guest loop makes no calls\n{d}",
+                os::HANG_WALL.as_secs()
+            );
+            1
+        }
     }
 }
