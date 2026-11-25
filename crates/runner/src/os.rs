@@ -127,6 +127,9 @@ struct Thread {
     /// thread in the memory of one that is only stopped; the host thread
     /// left from the old one must then never run again.
     generation: u64,
+    /// Woken only when this thread gets the CPU, so a switch wakes one
+    /// host thread instead of all of them.
+    cv: Arc<Condvar>,
 }
 
 thread_local! {
@@ -534,15 +537,14 @@ fn reschedule(c: &mut Ctx, mut st: MutexGuard<'static, State>) -> MutexGuard<'st
             let generation = st.threads[&best].generation;
             spawn_thread(best, generation);
         }
+        st.threads[&best].cv.notify_one();
+        // The main thread watches for the boot thread ending.
         os().cv.notify_all();
         if mine == Some(TState::Dead) {
             // A finished thread never runs guest code again.
             park(st);
         }
-        st = os()
-            .cv
-            .wait_while(st, |s| s.current != Some(me) || s.done.is_some())
-            .unwrap_or_else(|e| e.into_inner());
+        st = wait_turn(st, me);
         if !still_mine(&st, me) {
             // Replaced by a new thread in the same memory: retire.
             park(st);
@@ -559,9 +561,20 @@ fn reschedule(c: &mut Ctx, mut st: MutexGuard<'static, State>) -> MutexGuard<'st
 fn park(mut st: MutexGuard<'static, State>) -> ! {
     // A panic on another guest thread poisons the lock; keep waiting so
     // that panic is the one reported.
+    let never = Condvar::new();
     loop {
-        st = os().cv.wait(st).unwrap_or_else(|e| e.into_inner());
+        st = never.wait(st).unwrap_or_else(|e| e.into_inner());
     }
+}
+
+/// Waits until thread `id` has the CPU. A thread replaced by a new one in
+/// the same memory is never woken here, and retires anyway.
+fn wait_turn(st: MutexGuard<'static, State>, id: u32) -> MutexGuard<'static, State> {
+    let Some(cv) = st.threads.get(&id).map(|t| t.cv.clone()) else {
+        park(st)
+    };
+    cv.wait_while(st, |s| s.current != Some(id) || s.done.is_some())
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 fn spawn_thread(id: u32, generation: u64) {
@@ -571,10 +584,7 @@ fn spawn_thread(id: u32, generation: u64) {
         .spawn(move || {
             GENERATION.with(|g| g.set(generation));
             let st = lock();
-            let st = os()
-                .cv
-                .wait_while(st, |s| s.current != Some(id) || s.done.is_some())
-                .unwrap_or_else(|e| e.into_inner());
+            let st = wait_turn(st, id);
             if !still_mine(&st, id) {
                 park(st);
             }
@@ -674,10 +684,10 @@ pub fn run(
             regs: None,
             seq: 0,
             generation: 0,
+            cv: Arc::default(),
         },
     );
     spawn_thread(0, 0);
-    os().cv.notify_all();
     let mut st = lock();
     let mut seen = u64::MAX;
     loop {
@@ -761,6 +771,7 @@ fn os_create_thread(c: &mut Ctx) {
             regs: None,
             seq: 0,
             generation,
+            cv: Arc::default(),
         },
     );
 }
