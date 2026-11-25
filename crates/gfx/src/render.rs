@@ -602,6 +602,7 @@ impl Renderer {
         // leading run of 3D draws, after nothing but fills, that each cover
         // nine tenths of the width.
         let mut backdrop = vec![false; frame.vertices.len()];
+        let mut started = false;
         if wide > 1.0 {
             for d in frame
                 .draws()
@@ -611,11 +612,15 @@ impl Renderer {
                 // rectangle (a background picture) is the backdrop itself,
                 // and 3D after it is the scene.
                 if d.state.rect {
-                    if (d.state.other_h >> 20) & 3 == 3 {
+                    let fill = (d.state.other_h >> 20) & 3 == 3 && d.state.textures[0].is_none();
+                    // Only before the backdrop starts: a fill after it is
+                    // part of the scene.
+                    if fill && !started {
                         continue;
                     }
                     break;
                 }
+                started = true;
                 let range = d.first as usize..(d.first + d.count) as usize;
                 let (mut x0, mut x1) = (1.0f32, -1.0f32);
                 for v in &frame.vertices[range.clone()] {
