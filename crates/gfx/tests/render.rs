@@ -569,15 +569,15 @@ fn widescreen_keeps_a_pre_rendered_picture_in_shape() {
     // As a full-width rectangle it is a background and fills the width.
     let img = r.render_letterboxed(&f, 640, 360).unwrap();
     assert_px(&img, 2, 180, [0, 255, 0, 255]);
-    // As a pre-rendered room picture it stays 4:3, lined up with the 3D
-    // drawn into it.
+    // As a pre-rendered room picture the whole frame stays 4:3 with bars:
+    // the room's 3D is only what stands in front of the picture.
     let last = f.commands.iter_mut().rev().find_map(|c| match c {
         n64rusty_gfx::Command::Draw(d) => Some(d),
         _ => None,
     });
     last.unwrap().state.picture = true;
     let img = r.render_letterboxed(&f, 640, 360).unwrap();
-    assert_px(&img, 2, 180, BLUE);
+    assert_px(&img, 2, 180, [0, 0, 0, 255]);
     assert_px(&img, 320, 180, [0, 255, 0, 255]);
 }
 
@@ -615,4 +615,27 @@ fn widescreen_moves_hud_pieces_in_their_areas_to_the_edges() {
     f.hud.clear();
     let img = r.render_letterboxed(&f, 640, 360).unwrap();
     assert_px(&img, 110, 30, GREEN);
+}
+
+#[test]
+fn a_flat_piece_in_front_of_the_near_plane_still_shows() {
+    let Some(mut r) = renderer() else { return };
+    let mut ram = Ram::default();
+    // The test projection is orthographic: z -150 lies in front of the near
+    // plane, which the game's microcode does not clip.
+    let verts = ram.vertices(&[
+        v(-50, -50, -150, [255; 4]),
+        v(50, -50, -150, [255; 4]),
+        v(0, 50, -150, [255; 4]),
+    ]);
+    let dl = scene(&mut ram, |_, dl| {
+        dl.other_modes(CYCLE_1, 0)
+            .combine(pass(PRIM))
+            .prim(0xFF00_00FF)
+            .vtx(verts, 3, 0)
+            .tri(0, 1, 2);
+    });
+    let f = frame(&mut ram, &dl);
+    let img = r.render(&f, 320, 240).unwrap();
+    assert_px(&img, 160, 130, RED);
 }

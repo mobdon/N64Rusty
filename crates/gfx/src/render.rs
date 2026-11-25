@@ -262,9 +262,6 @@ impl Renderer {
                 // All the adapter offers: the lowest limits cap textures at
                 // 2048 pixels, smaller than a full-screen window.
                 required_limits: adapter.limits(),
-                // Depth clamped, not clipped, as the game's microcode does
-                // not clip at the near plane (a HUD piece behind it shows).
-                required_features: adapter.features() & wgpu::Features::DEPTH_CLIP_CONTROL,
                 ..Default::default()
             })
             .await
@@ -355,7 +352,14 @@ impl Renderer {
     /// `height` target is drawn: 1 unless widescreen is on and the target
     /// is wider.
     fn wide(&self, frame: &Frame, width: u32, height: u32) -> f32 {
-        if !self.widescreen {
+        // A room drawn on a pre-rendered picture has nothing made for the
+        // sides (its 3D is only the parts in front of the picture): 4:3.
+        let picture = || {
+            frame
+                .draws()
+                .any(|d| d.state.picture && d.state.color_image == frame.color_image)
+        };
+        if !self.widescreen || picture() {
             return 1.0;
         }
         let r = (width as f32 * frame.height() as f32) / (height as f32 * frame.width as f32);
@@ -451,9 +455,6 @@ impl Renderer {
                         2 => Some(wgpu::Face::Back),
                         _ => None,
                     },
-                    unclipped_depth: device
-                        .features()
-                        .contains(wgpu::Features::DEPTH_CLIP_CONTROL),
                     ..Default::default()
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
@@ -687,9 +688,23 @@ impl Renderer {
             }
         }
         let clip = clip_matrices(frame, transforms);
+        // Flat (orthographic) pieces get their depth clamped, not clipped:
+        // a HUD piece in front of the near plane still shows. Perspective
+        // geometry there stays clipped.
+        let flat: Vec<bool> = transforms
+            .iter()
+            .map(|t| {
+                t.projection[0][3] == 0.0 && t.projection[1][3] == 0.0 && t.projection[2][3] == 0.0
+            })
+            .collect();
         let at = |v: &crate::Vertex| {
-            clip.get(v.transform as usize)
-                .map_or([0.0; 4], |m| transform(m, v.pos))
+            let mut p = clip
+                .get(v.transform as usize)
+                .map_or([0.0; 4], |m| transform(m, v.pos));
+            if flat.get(v.transform as usize) == Some(&true) && p[3] > 0.0 {
+                p[2] = p[2].clamp(0.0, p[3]);
+            }
+            p
         };
         // A backdrop drawn first (a sky made for the original view's width)
         // ends at the 4:3 edges: stretch it like a background. It is the
