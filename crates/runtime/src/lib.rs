@@ -345,15 +345,16 @@ impl Ctx {
         }
     }
 
-    /// What every call costs: it goes in the trace and moves the clock, and
-    /// a due deadline runs its handler. An interpreter calls this for the
-    /// calls it makes itself, so time moves as in translated code.
-    /// The address of the call being made (the last one [`Ctx::tick`]
-    /// counted): lets one override serve many addresses.
+    /// The function [`Ctx::call`] last entered: read on entry, it lets one
+    /// override serve many addresses. Calls made after that (and ticks an
+    /// interpreter counts itself) change it, so read it first.
     pub fn last_call(&self) -> u32 {
         self.entering
     }
 
+    /// What every call costs: it goes in the trace and moves the clock, and
+    /// a due deadline runs its handler. An interpreter calls this for the
+    /// calls it makes itself, so time moves as in translated code.
     pub fn tick(&mut self, addr: u32) {
         self.trace[(self.calls % TRACE_LEN as u64) as usize] = addr;
         self.calls += 1;
