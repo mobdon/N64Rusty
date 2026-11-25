@@ -246,7 +246,11 @@ library version gets most of its routines found and plays. Games built with
 another library version need fingerprints from a game with that version.
 To share the program, give the folder with `n64rusty-play.exe` and
 `routines.txt`; each person uses their own ROM. Never share the `games`
-folder's saved images or a ROM. Any other arguments work as for a generated
+folder's saved images or a ROM. Or build the data in: with
+`N64RUSTY_PLAYER_DATA` set to a local folder holding `routines.txt` and
+`games/<sha256>/config.toml` routine lists when building, the program
+carries them and the program alone is enough. A built-in list replaces one
+found by fingerprint, but not one written from `--symbols`. Any other arguments work as for a generated
 game program (`--frames`, `--capture`, `--window`, and so on).
 
 CI builds `n64rusty-play.exe` on each push to `main` and keeps it as the
