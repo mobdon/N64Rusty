@@ -50,6 +50,8 @@ const MAX_WARNINGS: usize = 64;
 const G_CULL_FRONT: u32 = 0x0200;
 const G_CULL_BACK: u32 = 0x0400;
 const G_LIGHTING: u32 = 0x0002_0000;
+const G_TEXTURE_GEN: u32 = 0x0004_0000;
+const G_TEXTURE_GEN_LINEAR: u32 = 0x0008_0000;
 
 /// A loaded vertex, after the vertex stage.
 #[derive(Clone, Copy, Default)]
@@ -84,6 +86,8 @@ pub struct Interpreter {
     geometry: u32,
     lights: [Light; 8],
     num_lights: usize,
+    /// Look-at directions for texture generation (s, t).
+    look_at: [[f32; 3]; 2],
     tex_scale: [f32; 2],
     tex_tile: usize,
     tex_on: bool,
@@ -160,6 +164,7 @@ impl Interpreter {
             geometry: 0,
             lights: [Light::default(); 8],
             num_lights: 0,
+            look_at: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
             tex_scale: [1.0; 2],
             tex_tile: 0,
             tex_on: false,
@@ -482,10 +487,12 @@ impl Interpreter {
             }
             10 => {
                 // Lights start after the two look-at entries.
-                let Some(n) = (offset / 24).checked_sub(2) else {
-                    return Ok(()); // look-at, only used by texture generation
-                };
                 let b = |k: u32| rd8(rdram, a + k, at);
+                let Some(n) = (offset / 24).checked_sub(2) else {
+                    let dir = [b(8)? as i8 as f32, b(9)? as i8 as f32, b(10)? as i8 as f32];
+                    self.look_at[(offset / 24) as usize] = normalize(dir);
+                    return Ok(());
+                };
                 let light = Light {
                     color: [
                         b(0)? as f32 / 255.0,
@@ -524,29 +531,46 @@ impl Interpreter {
         let transform = self.frame.transforms.len() as u32 - 1;
         let a = self.phys(w1);
         let lit = self.geometry & G_LIGHTING != 0;
+        let texgen = lit && self.geometry & G_TEXTURE_GEN != 0;
         for i in 0..n {
             let v = a + i as u32 * 16;
             let h = |k: u32| -> Result<i16, GfxError> { Ok(rd16(rdram, v + k, at)? as i16) };
             let b = |k: u32| rd8(rdram, v + k, at);
+            let normal = [
+                b(12)? as i8 as f32,
+                b(13)? as i8 as f32,
+                b(14)? as i8 as f32,
+            ];
             let color = if lit {
-                let n = [
-                    b(12)? as i8 as f32,
-                    b(13)? as i8 as f32,
-                    b(14)? as i8 as f32,
-                ];
-                let lc = self.light(&lights_mv, n);
+                let lc = self.light(&lights_mv, normal);
                 [lc[0], lc[1], lc[2], b(15)? as f32 / 255.0]
             } else {
                 [b(12)?, b(13)?, b(14)?, b(15)?].map(|c| c as f32 / 255.0)
             };
+            let mut st = [
+                h(8)? as f32 / 32.0 * self.tex_scale[0],
+                h(10)? as f32 / 32.0 * self.tex_scale[1],
+            ];
+            if texgen {
+                // Reflection mapping: the coordinates come from the normal
+                // seen along the look-at directions, over the texture scale
+                // (a scale of 0x07C0 spans a 32-texel texture).
+                let e = eye_normal(&lights_mv, normal);
+                for k in 0..2 {
+                    let d = (0..3).map(|j| e[j] * self.look_at[k][j]).sum::<f32>();
+                    let u = if self.geometry & G_TEXTURE_GEN_LINEAR != 0 {
+                        (-d).clamp(-1.0, 1.0).acos() / std::f32::consts::PI
+                    } else {
+                        d * 0.5 + 0.5
+                    };
+                    st[k] = u * self.tex_scale[k] * 1024.0;
+                }
+            }
             self.vtx[end - n + i] = Loaded {
                 pos: [h(0)? as f32, h(2)? as f32, h(4)? as f32],
                 transform,
                 color,
-                st: [
-                    h(8)? as f32 / 32.0 * self.tex_scale[0],
-                    h(10)? as f32 / 32.0 * self.tex_scale[1],
-                ],
+                st,
             };
         }
         Ok(())
@@ -584,7 +608,7 @@ impl Interpreter {
 
     /// Directional lights plus ambient (the light after the last one).
     fn light(&self, mv: &Mat4, n: [f32; 3]) -> [f32; 3] {
-        let n = normalize([0, 1, 2].map(|j| (0..3).map(|k| n[k] * mv[k][j]).sum::<f32>()));
+        let n = eye_normal(mv, n);
         let mut c = self.lights[self.num_lights].color;
         for l in &self.lights[..self.num_lights] {
             let d = (n[0] * l.dir[0] + n[1] * l.dir[1] + n[2] * l.dir[2]).max(0.0);
@@ -907,6 +931,11 @@ impl Interpreter {
         };
         self.push_rect([x0, y0, x1, y1], uv, state);
     }
+}
+
+/// A vertex normal turned by the modelview matrix, unit length.
+fn eye_normal(mv: &Mat4, n: [f32; 3]) -> [f32; 3] {
+    normalize([0, 1, 2].map(|j| (0..3).map(|k| n[k] * mv[k][j]).sum::<f32>()))
 }
 
 fn normalize(v: [f32; 3]) -> [f32; 3] {

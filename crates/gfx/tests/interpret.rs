@@ -218,6 +218,40 @@ fn decodes_a_palette_texture() {
 }
 
 #[test]
+fn texture_generation_maps_normals_through_the_look_at() {
+    let mut ram = Ram::default();
+    // Normal along +x, stored in the colour bytes.
+    let verts = ram.vertices(&[V {
+        pos: [0, 0, 0],
+        st: [0, 0],
+        rgba: [127, 0, 0, 255],
+    }]);
+    let x = ram.put(&[0, 0, 0, 0, 0, 0, 0, 0, 127, 0, 0, 0, 0, 0, 0, 0]);
+    let y = ram.put(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 127, 0, 0, 0, 0, 0, 0]);
+    let mut dl = Dl::default();
+    setup(&mut ram, &mut dl);
+    // Scale 0x100: coordinates span 0..4 texels; the tile is 4x2.
+    dl.geometry(0, G_LIGHTING | 0x4_0000)
+        .look_at(x, 0)
+        .look_at(y, 1)
+        .texture_scaled(0, 0x100, 0x100)
+        .tile(0, 2, 1, 0, 0)
+        .tile_size(0, 4, 2)
+        .vtx(verts, 1, 0)
+        .tri(0, 0, 0)
+        .end();
+    let addr = ram.dl(&dl);
+    let f = run(&ram, addr);
+    // Facing the s direction: the far edge in s (4 texels), half way in t
+    // (2 texels of a 2-texel tile).
+    let uv = f.vertices[0].uv[0];
+    assert!(
+        (uv[0] - 1.0).abs() < 1e-3 && (uv[1] - 1.0).abs() < 1e-3,
+        "{uv:?}"
+    );
+}
+
+#[test]
 fn lights_vertices_from_normals() {
     let mut ram = Ram::default();
     // Normal pointing at +z, stored in the colour bytes; alpha 200.

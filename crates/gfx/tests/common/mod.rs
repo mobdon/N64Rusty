@@ -189,6 +189,17 @@ impl Dl {
     pub fn end(&mut self) -> &mut Self {
         self.c(0xDF << 24, 0)
     }
+    /// `G_TEXTURE` with an s and t scale (0x10000 is 1.0).
+    pub fn texture_scaled(&mut self, tile: u32, s: u32, t: u32) -> &mut Self {
+        self.c(0xD7 << 24 | tile << 8 | 1 << 1, s << 16 | t)
+    }
+    /// Look-at direction `k` (0: s, 1: t) for texture generation.
+    pub fn look_at(&mut self, addr: u32, k: u32) -> &mut Self {
+        self.c(
+            0xDC << 24 | ((16 - 1) / 8) << 19 | (k * 24 / 8) << 8 | 10,
+            addr,
+        )
+    }
     pub fn texture(&mut self, on: bool, tile: u32) -> &mut Self {
         self.c(0xD7 << 24 | tile << 8 | (on as u32) << 1, 0xFFFF_FFFF)
     }
