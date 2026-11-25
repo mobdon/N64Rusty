@@ -111,6 +111,14 @@ its command set is used. `--input script.txt` plays a controller script
 (`frame port buttons x y` lines, the format `n64rusty-host` records),
 matched against retrace numbers, so a headless run can press buttons.
 
+Cartridge save memory (battery-backed SRAM, reached with PI DMA) is kept
+in a file: `--save file`, and window runs default to `save.sra` in the
+per-game folder. The file is read at start and rewritten after every write
+the game makes, so closing the window or a crash loses nothing. Headless
+runs without `--save` start from blank save memory and keep nothing, so
+repeated runs stay identical. EEPROM, flash and controller pak saves are
+not done yet.
+
 Guest threads start with the floating-point register mode the system
 library gives them (32-bit registers, doubles in even/odd pairs); the boot
 code keeps the 64-bit mode the boot ROM sets.

@@ -11,6 +11,7 @@ pub mod devices;
 pub mod live;
 pub mod media;
 pub mod os;
+pub mod save;
 
 use std::collections::BTreeMap;
 use std::panic;
@@ -195,7 +196,7 @@ pub fn crash_report(ctx: &Ctx) -> String {
 /// Entry point for a generated game binary:
 /// `game <rom> [--symbols file]... [--config file] [--frames n]
 /// [--capture dir] [--capture-every n] [--capture-scale n] [--wav file] [--input script]
-/// [--window] [--run run.toml]`.
+/// [--save file] [--window] [--run run.toml]`.
 ///
 /// Display lists and audio command lists always go through the graphics
 /// and audio interpreters. With `--capture`, every n-th finished frame (60
@@ -208,6 +209,10 @@ pub fn crash_report(ctx: &Ctx) -> String {
 /// keyboard and gamepads, paced at the game's own rate, with no frame limit
 /// unless `--frames` is given. Window, input and pacing settings come from
 /// `--run` (default: `run.toml` in the per-game folder, if present).
+///
+/// Cartridge save memory is kept in `--save file`; window runs default to
+/// `save.sra` in the per-game folder. Headless runs without `--save` start
+/// from blank save memory and keep nothing, so they stay repeatable.
 ///
 /// System routines are replaced by role name. Their addresses come from the
 /// per-game config (`name = 0xADDR` lines, found by us) and from symbol
@@ -232,6 +237,7 @@ pub fn main_with(game: Game, devices: Option<Box<dyn devices::Devices>>) -> Exit
     let mut scale = 1;
     let mut wav = None;
     let mut input = None;
+    let mut save = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let flag = a.as_str();
@@ -254,6 +260,7 @@ pub fn main_with(game: Game, devices: Option<Box<dyn devices::Devices>>) -> Exit
             "--capture" => capture = Some(PathBuf::from(v)),
             "--wav" => wav = Some(PathBuf::from(v)),
             "--input" => input = Some(PathBuf::from(v)),
+            "--save" => save = Some(PathBuf::from(v)),
             "--run" => run_config = Some(PathBuf::from(v)),
             "--frames" | "--capture-every" | "--capture-scale" => {
                 let Some(n) = number() else {
@@ -277,7 +284,7 @@ pub fn main_with(game: Game, devices: Option<Box<dyn devices::Devices>>) -> Exit
     }
     let Some(rom_path) = rom_path else {
         eprintln!(
-            "usage: <game> <rom> [--symbols file]... [--config file] [--frames n] [--local dir] [--capture dir] [--capture-every n] [--capture-scale n] [--wav file] [--input script] [--window] [--run run.toml]"
+            "usage: <game> <rom> [--symbols file]... [--config file] [--frames n] [--local dir] [--capture dir] [--capture-every n] [--capture-scale n] [--wav file] [--input script] [--save file] [--window] [--run run.toml]"
         );
         return ExitCode::from(2);
     };
@@ -322,6 +329,16 @@ pub fn main_with(game: Game, devices: Option<Box<dyn devices::Devices>>) -> Exit
     if default_config.exists() {
         symbols.push(default_config);
     }
+    let save = match save.or_else(|| window.then(|| local.join("save.sra"))) {
+        Some(p) => match save::Save::open(&p) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error: save file {}: {e}", p.display());
+                return ExitCode::from(2);
+            }
+        },
+        None => save::Save::in_memory(),
+    };
     let names = read_names(&symbols);
     let by_name: BTreeMap<String, u32> = names.iter().map(|(a, n)| (n.clone(), *a)).collect();
     *NAMES.lock().unwrap() = names;
@@ -376,12 +393,12 @@ pub fn main_with(game: Game, devices: Option<Box<dyn devices::Devices>>) -> Exit
     let entry = game.entry;
     if window {
         return live::play(&run_config, media, move |devices| {
-            run_and_report(ctx, entry, rom_bytes, frames, devices, &local)
+            run_and_report(ctx, entry, rom_bytes, frames, devices, save, &local)
         });
     }
     let devices = devices.unwrap_or_else(|| Box::new(media));
     ExitCode::from(run_and_report(
-        ctx, entry, rom_bytes, frames, devices, &local,
+        ctx, entry, rom_bytes, frames, devices, save, &local,
     ))
 }
 
@@ -392,9 +409,10 @@ fn run_and_report(
     rom_bytes: Arc<[u8]>,
     frames: u64,
     devices: Box<dyn devices::Devices>,
+    save: save::Save,
     local: &std::path::Path,
 ) -> u8 {
-    let (outcome, report, frames_run) = os::run(ctx, entry, rom_bytes, frames, devices);
+    let (outcome, report, frames_run) = os::run(ctx, entry, rom_bytes, frames, devices, save);
     let (_, dma, threads, device_summary) = os::summary();
     if let Err(e) = record_run(local, &dma, &outcome) {
         eprintln!(

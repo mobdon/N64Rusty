@@ -23,6 +23,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use n64rusty_runtime::{sx32, Ctx, GuestFn};
 
 use crate::devices::{Devices, Pad};
+use crate::save::Save;
 
 /// COP0 Count ticks per second (half the 93.75 MHz CPU clock).
 pub const COUNT_HZ: u64 = 46_875_000;
@@ -156,6 +157,7 @@ pub struct State {
     rom: Arc<[u8]>,
     framebuffer: u32,
     devices: Box<dyn Devices>,
+    save: Save,
     /// Cartridge DMA requests seen: (ROM offset, RAM address, length).
     pub dma_log: Vec<(u32, u32, u32)>,
     /// Report text for a panic, filled by the panicking thread.
@@ -528,6 +530,7 @@ pub fn run(
     rom: Arc<[u8]>,
     frame_limit: u64,
     devices: Box<dyn Devices>,
+    save: Save,
 ) -> (Outcome, String, u64) {
     ctx.on_deadline = Some(interrupt);
     ctx.cop0[12] = STATUS_BOOT;
@@ -548,6 +551,7 @@ pub fn run(
                 rom,
                 framebuffer: 0,
                 devices,
+                save,
                 dma_log: Vec::new(),
                 report: String::new(),
             }),
@@ -853,6 +857,29 @@ fn os_stop_timer(c: &mut Ctx) {
     ret(c, if had { 0 } else { u32::MAX });
 }
 
+/// One PI transfer of `len` bytes between RAM and device address `dev`:
+/// `dir` 0 reads the device, 1 writes it. Save memory is read and written;
+/// cartridge ROM is only read.
+fn pi_dma(c: &mut Ctx, st: &mut State, dir: u32, dev: u32, ram: u32, len: u32) {
+    let Some(off) = Save::sram_offset(dev & 0x1FFF_FFFF) else {
+        if dir == 0 {
+            cart_copy(c, st, dev, ram, len);
+        }
+        return;
+    };
+    let at = (ram & 0x1FFF_FFFF) as usize;
+    let n = len as usize;
+    let bytes = c.mem.bytes_mut();
+    if at + n > bytes.len() {
+        panic!("save memory DMA at {ram:#010x}+{len:#x} runs past RAM");
+    }
+    if dir == 0 {
+        st.save.read(off, &mut bytes[at..at + n]);
+    } else {
+        st.save.write(off, &bytes[at..at + n]);
+    }
+}
+
 /// Copies `len` bytes of cartridge space at PI address `dev` into RAM.
 fn cart_copy(c: &mut Ctx, st: &mut State, dev: u32, ram: u32, len: u32) {
     let off = (dev & 0x0FFF_FFFF) as usize;
@@ -879,9 +906,7 @@ fn os_pi_start_dma(c: &mut Ctx) {
         arg(c, 6),
     );
     let mut st = lock();
-    if dir == 0 {
-        cart_copy(c, &mut st, dev, ram, len);
-    }
+    pi_dma(c, &mut st, dir, dev, ram, len);
     if mq != 0 {
         put_message(c, &mut st, mq, mb, false);
     }
@@ -897,9 +922,7 @@ fn os_epi_start_dma(c: &mut Ctx) {
     let dev = c.mem.read_u32(mb + 0x0C);
     let len = c.mem.read_u32(mb + 0x10);
     let mut st = lock();
-    if dir == 0 {
-        cart_copy(c, &mut st, base.wrapping_add(dev), ram, len);
-    }
+    pi_dma(c, &mut st, dir, base.wrapping_add(dev), ram, len);
     if mq != 0 {
         put_message(c, &mut st, mq, mb, false);
     }
@@ -910,9 +933,7 @@ fn os_epi_start_dma(c: &mut Ctx) {
 fn os_pi_raw_start_dma(c: &mut Ctx) {
     let (dir, dev, ram, len) = (arg(c, 0), arg(c, 1), arg(c, 2), arg(c, 3));
     let mut st = lock();
-    if dir == 0 {
-        cart_copy(c, &mut st, dev, ram, len);
-    }
+    pi_dma(c, &mut st, dir, dev, ram, len);
     drop(st);
     ret(c, 0);
 }
