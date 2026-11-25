@@ -1,5 +1,5 @@
 //! Builds the player's private data into it: with `N64RUSTY_PLAYER_DATA`
-//! set to a folder (its `routines.txt` and `games/<sha256>/config.toml` routine lists), the
+//! set to a folder (its `routines.txt` and `games/<sha256>/` routine lists and run.toml settings), the
 //! player carries them, so a friend needs only the program and a ROM.
 //! Without it the player carries nothing. The folder never goes in git.
 //!
@@ -21,6 +21,7 @@ fn main() {
         for game in games.flatten() {
             let name = game.file_name().to_string_lossy().into_owned();
             files.push(format!("games/{name}/config.toml"));
+            files.push(format!("games/{name}/run.toml"));
         }
         files.sort();
         for f in files {

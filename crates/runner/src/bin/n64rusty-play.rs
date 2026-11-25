@@ -98,6 +98,15 @@ fn play(args: &mut Vec<String>, dir: &Path, plain: bool) -> ExitCode {
         .find(|w| w[0] == "--local")
         .map(|w| PathBuf::from(&w[1]))
         .unwrap_or(local);
+    // Built-in game settings (widescreen HUD areas). They replace a run.toml
+    // without them; menu choices saved there go back to the defaults once.
+    if let Some(run) = built::get(&format!("games/{}/run.toml", rom.sha256)) {
+        let path = used.join("run.toml");
+        let have = std::fs::read_to_string(&path).unwrap_or_default();
+        if !have.contains("hud") {
+            let _ = std::fs::write(&path, run);
+        }
+    }
     if !used.join("run.toml").exists() && !args.iter().any(|a| a == "--run") {
         let settings = dir.join("settings.toml");
         // A folder it cannot write to just plays with the defaults.
