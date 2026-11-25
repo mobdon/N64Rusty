@@ -143,6 +143,7 @@ impl AudioRsp {
             11 => self.load_book(ram, self.addr(w1), lo0),
             12 => self.mix(lo0 as i16, hi1, lo1, count),
             13 => self.interleave(out, hi1, lo1, count),
+            14 => self.pole_filter(ram, flags, lo0, (inp, out, count), self.addr(w1)),
             15 => self.loop_addr = self.addr(w1),
             op => panic!("audio command {op:#x} not implemented ({w0:08x} {w1:08x})"),
         }
@@ -194,7 +195,7 @@ impl AudioRsp {
             13 => self.interleave(N_MAIN, N_DRY_LEFT, N_DRY_RIGHT, N_COUNT),
             14 => {
                 let buf = if w1 >> 24 == 0 { N_MAIN } else { N_MAIN2 };
-                self.pole_filter(ram, flags, lo0, buf, a1);
+                self.pole_filter(ram, flags, lo0, (buf, buf, N_COUNT), a1);
             }
             15 => self.loop_addr = a1,
             op => panic!("n_audio command {op:#x} not implemented ({w0:08x} {w1:08x})"),
@@ -505,7 +506,7 @@ impl AudioRsp {
     /// last two outputs.
     ///
     /// State: the last 4 output samples.
-    fn pole_filter(&mut self, ram: &mut Memory, flags: u8, gain: u16, buf: u16, state: u32) {
+    fn pole_filter(&mut self, ram: &mut Memory, flags: u8, gain: u16, (inp, out, count): (u16, u16, u16), state: u32) {
         let gain = gain as i64;
         let h1: Vec<i64> = self.book[0..8].iter().map(|&c| c as i64).collect();
         let h2: Vec<i64> = self.book[8..16].iter().map(|&c| c as i64).collect();
@@ -515,9 +516,9 @@ impl AudioRsp {
             l1 = ram.read_u16(state + 4) as i16 as i64;
             l2 = ram.read_u16(state + 6) as i16 as i64;
         }
-        for f in 0..N_COUNT / 16 {
-            let at = buf + 16 * f;
-            let x: Vec<i64> = (0..8).map(|i| self.ld(at + 2 * i) as i64).collect();
+        for f in 0..count.div_ceil(16) {
+            let (src, at) = (inp + 16 * f, out + 16 * f);
+            let x: Vec<i64> = (0..8).map(|i| self.ld(src + 2 * i) as i64).collect();
             for i in 0..8 {
                 let mut acc = x[i] * gain + h1[i] * l1 + h2[i] * l2;
                 for k in 0..i {
@@ -527,7 +528,7 @@ impl AudioRsp {
             }
             (l1, l2) = (self.ld(at + 12) as i64, self.ld(at + 14) as i64);
         }
-        let end = buf + N_COUNT;
+        let end = out + count.div_ceil(16) * 16;
         for i in 0..4u16 {
             ram.write_u16(state + 2 * i as u32, self.ld(end - 8 + 2 * i) as u16);
         }
