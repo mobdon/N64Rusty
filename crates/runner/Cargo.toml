@@ -16,3 +16,7 @@ n64rusty-gfx = { path = "../gfx" }
 n64rusty-audio = { path = "../audio", features = ["speaker"] }
 n64rusty-host = { path = "../host" }
 winit = "0.30"
+
+# The player's "pick your ROM" window.
+[target.'cfg(windows)'.dependencies]
+rfd = "0.15"

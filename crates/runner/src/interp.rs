@@ -82,7 +82,12 @@ fn run(ctx: &mut Ctx, entry: u32) {
         // Calls into translated code are charged by `Ctx::call`.
         let calls = target.is_some_and(|t| !ctx.has_translation(t));
         if let Err(e) = cpu.step_on(ctx.mem.bytes_mut()) {
-            panic!("interpreting untranslated code from {entry:#010x}: {e:?}");
+            // The reference CPU knows plain RAM only: COP0 and device
+            // registers go through the runtime, as translated code does.
+            if !outside(&mut cpu, ctx, word) {
+                panic!("interpreting untranslated code from {entry:#010x}: {e:?}");
+            }
+            cpu.skip();
         }
         if calls {
             // A call inside untranslated code costs what a translated call
@@ -94,6 +99,54 @@ fn run(ctx: &mut Ctx, entry: u32) {
         }
     }
     store(&cpu, ctx);
+}
+
+/// Runs `word` at `cpu.pc` through `ctx` if it is a COP0 move, a TLB
+/// instruction or a load or store the reference CPU cannot reach; returns
+/// whether it did.
+fn outside(cpu: &mut Cpu, ctx: &mut Ctx, word: u32) -> bool {
+    let (rs, rt, rd) = (
+        (word >> 21) & 31,
+        (word >> 16) as usize & 31,
+        (word >> 11) as usize & 31,
+    );
+    let ea = (cpu.r[rs as usize] as u32).wrapping_add(word as u16 as i16 as i32 as u32);
+    let t = cpu.r[rt];
+    let sx = |v: u32| v as i32 as i64 as u64;
+    let v = match word >> 26 {
+        0x10 if rs == 0 => ctx.mfc0(rd),
+        0x10 if rs == 4 => {
+            ctx.mtc0(rd, t);
+            return true;
+        }
+        0x10 if rs == 0x10 => {
+            store(cpu, ctx);
+            ctx.tlb(word & 0x3F);
+            load(cpu, ctx);
+            return true;
+        }
+        0x20 => ctx.mem.read_u8(ea) as i8 as i64 as u64,
+        0x24 => u64::from(ctx.mem.read_u8(ea)),
+        0x21 => ctx.mem.read_u16(ea) as i16 as i64 as u64,
+        0x25 => u64::from(ctx.mem.read_u16(ea)),
+        0x23 => sx(ctx.mem.read_u32(ea)),
+        0x27 => u64::from(ctx.mem.read_u32(ea)),
+        0x37 => ctx.mem.read_u64(ea),
+        0x28 | 0x29 | 0x2B | 0x3F => {
+            match word >> 26 {
+                0x28 => ctx.mem.write_u8(ea, t as u8),
+                0x29 => ctx.mem.write_u16(ea, t as u16),
+                0x2B => ctx.mem.write_u32(ea, t as u32),
+                _ => ctx.mem.write_u64(ea, t),
+            }
+            return true;
+        }
+        _ => return false,
+    };
+    if rt != 0 {
+        cpu.r[rt] = v;
+    }
+    true
 }
 
 #[cfg(test)]
@@ -169,5 +222,20 @@ mod tests {
         ctx.r[31] = sx32(0x8000_0F00);
         ctx.call(0x8000_3000);
         assert_eq!(ctx.r[2], 42);
+    }
+
+    #[test]
+    fn cop0_moves_go_through_the_runtime() {
+        let mut ctx = Ctx::new(Memory::new(0x10000));
+        // mtc0 a0,Status; mfc0 v0,Status; jr ra; nop
+        let code = [0x4084_6000u32, 0x4002_6000, 0x03E0_0008, 0];
+        for (k, w) in code.iter().enumerate() {
+            ctx.mem.write_u32(0x8000_3000 + 4 * k as u32, *w);
+        }
+        install(&mut ctx, Box::new(|_, a| Some((a, a + 32))));
+        ctx.r[4] = 0x1234;
+        ctx.r[31] = sx32(0x8000_0F00);
+        ctx.call(0x8000_3000);
+        assert_eq!(ctx.r[2], 0x1234);
     }
 }

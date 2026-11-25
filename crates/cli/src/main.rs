@@ -9,6 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use n64rusty_rom::signature::{masked, starts_function, words};
 use n64rusty_rom::{Rom, BOOT_SEGMENT_ROM, BOOT_SEGMENT_SIZE};
 use n64rusty_translator::discover::{
     data_pointers, discover, discover_layout, function_starts, overlay_table, Discovery, Image,
@@ -655,41 +656,6 @@ fn translate(args: &[String]) -> Result<(), String> {
         files.len()
     );
     Ok(())
-}
-
-/// An instruction word with what relocation changes taken out: jump
-/// targets, `lui` values and the offsets of addressing not based on `sp`.
-fn masked(w: u32) -> u32 {
-    match w >> 26 {
-        2 | 3 => w & 0xFC00_0000,
-        0x0F => w & 0xFFFF_0000,
-        0x09 | 0x0D | 0x20..=0x2F | 0x31 | 0x35 | 0x37 | 0x39 | 0x3D | 0x3F
-            if (w >> 21) & 31 != 29 =>
-        {
-            w & 0xFFFF_0000
-        }
-        _ => w,
-    }
-}
-
-/// Whether word `i` can start a routine: it is the first word, or the words
-/// before it (past any padding) end one with `jr ra` or a `j` and its delay slot.
-/// Short routines otherwise match the tail of a longer one.
-fn starts_function(w: &[u32], i: usize) -> bool {
-    let ends = |k: usize| w[k] == 0x03E0_0008 || w[k] >> 26 == 2;
-    let mut j = i;
-    while j > 0 && w[j - 1] == 0 {
-        j -= 1;
-    }
-    i == 0
-        || (i >= 2 && ends(i - 2))
-        || (j < i && ((j >= 1 && ends(j - 1)) || (j >= 2 && ends(j - 2))))
-}
-
-fn words(seg: &[u8]) -> Vec<u32> {
-    seg.chunks_exact(4)
-        .map(|c| u32::from_be_bytes(c.try_into().unwrap()))
-        .collect()
 }
 
 /// Finds each reference routine `(addr, name, len in words)` in `target`
