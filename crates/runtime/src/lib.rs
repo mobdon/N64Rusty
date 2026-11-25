@@ -162,7 +162,7 @@ impl Ctx {
             if lo <= olo && hi >= ohi {
                 return false;
             }
-            dead.push((lo, hi));
+            add_range(dead, lo, hi);
             true
         });
         for (i, o) in self.overlays.iter().enumerate() {
@@ -496,5 +496,38 @@ mod tests {
         c.clear_override(0x8000_0400);
         c.call(0x8000_0400);
         assert_eq!(c.r[2], 1);
+    }
+}
+
+/// Adds `lo..hi` to the disjoint `ranges`, merging what it touches. Games
+/// copy into the same buffers over and over; unmerged, every call would
+/// look through each of those copies.
+fn add_range(ranges: &mut Vec<(u32, u32)>, lo: u32, hi: u32) {
+    let (mut lo, mut hi) = (lo, hi);
+    ranges.retain(|&(a, b)| {
+        let touches = a <= hi && b >= lo;
+        if touches {
+            lo = lo.min(a);
+            hi = hi.max(b);
+        }
+        !touches
+    });
+    ranges.push((lo, hi));
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::add_range;
+
+    #[test]
+    fn repeated_and_touching_copies_merge() {
+        let mut r = Vec::new();
+        for _ in 0..1000 {
+            add_range(&mut r, 0x100, 0x200);
+        }
+        add_range(&mut r, 0x400, 0x500);
+        assert_eq!(r, [(0x100, 0x200), (0x400, 0x500)]);
+        add_range(&mut r, 0x200, 0x400);
+        assert_eq!(r, [(0x100, 0x500)]);
     }
 }
