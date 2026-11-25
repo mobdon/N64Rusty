@@ -142,10 +142,11 @@ fn saved_images(sha256: &str) -> Result<Vec<(u32, Vec<u8>)>, String> {
         else {
             continue;
         };
-        out.push((
-            base,
-            fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?,
-        ));
+        // One unreadable image is skipped, not fatal for the whole match.
+        match fs::read(&p) {
+            Ok(bytes) => out.push((base, bytes)),
+            Err(e) => eprintln!("warning: skipped {}: {e}", p.display()),
+        }
     }
     Ok(out)
 }
@@ -827,9 +828,12 @@ fn match_routines(args: &[String]) -> Result<(), String> {
         let mut len = ((next - a) / 4) as usize;
         // Names can be sparse: a routine also ends at the first return
         // followed by the start of another.
-        if let Some(k) = (0..len)
-            .find(|&k| ref_words[at + k] == 0x03E0_0008 && starts_function(&ref_words, at + k + 2))
-        {
+        if let Some(k) = (0..len).find(|&k| {
+            // The word after the delay slot must exist to start a routine.
+            at + k + 2 < ref_words.len()
+                && ref_words[at + k] == 0x03E0_0008
+                && starts_function(&ref_words, at + k + 2)
+        }) {
             len = len.min(k + 2);
         }
         while len > 0 && ref_words[at + len - 1] == 0 {
