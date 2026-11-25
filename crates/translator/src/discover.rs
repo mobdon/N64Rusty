@@ -245,7 +245,9 @@ fn is_leaf(img: &Image, a: u32) -> bool {
     const JR_RA: u32 = 0x03E0_0008;
     let words: Vec<u32> = (0..32).map_while(|k| img.word(a + 4 * k)).collect();
     words.iter().position(|&w| w == JR_RA).is_some_and(|k| {
-        words[..=k].iter().all(|&w| Inst::decode(w).op != Op::Unknown)
+        words[..=k]
+            .iter()
+            .all(|&w| Inst::decode(w).op != Op::Unknown)
     })
 }
 
@@ -644,7 +646,20 @@ mod tests {
         // f: jr ra ; nop | g (only a hint): jal past ; nop ; jr ra ; nop |
         // past the code: bytes loaded over later, which here call into g.
         let past = BASE + 32;
-        let bytes = image(&[JR_RA, NOP, jal(past), NOP, JR_RA, NOP, 0, 0, jal(BASE + 12), NOP, JR_RA, NOP]);
+        let bytes = image(&[
+            JR_RA,
+            NOP,
+            jal(past),
+            NOP,
+            JR_RA,
+            NOP,
+            0,
+            0,
+            jal(BASE + 12),
+            NOP,
+            JR_RA,
+            NOP,
+        ]);
         let img = Image {
             base: BASE,
             bytes: &bytes,
