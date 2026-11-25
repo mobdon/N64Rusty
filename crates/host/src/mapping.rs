@@ -187,7 +187,7 @@ impl PadMap {
     /// so it can be tested without a device.
     pub fn pad(&self, pressed: impl Fn(Button) -> bool, axis: impl Fn(Axis) -> f32) -> Pad {
         let mut pad = Pad::default();
-        let (mut up, mut down, mut left, mut right) = (false, false, false, false);
+        let (mut up, mut down, mut left, mut right, mut half) = (false, false, false, false, false);
         for &(from, to) in &self.buttons {
             if !pressed(from) {
                 continue;
@@ -198,7 +198,7 @@ impl PadMap {
                 Binding::StickDown => down = true,
                 Binding::StickLeft => left = true,
                 Binding::StickRight => right = true,
-                Binding::Half => {}
+                Binding::Half => half = true,
             }
         }
         let (cx, cy) = (axis(Axis::RightStickX), axis(Axis::RightStickY));
@@ -223,13 +223,14 @@ impl PadMap {
                 (len - self.deadzone) / (1.0 - self.deadzone).max(1e-3) * self.sensitivity / len;
             (x * k, y * k)
         };
-        let to_n64 = |v: f32| (v.clamp(-1.0, 1.0) * STICK_MAX as f32).round() as i8;
+        let reach = if half { STICK_MAX / 2 } else { STICK_MAX } as f32;
+        let to_n64 = |v: f32| (v.clamp(-1.0, 1.0) * reach).round() as i8;
         pad.x = to_n64(x);
         pad.y = to_n64(y);
-        // Pad buttons bound to the stick push it all the way.
+        // Pad buttons bound to the stick push it all the way (or halfway).
         if up || down || left || right {
-            pad.x = (right as i8 - left as i8) * STICK_MAX;
-            pad.y = (up as i8 - down as i8) * STICK_MAX;
+            pad.x = to_n64((right as i8 - left as i8) as f32);
+            pad.y = to_n64((up as i8 - down as i8) as f32);
         }
         pad
     }
@@ -321,5 +322,16 @@ mod tests {
         assert_eq!(pad(-1.0, false).x, -STICK_MAX, "clamped");
         assert_eq!(pad(0.0, true).buttons, button::B);
         assert_eq!(pad(0.0, false).buttons, 0, "the default layout is replaced");
+        let walk = PadMap {
+            buttons: vec![(Button::LeftTrigger, Binding::Half)],
+            ..PadMap::default()
+        };
+        let x = walk
+            .pad(
+                |b| b == Button::LeftTrigger,
+                |a| (a == Axis::LeftStickX) as u8 as f32,
+            )
+            .x;
+        assert_eq!(x, STICK_MAX / 2, "HALF halves the stick");
     }
 }
