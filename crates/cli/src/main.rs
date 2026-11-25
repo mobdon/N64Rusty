@@ -348,6 +348,9 @@ fn translate(args: &[String]) -> Result<(), String> {
         // up, so also start at every function its layout shows.
         let mut entries = entries.clone();
         entries.extend(function_starts(&oimg));
+        // A scene's entry often sits first in its code and is a leaf with
+        // no frame to spot, so the start of the copy is a function too.
+        entries.push(ram);
         let d = discover(
             &oimg,
             &entries,
