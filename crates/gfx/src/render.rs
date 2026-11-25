@@ -193,6 +193,8 @@ pub struct Renderer {
     samplers: HashMap<(Wrap, Wrap, bool), wgpu::Sampler>,
     white: wgpu::TextureView,
     widescreen: bool,
+    /// Colour and depth targets of the last size drawn.
+    targets: Option<(u32, u32, wgpu::Texture, wgpu::Texture)>,
 }
 
 impl Renderer {
@@ -267,6 +269,7 @@ impl Renderer {
             samplers: HashMap::new(),
             white,
             widescreen: false,
+            targets: None,
         })
     }
 
@@ -511,24 +514,30 @@ impl Renderer {
             height,
             depth_or_array_layers: 1,
         };
-        let target = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("color"),
-            size,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: COLOR_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::COPY_SRC
-                | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let depth = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("depth"),
-            format: DEPTH_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            ..target_desc(size)
-        });
+        // The window draws at one size frame after frame: keep the targets.
+        let reuse = matches!(&self.targets, Some((w, h, ..)) if (*w, *h) == (width, height));
+        if !reuse {
+            let target = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("color"),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: COLOR_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::COPY_SRC
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let depth = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("depth"),
+                format: DEPTH_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                ..target_desc(size)
+            });
+            self.targets = Some((width, height, target, depth));
+        }
+        let (_, _, target, depth) = self.targets.clone().expect("targets were just made");
         let color_view = target.create_view(&Default::default());
         let depth_view = depth.create_view(&Default::default());
 
