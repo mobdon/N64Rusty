@@ -111,6 +111,7 @@ pub struct Screen {
     shown: Shown,
     sound: Option<Receiver<Sound>>,
     window: Option<(Arc<Window>, Renderer, WindowTarget)>,
+    widescreen: bool,
 }
 
 /// Connects the two sides. `media` supplies graphics, audio and capture.
@@ -133,6 +134,7 @@ pub fn pair(mut media: Media) -> (Live, Screen) {
         shown,
         sound: Some(sound_rx),
         window: None,
+        widescreen: false,
     };
     (live, screen)
 }
@@ -157,7 +159,8 @@ impl Guest for Screen {
     }
 
     fn attach_window(&mut self, window: Arc<Window>) {
-        let target = Renderer::new().and_then(|r| {
+        let target = Renderer::new().and_then(|mut r| {
+            r.set_widescreen(self.widescreen);
             let t = r.window_target(window.clone())?;
             Ok((r, t))
         });
@@ -221,7 +224,8 @@ pub fn play(
         let trace = std::backtrace::Backtrace::force_capture();
         let _ = std::fs::write("crash.txt", format!("thread {thread}: {info}\n\n{trace}\n"));
     }));
-    let (live, screen) = pair(media);
+    let (live, mut screen) = pair(media);
+    screen.widescreen = cfg.window.widescreen;
     std::thread::Builder::new()
         .name("game".into())
         .spawn(move || std::process::exit(run(Box::new(live)).into()))

@@ -50,6 +50,8 @@ pub struct Media {
     every: u64,
     /// Saved frames are this many times the game's resolution.
     scale: u32,
+    /// Saved frames are 16:9 widescreen.
+    wide: bool,
     renderer: Option<Renderer>,
     renderer_failed: bool,
     tasks: u64,
@@ -99,6 +101,7 @@ impl Media {
             capture,
             every: every.max(1),
             scale: 1,
+            wide: false,
             renderer: None,
             renderer_failed: false,
             tasks: 0,
@@ -118,6 +121,12 @@ impl Media {
         self
     }
 
+    /// Saves frames 16:9 wide, as the window's widescreen option draws them.
+    pub fn with_widescreen(mut self, on: bool) -> Self {
+        self.wide = on;
+        self
+    }
+
     /// Hands every finished frame to `slot`, replacing one not yet taken.
     pub fn show_frames(&mut self, slot: Arc<Mutex<Option<Frame>>>) {
         self.shown = Some(slot);
@@ -129,7 +138,10 @@ impl Media {
         };
         if self.renderer.is_none() && !self.renderer_failed {
             match Renderer::new() {
-                Ok(r) => self.renderer = Some(r),
+                Ok(mut r) => {
+                    r.set_widescreen(self.wide);
+                    self.renderer = Some(r);
+                }
                 Err(e) => {
                     eprintln!("warning: no off-screen renderer, frames are not saved: {e}");
                     self.renderer_failed = true;
@@ -139,7 +151,10 @@ impl Media {
         let Some(r) = self.renderer.as_mut() else {
             return;
         };
-        let (w, h) = (f.width.max(1) * self.scale, f.height() * self.scale);
+        let (mut w, h) = (f.width.max(1) * self.scale, f.height() * self.scale);
+        if self.wide {
+            w = (h * 16 / 9).max(w);
+        }
         let result = r
             .render(f, w, h)
             .map_err(|e| e.to_string())

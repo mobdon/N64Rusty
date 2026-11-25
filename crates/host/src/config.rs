@@ -12,6 +12,7 @@
 //! [window]
 //! title = "n64rusty"
 //! scale = 2                         # window is 320x240 times this
+//! widescreen = false                # fill a wide window, showing more
 //!
 //! [[port]]                          # ports 1 to 4, in order
 //! sources = ["keyboard", "gamepad0"]
@@ -50,6 +51,9 @@ pub struct RunConfig {
 pub struct WindowConfig {
     pub title: String,
     pub scale: u32,
+    /// Fill a window wider than 4:3 with more of the scene instead of
+    /// black bars.
+    pub widescreen: bool,
 }
 
 impl Default for WindowConfig {
@@ -57,6 +61,7 @@ impl Default for WindowConfig {
         WindowConfig {
             title: "n64rusty".into(),
             scale: 2,
+            widescreen: false,
         }
     }
 }

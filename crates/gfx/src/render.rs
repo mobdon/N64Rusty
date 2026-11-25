@@ -192,6 +192,7 @@ pub struct Renderer {
     pipelines: HashMap<PipeKey, wgpu::RenderPipeline>,
     samplers: HashMap<(Wrap, Wrap, bool), wgpu::Sampler>,
     white: wgpu::TextureView,
+    widescreen: bool,
 }
 
 impl Renderer {
@@ -265,7 +266,42 @@ impl Renderer {
             pipelines: HashMap::new(),
             samplers: HashMap::new(),
             white,
+            widescreen: false,
         })
+    }
+
+    /// Widescreen: a target wider than the game's frame shows more of the
+    /// 3D scene at the sides instead of black bars. Everything keeps its
+    /// shape: the 4:3 picture sits in the middle, and a rectangle or
+    /// scissor box spanning the frame's whole width (backgrounds, the 3D
+    /// view) is widened to the target. Off by default.
+    pub fn set_widescreen(&mut self, on: bool) {
+        self.widescreen = on;
+    }
+
+    /// How many times wider than the frame's own shape a `width` x
+    /// `height` target is drawn: 1 unless widescreen is on and the target
+    /// is wider.
+    fn wide(&self, frame: &Frame, width: u32, height: u32) -> f32 {
+        if !self.widescreen {
+            return 1.0;
+        }
+        let r = (width as f32 * frame.height() as f32) / (height as f32 * frame.width as f32);
+        if r.is_finite() {
+            r.max(1.0)
+        } else {
+            1.0
+        }
+    }
+
+    /// Where a frame goes in a `width` x `height` window: all of it in
+    /// widescreen, else the largest centred rectangle of the frame's shape.
+    fn place(&self, frame: &Frame, width: u32, height: u32) -> (u32, u32, u32, u32) {
+        if self.wide(frame, width, height) > 1.0 {
+            (0, 0, width, height)
+        } else {
+            fit(width, height, frame.width, frame.height())
+        }
     }
 
     /// Name and backend of the adapter in use.
@@ -495,13 +531,32 @@ impl Renderer {
         let color_view = target.create_view(&Default::default());
         let depth_view = depth.create_view(&Default::default());
 
-        // Vertices, transformed to clip space.
+        // Vertices, transformed to clip space. In widescreen everything is
+        // narrowed about the centre to keep its shape, except rectangles
+        // spanning the whole frame (backgrounds), which stretch from edge
+        // to edge of the target, over the border the game left.
+        let wide = self.wide(frame, width, height);
+        let mut stretch = vec![None; frame.vertices.len()];
+        for d in frame.draws().filter(|d| d.state.rect && wide > 1.0) {
+            let range = d.first as usize..(d.first + d.count) as usize;
+            let xs = || frame.vertices[range.clone()].iter().map(|v| v.pos[0]);
+            let x0 = xs().fold(f32::MAX, f32::min);
+            let x1 = xs().fold(f32::MIN, f32::max);
+            if spans_width(x0, x1, frame.width as f32) {
+                stretch[range].fill(Some((x0, x1)));
+            }
+        }
         let clip = clip_matrices(frame);
         let mut verts = Vec::with_capacity(frame.vertices.len() * VERTEX_FLOATS);
-        for v in &frame.vertices {
-            let p = clip
+        for (v, stretch) in frame.vertices.iter().zip(stretch) {
+            let mut p = clip
                 .get(v.transform as usize)
                 .map_or([0.0; 4], |m| transform(m, v.pos));
+            match stretch {
+                // Rectangles are in pixels with w = 1.
+                Some((x0, x1)) => p[0] = 2.0 * (v.pos[0] - x0) / (x1 - x0) - 1.0,
+                None => p[0] /= wide,
+            }
             verts.extend_from_slice(&p);
             verts.extend_from_slice(&v.color);
             verts.extend_from_slice(&v.uv[0]);
@@ -632,7 +687,7 @@ impl Renderer {
                 let i = next;
                 next += 1;
                 let (key, bind) = &prepared[i];
-                let [x, y, w, h] = scissor(d.state.scissor, frame, width, height);
+                let [x, y, w, h] = scissor(d.state.scissor, frame, width, height, wide);
                 if w == 0 || h == 0 {
                     continue;
                 }
@@ -659,11 +714,28 @@ impl Renderer {
     }
 }
 
+/// Whether pixels `x0..x1` span a frame `fw` wide, give or take the border
+/// games often leave (a scissor of 10 to 310 in a 320-wide frame).
+fn spans_width(x0: f32, x1: f32, fw: f32) -> bool {
+    x0 <= fw * 0.1 && x1 >= fw * 0.9
+}
+
 /// The scissor box scaled from framebuffer pixels to the target, clamped to
-/// it, as x, y, width, height.
-fn scissor(s: Option<[f32; 4]>, frame: &Frame, width: u32, height: u32) -> [u32; 4] {
-    let [x0, y0, x1, y1] = s.unwrap_or([0.0, 0.0, f32::MAX, f32::MAX]);
-    let sx = width as f32 / frame.width as f32;
+/// it, as x, y, width, height. With `wide` above 1 (widescreen) a box
+/// spanning the whole frame width spans the whole target; others are
+/// narrowed about the centre as the geometry is.
+fn scissor(s: Option<[f32; 4]>, frame: &Frame, width: u32, height: u32, wide: f32) -> [u32; 4] {
+    let [mut x0, y0, mut x1, y1] = s.unwrap_or([0.0, 0.0, f32::MAX, f32::MAX]);
+    let fw = frame.width as f32;
+    if wide > 1.0 {
+        if spans_width(x0, x1, fw) {
+            (x0, x1) = (0.0, f32::MAX);
+        } else {
+            let c = fw * wide / 2.0;
+            (x0, x1) = (c + (x0 - fw / 2.0), c + (x1 - fw / 2.0));
+        }
+    }
+    let sx = width as f32 / (fw * wide);
     let sy = height as f32 / frame.height() as f32;
     let px = |v: f32, scale: f32, max: u32| ((v * scale).round().max(0.0) as u32).min(max);
     let (x0, x1) = (px(x0, sx, width), px(x1, sx, width));
@@ -993,7 +1065,7 @@ impl Renderer {
             format: Some(win.view_format),
             ..Default::default()
         });
-        let rect = fit(width, height, frame.width, frame.height());
+        let rect = self.place(frame, width, height);
         let (src, mut encoder) = self.draw(frame, rect.2, rect.3);
         blit.record(&self.device, &mut encoder, &src, &view, rect);
         self.queue.submit([encoder.finish()]);
@@ -1019,7 +1091,7 @@ impl Renderer {
             })
         });
         let blit = Blit::new(&self.device, COLOR_FORMAT);
-        let rect = fit(width, height, frame.width, frame.height());
+        let rect = self.place(frame, width, height);
         let (src, mut encoder) = self.draw(frame, rect.2, rect.3);
         blit.record(
             &self.device,
