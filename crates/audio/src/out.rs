@@ -118,10 +118,16 @@ mod speaker {
         pos: f64,
         /// False while filling the cushion, at the start and after running dry.
         playing: bool,
+        /// Seconds of sound kept queued: grows each time playback runs dry
+        /// (a game that cannot always keep up, as when interpreted), so
+        /// gaps stop at the cost of a little more delay.
+        cushion: f64,
     }
 
-    /// Seconds of sound kept queued.
+    /// Seconds of sound kept queued at first.
     const TARGET: f64 = 0.08;
+    /// Most the cushion grows to.
+    const MOST: f64 = 0.25;
     /// Most the playback speed is nudged: 0.5%, too little to hear.
     const NUDGE: f64 = 0.005;
 
@@ -132,7 +138,10 @@ mod speaker {
             if self.rate == 0 || dev_rate == 0 {
                 return [0.0; 2];
             }
-            let target = self.rate as f64 * TARGET;
+            if self.cushion == 0.0 {
+                self.cushion = TARGET;
+            }
+            let target = self.rate as f64 * self.cushion;
             if !self.playing {
                 if (self.frames.len() as f64) < target {
                     return [0.0; 2];
@@ -141,6 +150,7 @@ mod speaker {
             }
             if self.frames.len() < 2 {
                 self.playing = false;
+                self.cushion = (self.cushion * 1.5).min(MOST);
                 return [0.0; 2];
             }
             let t = self.pos as f32;
@@ -166,7 +176,7 @@ mod speaker {
             // Far behind (after a stall): skip back to the cushion in one jump
             // rather than clipping a little off every buffer.
             if self.frames.len() > (rate / 2).max(1) as usize {
-                let keep = (rate as f64 * TARGET) as usize;
+                let keep = (rate as f64 * self.cushion.max(TARGET)) as usize;
                 let drop = self.frames.len() - keep;
                 self.frames.drain(..drop);
             }
@@ -283,6 +293,18 @@ mod speaker {
                 assert_eq!(silent, 0, "gaps at drift {drift}");
                 assert!(most < 16000, "queue grew to {most} at drift {drift}");
             }
+        }
+
+        #[test]
+        fn running_dry_grows_the_cushion() {
+            let mut q = Queue::default();
+            q.push(32000, &[16384; 2 * 3000]);
+            while q.next(32000) != [0.0; 2] {}
+            // After the gap it waits for more than the first cushion.
+            q.push(32000, &[16384; 2 * 3000]);
+            assert_eq!(q.next(32000), [0.0; 2]);
+            q.push(32000, &[16384; 2 * 1000]);
+            assert_eq!(q.next(32000), [0.5; 2]);
         }
 
         #[test]
