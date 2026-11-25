@@ -22,6 +22,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
+use n64rusty_host::launcher::Page;
 use n64rusty_rom::{signature, Rom};
 use n64rusty_runner::{main_args, os, read_names, routine_list, Game};
 
@@ -89,17 +90,21 @@ fn console(_dir: &Path) -> Option<PathBuf> {
     None
 }
 
-#[cfg(windows)]
+/// The error on the 8-bit message screen, or in a plain Windows box when
+/// the program already used its one window loop (the game ran).
 fn error_box(text: &str) {
-    rfd::MessageDialog::new()
-        .set_title("n64rusty-play could not start the game")
-        .set_description(text)
-        .set_level(rfd::MessageLevel::Error)
-        .show();
+    let shown = n64rusty_host::launcher::message("Could not start", text);
+    #[cfg(windows)]
+    if !shown {
+        rfd::MessageDialog::new()
+            .set_title("n64rusty-play could not start the game")
+            .set_description(text)
+            .set_level(rfd::MessageLevel::Error)
+            .show();
+    }
+    #[cfg(not(windows))]
+    let _ = shown;
 }
-
-#[cfg(not(windows))]
-fn error_box(_text: &str) {}
 
 fn play(args: &mut Vec<String>, dir: &Path, plain: bool) -> ExitCode {
     // Its Game menu can go back to the start screen.
@@ -107,10 +112,17 @@ fn play(args: &mut Vec<String>, dir: &Path, plain: bool) -> ExitCode {
     let recent = dir.join("recent.txt");
     if args.first().is_none_or(|a| a.starts_with("--")) {
         let recent = n64rusty_host::menu::recent_roms();
-        if args.is_empty() && !recent.is_empty() {
+        let page = match args.as_slice() {
+            [] => Some(Page::Games),
+            [flag, page] if flag == "--screen" => Page::parse(page),
+            _ => None,
+        };
+        if let Some(page) = page {
+            let mut games = recent.clone();
+            games.extend(find_rom(dir).filter(|r| !recent.contains(r)));
             // The start screen has its own window, and a program gets one
             // window loop: the game plays in a fresh start of the program.
-            let Some(rom) = n64rusty_host::launcher::pick(&recent) else {
+            let Some(rom) = n64rusty_host::launcher::pick(&games, page) else {
                 return ExitCode::SUCCESS;
             };
             let started =
