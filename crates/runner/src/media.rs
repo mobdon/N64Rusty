@@ -20,6 +20,8 @@ use crate::devices::{Devices, Pad};
 const TASK_GFX: u32 = 1;
 /// `OSTask.t.type` of an audio task.
 const TASK_AUDIO: u32 = 2;
+/// Picture decode (inverse DCT and colour conversion of JPEG blocks).
+const TASK_JPEG: u32 = 4;
 /// Offset of `OSTask.t.data_ptr`: the display list or audio command list.
 const TASK_DATA_PTR: u32 = 0x30;
 /// Offset of `OSTask.t.data_size`.
@@ -215,6 +217,13 @@ impl Devices for Media {
             let (sound, mem) = (&mut self.sound, &mut ctx.mem);
             if let Err(e) = panic::catch_unwind(AssertUnwindSafe(|| sound.run(mem, list, len))) {
                 self.audio_failed = Some(panic_text(&*e));
+            }
+            return;
+        }
+        if kind == TASK_JPEG {
+            let data = ctx.mem.read_u32(task + TASK_DATA_PTR);
+            if data != 0 {
+                crate::jpeg::run(&mut ctx.mem, data);
             }
             return;
         }

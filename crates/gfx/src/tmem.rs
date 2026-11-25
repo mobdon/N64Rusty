@@ -291,7 +291,10 @@ impl Tmem {
         for k in 0..2 {
             let tile_size = tile_size(k);
             let period = 1 << t.mask[k].min(10);
-            let clamp = t.cm[k] & 2 != 0 && !(big && t.mask[k] != 0 && tile_size > period);
+            // With no mask the hardware cannot wrap, so it clamps whatever
+            // the clamp bit says.
+            let clamp = (t.cm[k] & 2 != 0 || t.mask[k] == 0)
+                && !(big && t.mask[k] != 0 && tile_size > period);
             size[k] = if t.mask[k] != 0 && !clamp {
                 1 << t.mask[k].min(10)
             } else {

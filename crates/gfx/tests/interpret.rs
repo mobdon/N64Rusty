@@ -177,7 +177,8 @@ fn loads_and_decodes_an_rgba16_texture() {
     assert_eq!(&t.rgba[..8], &[255, 0, 0, 255, 0, 255, 0, 255]);
     assert_eq!(&t.rgba[12..16], &[255, 255, 255, 255]);
     assert_eq!(&t.rgba[16..20], &[0, 0, 0, 0]);
-    assert_eq!(t.wrap, [Wrap::Repeat; 2]);
+    // No mask: the hardware cannot wrap, so the tile clamps.
+    assert_eq!(t.wrap, [Wrap::Clamp; 2]);
     assert_eq!(f.vertices[1].uv[0], [1.0, 0.0]);
     assert_eq!(f.vertices[2].uv[0], [0.0, 1.0]);
 }

@@ -8,6 +8,7 @@
 //! opened and no sound is played.
 
 pub mod devices;
+mod jpeg;
 pub mod live;
 pub mod media;
 pub mod os;
@@ -101,10 +102,17 @@ fn label(names: &BTreeMap<u32, String>, a: u32) -> String {
 /// all zero for code in the boot image).
 /// Both live in the per-game folder. `n64rusty translate` reads them to find
 /// code the game loads at run time.
+///
+/// Code no copy covers and that is not the boot image's own bytes was written
+/// by the game itself (unpacked, for example). Its line has rom `0xffffffff`
+/// and the RAM around it is saved to `images/<ram>_<addr>.bin` for translate.
 fn record_run(
     local: &std::path::Path,
     dma: &[(u32, u32, u32)],
     outcome: &os::Outcome,
+    ram_now: &[u8],
+    rom: &[u8],
+    entry: u32,
 ) -> std::io::Result<()> {
     use std::collections::BTreeSet;
     let read = |name: &str| std::fs::read_to_string(local.join(name)).unwrap_or_default();
@@ -123,16 +131,41 @@ fn record_run(
             let addr_text = rest.split_whitespace().next().unwrap_or("");
             let addr = u32::from_str_radix(addr_text.trim_start_matches("0x"), 16).unwrap_or(0);
             // Which copy put code there: the latest one covering it.
+            // The copy must still be what is there: the game may have
+            // written other code over it since (unpacking, for example).
+            let still_there = |r: u32, ram: u32| {
+                let (at, from) = (
+                    (addr & 0x1FFF_FFFC) as usize,
+                    (r + (addr & !3) - ram) as usize,
+                );
+                let n = 16.min(ram_now.len().saturating_sub(at));
+                rom.get(from..from + n)
+                    .is_some_and(|b| b == &ram_now[at..at + n])
+            };
             let src = dma
                 .iter()
                 .rev()
-                .find(|(_, ram, len)| addr >= *ram && addr < ram.wrapping_add(*len));
+                .find(|(_, ram, len)| addr >= *ram && addr < ram.wrapping_add(*len))
+                .filter(|(r, ram, _)| still_there(*r, *ram));
             // No copy covers it: code in the boot image reached only
             // through a pointer, written with a zero copy.
-            let (rom, ram, len) = src.copied().unwrap_or((0, 0, 0));
+            let mut found = src.copied().unwrap_or((0, 0, 0));
             if addr == 0 {
                 return Ok(());
             }
+            if src.is_none() {
+                if let Some((lo, hi)) = written_code(ram_now, rom, entry, addr) {
+                    let dir = local.join("images");
+                    std::fs::create_dir_all(&dir)?;
+                    let at = |a: u32| (a & 0x1FFF_FFFF) as usize;
+                    std::fs::write(
+                        dir.join(format!("{lo:08x}_{addr:08x}.bin")),
+                        &ram_now[at(lo)..at(hi)],
+                    )?;
+                    found = (u32::MAX, lo, hi - lo);
+                }
+            }
+            let (rom, ram, len) = found;
             let entry = format!("{addr:#010x} {rom:#010x} {ram:#010x} {len:#x}");
             let mut missing: BTreeSet<String> =
                 read("missing.txt").lines().map(str::to_string).collect();
@@ -146,6 +179,35 @@ fn record_run(
         }
     }
     Ok(())
+}
+
+/// The extent of code the game wrote into RAM around `addr`, if the bytes
+/// there are not the boot image's: out to the nearest 4 KiB of zero bytes on each
+/// side (padding between functions, and zeros in its data, are shorter), at most 4 MiB.
+fn written_code(ram: &[u8], rom: &[u8], entry: u32, addr: u32) -> Option<(u32, u32)> {
+    const GAP: usize = 4096;
+    const MAX: usize = 4 << 20;
+    let at = (addr & 0x1FFF_FFFF) as usize & !3;
+    let boot = (entry & 0x1FFF_FFFF) as usize;
+    let here = ram.get(at..at + 64)?;
+    let in_boot = at >= boot && rom.get(0x1000 + at - boot..0x1000 + at - boot + 64) == Some(here);
+    if in_boot {
+        return None;
+    }
+    let zero_run = |i: usize| {
+        ram.get(i..i + GAP)
+            .is_some_and(|b| b.iter().all(|&x| x == 0))
+    };
+    let mut lo = at;
+    while lo >= 4 && at - lo < MAX && !zero_run(lo.saturating_sub(GAP)) {
+        lo -= 4;
+    }
+    let mut hi = at;
+    while hi < ram.len() && hi - at < MAX && !zero_run(hi) {
+        hi += 4;
+    }
+    let base = addr & !0x1FFF_FFFF;
+    Some((base | lo as u32, base | hi as u32))
 }
 
 static NAMES: Mutex<BTreeMap<u32, String>> = Mutex::new(BTreeMap::new());
@@ -354,7 +416,6 @@ pub fn main_with(game: Game, devices: Option<Box<dyn devices::Devices>>) -> Exit
     };
     let names = read_names(&symbols);
     let by_name: BTreeMap<String, u32> = names.iter().map(|(a, n)| (n.clone(), *a)).collect();
-    *NAMES.lock().unwrap() = names;
 
     let mut ctx = boot(&rom, &game);
     let rom_bytes: Arc<[u8]> = Arc::from(rom.bytes());
@@ -364,8 +425,9 @@ pub fn main_with(game: Game, devices: Option<Box<dyn devices::Devices>>) -> Exit
         regs: Default::default(),
         flash: Default::default(),
     });
-    let hooked = os::install(&mut ctx, &by_name);
+    let hooked = os::install(&mut ctx, names.iter().map(|(a, n)| (n, a)));
     println!("replaced {} system routines", hooked.len());
+    *NAMES.lock().unwrap() = names;
 
     panic::set_hook(Box::new(|info| {
         let loc = info
@@ -429,9 +491,10 @@ fn run_and_report(
     save: save::Save,
     local: &std::path::Path,
 ) -> u8 {
+    let rom = rom_bytes.clone();
     let (outcome, report, frames_run) = os::run(ctx, entry, rom_bytes, frames, devices, save);
     let (_, dma, threads, device_summary) = os::summary();
-    if let Err(e) = record_run(local, &dma, &outcome) {
+    if let Err(e) = record_run(local, &dma, &outcome, ctx.mem.bytes(), &rom, entry) {
         eprintln!(
             "warning: could not write the run log in {}: {e}",
             local.display()
@@ -443,6 +506,11 @@ fn run_and_report(
         println!("  rom {rom_off:#09x} -> {ram:#010x} len {len:#x}");
     }
     println!("threads:\n{threads}");
+    // The thread that was on the CPU last keeps its registers in `ctx`.
+    println!(
+        "  last on the CPU: call at {:#010x}",
+        (ctx.r[31] as u32).wrapping_sub(8)
+    );
     print!("{device_summary}");
     match outcome {
         os::Outcome::Frames(n) => {

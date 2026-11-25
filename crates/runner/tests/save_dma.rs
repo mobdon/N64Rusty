@@ -34,7 +34,9 @@ fn game(c: &mut Ctx) {
         let b = c.mem.read_u8(BUF + k);
         c.mem.write_u8(BUF + k, b + 1);
     }
-    epi(c, 1, 0x20);
+    // Some games also put the full physical address in the request: the
+    // library ORs it with the base, so it is the same block.
+    epi(c, 1, 0x0800_0020);
 }
 
 #[test]

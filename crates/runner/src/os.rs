@@ -167,6 +167,8 @@ pub struct State {
     save: Save,
     /// Cartridge DMA requests seen: (ROM offset, RAM address, length).
     pub dma_log: Vec<(u32, u32, u32)>,
+    /// The serial interface's 64 bytes of PIF RAM.
+    pif: [u8; 64],
     /// Report text for a panic, filled by the panicking thread.
     report: String,
     /// The page buffer of a flash save chip.
@@ -262,7 +264,20 @@ impl State {
     fn describe_threads(&self) -> String {
         self.threads
             .values()
-            .map(|t| format!("  thread {:#010x} pri {} {:?}", t.id, t.pri, t.state))
+            .map(|t| {
+                // A switched-out thread is inside a system call: its return
+                // address says which guest code made it.
+                let from = t.regs.as_ref().map_or(String::new(), |r| {
+                    format!(" (call at {:#010x})", (r.r[31] as u32).wrapping_sub(8))
+                });
+                format!("  thread {:#010x} pri {} {:?}{from}", t.id, t.pri, t.state)
+            })
+            .chain(self.timers.iter().map(|(k, t)| {
+                format!(
+                    "  timer {k:#010x} due at count {:#x} posts to {:#010x}",
+                    t.at, t.mq
+                )
+            }))
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -565,6 +580,7 @@ pub fn run(
                 devices,
                 save,
                 dma_log: Vec::new(),
+                pif: [0; 64],
                 report: String::new(),
                 flash_page: [0xFF; 128],
             }),
@@ -992,7 +1008,9 @@ fn os_epi_start_dma(c: &mut Ctx) {
     let dev = c.mem.read_u32(mb + 0x0C);
     let len = c.mem.read_u32(mb + 0x10);
     let mut st = lock();
-    pi_dma(c, &mut st, dir, base.wrapping_add(dev), ram, len);
+    // The system library ORs the handle base with the device address: a
+    // handle may give the full address in either.
+    pi_dma(c, &mut st, dir, base | dev, ram, len);
     if mq != 0 {
         put_message(c, &mut st, mq, mb, false);
     }
@@ -1082,6 +1100,77 @@ fn os_cont_get_read_data(c: &mut Ctx) {
     write_pads(c, out, &pads);
 }
 
+/// __osSiRawStartDma(direction, buffer): moves the 64-byte command block
+/// between RAM and PIF RAM, answering the commands in it on the way in, and
+/// raises the serial interrupt as each transfer would.
+fn os_si_raw_start_dma(c: &mut Ctx) {
+    let (dir, buf) = (arg(c, 0), arg(c, 1));
+    let mut st = lock();
+    if dir == 1 {
+        for (k, b) in st.pif.iter_mut().enumerate() {
+            *b = c.mem.read_u8(buf + k as u32);
+        }
+        let pads = st.devices.pads();
+        run_pif(&mut st.pif, &pads);
+    } else {
+        for (k, &b) in st.pif.iter().enumerate() {
+            c.mem.write_u8(buf + k as u32, b);
+        }
+    }
+    post_event(c, &mut st, event::SI);
+    let _st = reschedule(c, st);
+    ret(c, 0);
+}
+
+/// Answers the controller commands in a PIF command block: per channel a
+/// send length, a reply length, the command and room for the reply. No
+/// pak is plugged in: pak reads and writes answer with a bad data CRC, as an
+/// empty slot does, and the status says no pak.
+fn run_pif(pif: &mut [u8; 64], pads: &[Pad; 4]) {
+    const NO_REPLY: u8 = 0x80;
+    let (mut i, mut ch) = (0, 0);
+    while i < 63 {
+        match pif[i] {
+            0xFE => break,
+            0xFF | 0xFD => i += 1,
+            0 => {
+                ch += 1;
+                i += 1;
+            }
+            t => {
+                let (tx, rx) = ((t & 0x3F) as usize, (pif[i + 1] & 0x3F) as usize);
+                let (cmd, at) = (i + 2, i + 2 + tx);
+                if at + rx > 63 {
+                    break;
+                }
+                let pad = pads.get(ch).filter(|p| p.connected);
+                let reply: Option<Vec<u8>> = pad.and_then(|p| match pif[cmd] {
+                    0x00 | 0xFF => Some(vec![0x05, 0x00, 0x00]),
+                    0x01 => Some(vec![
+                        (p.buttons >> 8) as u8,
+                        p.buttons as u8,
+                        p.stick_x as u8,
+                        p.stick_y as u8,
+                    ]),
+                    0x02 => Some([vec![0; 32], vec![0xFF]].concat()),
+                    0x03 => Some(vec![0xFF]),
+                    _ => None,
+                });
+                match reply {
+                    Some(r) => {
+                        let n = r.len().min(rx);
+                        pif[at..at + n].copy_from_slice(&r[..n]);
+                    }
+                    None => pif[i + 1] |= NO_REPLY,
+                }
+                i = at + rx;
+                ch += 1;
+            }
+        }
+    }
+    pif[63] = 0;
+}
+
 fn os_cont_get_query(c: &mut Ctx) {
     let out = arg(c, 0);
     let pads = lock().devices.pads();
@@ -1118,6 +1207,13 @@ fn ret_zero(c: &mut Ctx) {
 }
 
 fn nothing(_: &mut Ctx) {}
+
+/// New code is in place: functions of code the game wrote itself are
+/// checked against RAM again at their next call.
+fn os_inval_icache(c: &mut Ctx) {
+    let (ram, len) = (arg(c, 0), arg(c, 1));
+    c.code_written(ram, len);
+}
 
 fn os_set_int_mask(c: &mut Ctx) {
     // Interrupts are not modelled; report all enabled.
@@ -1170,6 +1266,7 @@ pub const HOOKS: &[(&str, GuestFn)] = &[
     ("osContStartQuery", os_cont_start),
     ("osContGetReadData", os_cont_get_read_data),
     ("osContGetQuery", os_cont_get_query),
+    ("__osSiRawStartDma", os_si_raw_start_dma),
     ("osSpTaskLoad", nothing),
     ("osSpTaskStartGo", os_sp_task_start_go),
     ("osSpTaskYield", nothing),
@@ -1182,7 +1279,7 @@ pub const HOOKS: &[(&str, GuestFn)] = &[
     ("osAiGetLength", ret_zero),
     ("osAiGetStatus", ret_zero),
     ("osInvalDCache", nothing),
-    ("osInvalICache", nothing),
+    ("osInvalICache", os_inval_icache),
     ("osWritebackDCache", nothing),
     ("osWritebackDCacheAll", nothing),
     ("osMapTLB", nothing),
@@ -1190,14 +1287,54 @@ pub const HOOKS: &[(&str, GuestFn)] = &[
 ];
 
 /// Installs the replacements over the routines found in `addrs`
-/// (role name to guest address). Returns the names installed.
-pub fn install(ctx: &mut Ctx, addrs: &BTreeMap<String, u32>) -> Vec<String> {
+/// (role name and guest address). A name may come more than once: a game can
+/// link a library routine into two segments. Returns the names installed.
+pub fn install<'a>(
+    ctx: &mut Ctx,
+    addrs: impl IntoIterator<Item = (&'a String, &'a u32)>,
+) -> Vec<String> {
     let mut done = Vec::new();
-    for (name, f) in HOOKS {
-        if let Some(&a) = addrs.get(*name) {
+    for (name, &a) in addrs {
+        if let Some((_, f)) = HOOKS.iter().find(|(h, _)| h == name) {
             ctx.set_override(a, *f);
-            done.push(name.to_string());
+            done.push(name.clone());
         }
     }
     done
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pif_answers_status_buttons_and_an_empty_pak() {
+        let pad = Pad {
+            connected: true,
+            buttons: 0x1000,
+            stick_x: 5,
+            stick_y: -3,
+        };
+        let pads = [pad, Pad::default(), Pad::default(), Pad::default()];
+        // Port 1: status (1 out, 3 back). Port 2: read buttons, unplugged.
+        let mut pif = [0u8; 64];
+        let block = [
+            1, 3, 0x00, 0xFF, 0xFF, 0xFF, 1, 4, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE,
+        ];
+        pif[..block.len()].copy_from_slice(&block);
+        run_pif(&mut pif, &pads);
+        assert_eq!(pif[3..6], [0x05, 0x00, 0x00]);
+        assert_eq!(pif[7] & 0x80, 0x80);
+        // Port 1: buttons.
+        let mut pif = [0u8; 64];
+        pif[..8].copy_from_slice(&[1, 4, 0x01, 0, 0, 0, 0, 0xFE]);
+        run_pif(&mut pif, &pads);
+        assert_eq!(pif[3..7], [0x10, 0x00, 5, 0xFD]);
+        // Port 1: pak read (3 out, 33 back) answers with a bad CRC.
+        let mut pif = [0u8; 64];
+        pif[..5].copy_from_slice(&[3, 33, 0x02, 0x00, 0x00]);
+        pif[38] = 0xFE;
+        run_pif(&mut pif, &pads);
+        assert_eq!(pif[37], 0xFF);
+    }
 }

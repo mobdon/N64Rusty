@@ -63,6 +63,9 @@ struct Explored {
     pointers: Vec<u32>,
     jump_targets: Vec<u32>,
     jump_tables: usize,
+    /// Reached a word no VR4300 decodes, or a jump in a delay slot: data,
+    /// not code (a call into code loaded over these bytes later).
+    bad: bool,
 }
 
 fn explore(img: &Image, s: u32, known: &BTreeSet<u32>) -> Explored {
@@ -74,6 +77,7 @@ fn explore(img: &Image, s: u32, known: &BTreeSet<u32>) -> Explored {
         pointers: Vec::new(),
         jump_targets: Vec::new(),
         jump_tables: 0,
+        bad: false,
     };
     let touch = |a: u32, end: &mut u32| *end = (*end).max(a + 4);
     while let Some(b) = work.pop() {
@@ -86,6 +90,10 @@ fn explore(img: &Image, s: u32, known: &BTreeSet<u32>) -> Explored {
             let Some(w) = img.word(a) else { break };
             touch(a, &mut ex.end);
             let i = Inst::decode(w);
+            // COP0 words the decoder leaves out (ERET) are still code.
+            let cti = |x: u32| Inst::decode(x).flow() != Flow::Next;
+            ex.bad |= (i.op == Op::Unknown && w >> 26 != 0x10)
+                || (cti(w) && img.word(a + 4).is_some_and(cti));
             // Track constants built with lui/addiu/ori, for function
             // pointers and for register jumps to a known address.
             let known_value = match i.op {
@@ -398,6 +406,21 @@ pub fn data_pointers(img: &Image) -> Vec<u32> {
 /// addresses must lie below `code_end`, which defaults to the end of the
 /// code reached from the entries.
 pub fn discover(img: &Image, entries: &[u32], hints: &[u32], code_end: Option<u32>) -> Discovery {
+    discover_layout(img, entries, hints, &[], code_end)
+}
+
+/// [`discover`], plus `layout`: places the image's layout suggests a
+/// function starts. Unlike a hint, one is dropped where it lands inside a
+/// function found from an earlier address, and where it decodes as data.
+/// With a layout, a function is not cut short where another starts.
+pub fn discover_layout(
+    img: &Image,
+    entries: &[u32],
+    hints: &[u32],
+    layout: &[u32],
+    code_end: Option<u32>,
+) -> Discovery {
+    let layout: BTreeSet<u32> = layout.iter().copied().collect();
     let mut known: BTreeSet<u32> = BTreeSet::new();
     let mut done: BTreeMap<u32, Explored> = BTreeMap::new();
     let mut queue: Vec<u32> = entries
@@ -416,7 +439,14 @@ pub fn discover(img: &Image, entries: &[u32], hints: &[u32], code_end: Option<u3
             if done.contains_key(&s) {
                 continue;
             }
+            let inside_done = done.range(..s).next_back().is_some_and(|(_, e)| s < e.end);
+            if layout.contains(&s) && !hints.contains(&s) && inside_done {
+                continue;
+            }
             let ex = explore(img, s, &known);
+            if ex.bad && !entries.contains(&s) {
+                continue;
+            }
             for &c in &ex.calls {
                 if c < call_end && img.contains(c) && known.insert(c) {
                     queue.push(c);
@@ -446,6 +476,7 @@ pub fn discover(img: &Image, entries: &[u32], hints: &[u32], code_end: Option<u3
             .iter()
             .map(|&a| (a, true))
             .chain(pointers.into_iter().map(|a| (a, false)))
+            .chain(layout.iter().map(|&a| (a, false)))
         {
             if known.contains(&a) || !img.contains(a) {
                 continue;
@@ -455,7 +486,9 @@ pub fn discover(img: &Image, entries: &[u32], hints: &[u32], code_end: Option<u3
             // pair must also start like a function and not land inside one
             // already found.
             let ok = a < code_end
-                && (from_hint || (looks_like_prologue(img.word(a).unwrap()) && !inside_known(a)));
+                && (from_hint
+                    || ((layout.contains(&a) || looks_like_prologue(img.word(a).unwrap()))
+                        && !inside_known(a)));
             if !ok {
                 continue;
             }
@@ -486,6 +519,9 @@ pub fn discover(img: &Image, entries: &[u32], hints: &[u32], code_end: Option<u3
         if fresh.is_empty() {
             break;
         }
+        // Lowest address first, so a layout start inside a function found
+        // in this same round is seen to be inside it.
+        fresh.sort_unstable_by(|a, b| b.cmp(a));
         queue = fresh;
     }
 
@@ -496,7 +532,16 @@ pub fn discover(img: &Image, entries: &[u32], hints: &[u32], code_end: Option<u3
         let ex = &done[&s];
         jump_tables += ex.jump_tables;
         let next = starts.get(n + 1).copied().unwrap_or(u32::MAX);
-        let end = ex.end.min(next).max(s + 4);
+        // A start inside another function usually means the explorer ran
+        // on into the next function. Code saved from RAM also holds stale
+        // code whose calls land mid-function: there each function keeps all
+        // it reaches, and overlapping translations are harmless.
+        let end = if layout.is_empty() {
+            ex.end.min(next)
+        } else {
+            ex.end
+        }
+        .max(s + 4);
         let words = (s..end).step_by(4).map_while(|a| img.word(a)).collect();
         let mut f = Function::new(s, words);
         f.jump_targets = ex
@@ -597,6 +642,47 @@ mod tests {
             bytes: &bytes,
         };
         assert_eq!(data_pointers(&img), vec![0x1000]);
+    }
+
+    #[test]
+    fn layout_starts_inside_a_function_are_dropped() {
+        // f: beq zero,zero,+2 ; nop ; nop(skipped) ; jr ra ; nop | g: jr ra ; nop
+        let bytes = image(&[0x1000_0002, NOP, NOP, JR_RA, NOP, JR_RA, NOP]);
+        let img = Image {
+            base: BASE,
+            bytes: &bytes,
+        };
+        let d = discover_layout(
+            &img,
+            &[],
+            &[],
+            &[BASE, BASE + 8, BASE + 20],
+            Some(BASE + 28),
+        );
+        let starts: Vec<u32> = d.functions.iter().map(|f| f.addr).collect();
+        assert_eq!(starts, vec![BASE, BASE + 20]);
+    }
+
+    #[test]
+    fn drops_calls_into_data() {
+        // f: jal g ; nop ; jr ra ; nop | g: data (an op no VR4300 has), and
+        // a jal from that data into the middle of f is not followed.
+        let bytes = image(&[
+            jal(BASE + 16),
+            NOP,
+            JR_RA,
+            NOP,
+            0xF140_F23F,
+            jal(BASE + 4),
+            NOP,
+        ]);
+        let img = Image {
+            base: BASE,
+            bytes: &bytes,
+        };
+        let d = discover(&img, &[BASE], &[], None);
+        let starts: Vec<u32> = d.functions.iter().map(|f| f.addr).collect();
+        assert_eq!(starts, vec![BASE]);
     }
 
     #[test]

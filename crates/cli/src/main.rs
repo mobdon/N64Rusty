@@ -11,7 +11,7 @@ use std::process::ExitCode;
 
 use n64rusty_rom::{Rom, BOOT_SEGMENT_ROM, BOOT_SEGMENT_SIZE};
 use n64rusty_translator::discover::{
-    data_pointers, discover, function_starts, overlay_table, Image,
+    data_pointers, discover, discover_layout, function_starts, overlay_table, Discovery, Image,
 };
 use n64rusty_translator::{emit, translate_function};
 
@@ -28,6 +28,7 @@ COMMANDS:
                                Print a symbol map for <rom>: each routine named
                                in the reference map whose code (addresses
                                masked) is found once in <rom>'s boot segment
+                               or in code saved from its runs' RAM
     version                    Print tool and runtime versions
     help                       Print this message
 
@@ -112,6 +113,55 @@ fn read_symbols(path: &Path) -> Result<Vec<(u32, String)>, String> {
         if let Ok(a) = u32::from_str_radix(hex, 16) {
             out.push((a, name.trim().to_string()));
         }
+    }
+    Ok(out)
+}
+
+/// The `missing.txt` rom column of code the game wrote into RAM itself.
+const WRITTEN: u32 = u32::MAX;
+
+/// The code in each RAM image a run saved under `images/<ram>_<call>.bin`
+/// (see the runner's `record_run`), found from the call that missed, as one
+/// module each.
+/// Discovery starts from that call; every function start the layout of the
+/// image shows is taken too, unless it lands inside one already found. The image may also hold other code loaded nearby:
+/// harmless, since each function only runs while its bytes are in RAM, and
+/// what decodes as data is dropped.
+fn written_images(local: &Path) -> Result<Vec<(String, Discovery)>, String> {
+    let mut out = Vec::new();
+    let Ok(dir) = fs::read_dir(local.join("images")) else {
+        return Ok(out);
+    };
+    let mut paths: Vec<PathBuf> = dir.flatten().map(|e| e.path()).collect();
+    paths.sort();
+    for path in paths {
+        let stem = path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let hex: Vec<u32> = stem
+            .split('_')
+            .filter_map(|h| u32::from_str_radix(h, 16).ok())
+            .collect();
+        let [base, called] = hex[..] else {
+            continue;
+        };
+        let bytes = fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let img = Image {
+            base,
+            bytes: &bytes,
+        };
+        let end = base.wrapping_add(bytes.len() as u32);
+        // Only the call that saved this image: other misses in the same
+        // range may have been into other code loaded there at other times.
+        let entries = vec![called];
+        let mut layout = function_starts(&img);
+        layout.extend(data_pointers(&img));
+        out.push((
+            format!("img_{stem}"),
+            discover_layout(&img, &entries, &[], &layout, Some(end)),
+        ));
     }
     Ok(out)
 }
@@ -272,7 +322,7 @@ fn translate(args: &[String]) -> Result<(), String> {
     let stale = before - found.functions.len();
     // One overlay per distinct copy, with every address seen missing there.
     let mut regions: BTreeMap<(u32, u32, u32), Vec<u32>> = BTreeMap::new();
-    for m in missing.iter().filter(|m| m[3] != 0) {
+    for m in missing.iter().filter(|m| m[3] != 0 && m[1] != WRITTEN) {
         regions.entry((m[1], m[2], m[3])).or_default().push(m[0]);
     }
     // Any other copy that is laid out like code is code too: a game loads
@@ -377,6 +427,9 @@ fn translate(args: &[String]) -> Result<(), String> {
         }
     }
 
+    // Code the game wrote into RAM itself, saved by runs that called into it.
+    let images = written_images(&local)?;
+
     let mut failed = Vec::new();
     let mut translate_one = |f: &n64rusty_translator::Function| {
         let mut f = f.clone();
@@ -413,6 +466,23 @@ fn translate(args: &[String]) -> Result<(), String> {
             file.push('\n');
         }
         files.insert(format!("ovl_{r:07x}_{ram:08x}"), file);
+    }
+    // Image functions are checked against RAM by their bytes, so one found in
+    // several saved images is emitted once.
+    let mut image_fns: Vec<(String, u32, u32, u64)> = Vec::new();
+    let mut seen_fns = std::collections::HashSet::new();
+    for (module, d) in &images {
+        let mut file = HEADER.to_string();
+        for f in &d.functions {
+            let bytes: Vec<u8> = f.words.iter().flat_map(|w| w.to_be_bytes()).collect();
+            let hash = n64rusty_runtime::code_hash(&bytes);
+            if seen_fns.insert((f.addr, hash)) {
+                file.push_str(&translate_one(f));
+                file.push('\n');
+                image_fns.push((module.clone(), f.addr, bytes.len() as u32, hash));
+            }
+        }
+        files.insert(module.clone(), file);
     }
 
     // Each file of generated code is its own crate under `parts/`, so a
@@ -466,6 +536,13 @@ fn translate(args: &[String]) -> Result<(), String> {
             );
         }
         register.push_str("    ]);\n");
+    }
+    for (module, addr, len, hash) in &image_fns {
+        let _ = writeln!(
+            register,
+            "    ctx.register_image_fn({addr:#010x}, {len:#x}, {hash:#018x}, {module}::{});",
+            emit::fn_name(*addr)
+        );
     }
     register.push_str("}\n");
     lib.push('\n');
@@ -561,6 +638,20 @@ fn masked(w: u32) -> u32 {
     }
 }
 
+/// Whether word `i` can start a routine: it is the first word, or the words
+/// before it (past any padding) end one with `jr ra` or a `j` and its delay slot.
+/// Short routines otherwise match the tail of a longer one.
+fn starts_function(w: &[u32], i: usize) -> bool {
+    let ends = |k: usize| w[k] == 0x03E0_0008 || w[k] >> 26 == 2;
+    let mut j = i;
+    while j > 0 && w[j - 1] == 0 {
+        j -= 1;
+    }
+    i == 0
+        || (i >= 2 && ends(i - 2))
+        || (j < i && ((j >= 1 && ends(j - 1)) || (j >= 2 && ends(j - 2))))
+}
+
 fn words(seg: &[u8]) -> Vec<u32> {
     seg.chunks_exact(4)
         .map(|c| u32::from_be_bytes(c.try_into().unwrap()))
@@ -603,7 +694,7 @@ fn find_routines(
             .into_iter()
             .flatten()
             .copied()
-            .filter(|&i| mtgt.get(i..i + len) == Some(c))
+            .filter(|&i| starts_function(target, i) && mtgt.get(i..i + len) == Some(c))
             .collect();
         if let [i] = hits[..] {
             found.insert(k, base + 4 * i as u32);
@@ -692,13 +783,44 @@ fn match_routines(args: &[String]) -> Result<(), String> {
         }
         routines.push((*a, n.clone(), len.min(0x1000)));
     }
-    let found = find_routines(
+    let mut found = find_routines(
         &ref_words,
         ref_base,
         &routines,
         &words(rom.boot_segment()),
         rom.entry(),
     );
+    // Also the code runs saved from RAM (`images/`), for library routines
+    // the game keeps in code it unpacks itself.
+    let images = PathBuf::from("local").join(&rom.sha256).join("images");
+    let mut saved: Vec<PathBuf> = fs::read_dir(&images)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    saved.sort();
+    for p in saved {
+        let stem = p
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let Some(base) = stem
+            .split('_')
+            .next()
+            .and_then(|h| u32::from_str_radix(h, 16).ok())
+        else {
+            continue;
+        };
+        let bytes = fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+        for (a, n) in find_routines(&ref_words, ref_base, &routines, &words(&bytes), base) {
+            if found.iter().all(|(fa, fname)| *fa != a && *fname != n) {
+                found.push((a, n));
+            }
+        }
+    }
+    found.sort();
     eprintln!(
         "{} of {} reference routines found",
         found.len(),
@@ -735,6 +857,26 @@ mod tests {
         // f found twice: neither is named.
         target.extend([0x3C04_8002, jal(B + 32), 0x2484_0020, 0x03E0_0008]);
         assert!(find_routines(&reference, B, &routines, &target, B).is_empty());
+    }
+
+    #[test]
+    fn matches_only_at_routine_starts() {
+        // A 3-word routine whose shape is also the tail of a longer one.
+        let reference = [0x8C82_0010, 0x03E0_0008, 0];
+        let routines = [(0x8000_0400, "g".to_string(), 3)];
+        let target = [
+            0x2484_0001,
+            0x8C82_0010,
+            0x03E0_0008,
+            0,
+            0x03E0_0008,
+            0,
+            0x8C82_0010,
+            0x03E0_0008,
+            0,
+        ];
+        let r = find_routines(&reference, 0x8000_0400, &routines, &target, 0x8000_0400);
+        assert_eq!(r, vec![(0x8000_0418, "g".to_string())]);
     }
 
     #[test]
