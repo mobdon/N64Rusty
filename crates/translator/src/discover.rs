@@ -238,9 +238,22 @@ fn opens_frame(img: &Image, a: u32) -> bool {
         .any(looks_like_prologue)
 }
 
+/// Whether `a` starts a short function with no stack frame: every word
+/// decodes, and a `jr $ra` comes within 32 words. Data between a return
+/// and the next one rarely does both.
+fn is_leaf(img: &Image, a: u32) -> bool {
+    const JR_RA: u32 = 0x03E0_0008;
+    let words: Vec<u32> = (0..32).map_while(|k| img.word(a + 4 * k)).collect();
+    words.iter().position(|&w| w == JR_RA).is_some_and(|k| {
+        words[..=k]
+            .iter()
+            .all(|&w| Inst::decode(w).op != Op::Unknown)
+    })
+}
+
 /// Places that start a function by their layout: the image's first word,
 /// or the first non-zero word after a `jr $ra` and its delay slot, when it
-/// opens a stack frame (see [`opens_frame`]). For code copied in at run
+/// opens a stack frame (see [`opens_frame`]) or is a leaf (see [`is_leaf`]). For code copied in at run
 /// time, whose functions are mostly reached through pointers set up by code.
 pub fn function_starts(img: &Image) -> Vec<u32> {
     const JR_RA: u32 = 0x03E0_0008;
@@ -248,13 +261,20 @@ pub fn function_starts(img: &Image) -> Vec<u32> {
     let mut out = Vec::new();
     let mut a = img.base;
     let mut after_return = true;
+    // Furthest place a branch so far jumps forward to: code up to there
+    // still belongs to the function before, even past a return.
+    let mut reach = 0;
     while a < end {
         let w = img.word(a).unwrap_or(0);
         if after_return && w != 0 {
-            if opens_frame(img, a) {
+            if opens_frame(img, a) || (a > reach && is_leaf(img, a)) {
                 out.push(a);
             }
             after_return = false;
+        }
+        let i = Inst::decode(w);
+        if matches!(i.flow(), Flow::Branch { link: false, .. }) {
+            reach = reach.max(i.branch_target(a));
         }
         if w == JR_RA {
             after_return = true;
@@ -528,7 +548,16 @@ mod tests {
             base: BASE,
             bytes: &bytes,
         };
-        assert_eq!(function_starts(&img), [BASE, BASE + 0x14]);
+        // The leaf counts; the data after it reaches no return.
+        assert_eq!(function_starts(&img), [BASE, BASE + 0x14, BASE + 0x20]);
+        // Code after a return that a branch before it reaches is not a leaf.
+        let words = [0x1080_0003, NOP, JR_RA, NOP, 0x2402_0001, JR_RA, NOP];
+        let bytes = image(&words);
+        let img = Image {
+            base: BASE,
+            bytes: &bytes,
+        };
+        assert_eq!(function_starts(&img), [BASE]);
         // A frame opened after a scheduled `lui` still starts a function.
         let words = [JR_RA, NOP, 0x3C0E_800A, FRAME, JR_RA, NOP];
         let bytes = image(&words);
@@ -536,7 +565,7 @@ mod tests {
             base: BASE,
             bytes: &bytes,
         };
-        assert_eq!(function_starts(&img), [BASE + 8]);
+        assert_eq!(function_starts(&img), [BASE, BASE + 8]);
     }
 
     #[test]
