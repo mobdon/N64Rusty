@@ -130,3 +130,38 @@ the hash test is headless and only reads RAM, and the server is a separate
 binary. Step 4 touches the runner's input path, so it should wait until the
 controller input work has merged. Steps 1-3 also help single player: they
 catch nondeterminism bugs that show up as rare crashes.
+
+## 6. Notes per game
+
+Short notes from each game brought up, so the plan keeps up with what real
+games need. Games are described, not named.
+
+### Single-player adventure with compressed files (third game)
+
+- **Save type.** 32 KB battery SRAM, reached through PI DMA on a hand-built
+  handle whose base is the KSEG1 address of the SRAM domain. A new file is
+  written as soon as it is named, so both players must start from the same
+  save, as in section 3.
+- **Players.** One player. Online play would mean a shared session or co-op
+  built on top, not a versus match; lockstep from boot still applies.
+- **Determinism concerns.**
+  - Almost all code is unpacked into RAM by the game at run time, and some of
+    it is relocated to wherever the heap puts it. Translated functions only
+    run while their exact bytes are in RAM, so both peers need the same
+    translation build and the same saved images, and the heap must lay out
+    the same way on both sides.
+  - Decompression runs on the DMA thread, which raises and lowers its own
+    priority around each file. Loads finish asynchronously and the game polls
+    for them, so load timing must come only from virtual time, never from
+    host speed.
+  - Pre-rendered room pictures are unpacked by an RSP picture-decode task.
+    Its output feeds the frame and the depth buffer, so the decode must be
+    bit-identical on every host (it uses floating point today).
+- **Input quirks.** The controller manager probes for a controller pak (and
+  rumble) every few frames with raw serial transfers. The answers must be the
+  same on both sides, so report "no pak" to everyone. A peer's pad reported
+  as unplugged changes the game's control flow.
+- **Timing.** The game runs at 20 frames a second during play over 60 Hz
+  retraces and uses a 3-second timeout timer on graphics tasks. Lockstep
+  should count retraces, not game frames. Audio runs a task about every
+  retrace from its own thread.
