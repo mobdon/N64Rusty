@@ -14,7 +14,6 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use crate::config::RunConfig;
-use crate::mapping::gamepad_pad;
 use crate::pad::Pads;
 use crate::session::{Guest, Pacer, Session, Tick};
 
@@ -41,6 +40,7 @@ pub fn run_windowed<G: Guest>(guest: G, cfg: &RunConfig) -> Result<G, String> {
         window: None,
         keys: HashSet::new(),
         gilrs,
+        named: Vec::new(),
         error: None,
     };
     event_loop.run_app(&mut app).map_err(|e| e.to_string())?;
@@ -59,6 +59,8 @@ struct App<G> {
     window: Option<Arc<Window>>,
     keys: HashSet<KeyCode>,
     gilrs: Option<Gilrs>,
+    /// Controllers already named on the console.
+    named: Vec<gilrs::GamepadId>,
     error: Option<String>,
 }
 
@@ -70,13 +72,20 @@ impl<G: Guest> App<G> {
             while g.next_event().is_some() {} // keeps gilrs' cached state current
         }
         let connected: Vec<_> = gilrs.iter().flat_map(|g| g.gamepads()).collect();
+        // Name each controller once, so a person can see it was found.
+        for (n, (id, gp)) in connected.iter().enumerate() {
+            if !self.named.contains(id) {
+                self.named.push(*id);
+                println!("controller gamepad{n}: {}", gp.name());
+            }
+        }
         for (pad, port) in pads.iter_mut().zip(&self.cfg.ports) {
             if let Some(map) = &port.keyboard {
                 *pad = pad.merge(map.pad(&self.keys));
             }
             for &n in &port.gamepads {
                 if let Some((_, gp)) = connected.get(n) {
-                    *pad = pad.merge(gamepad_pad(|b| gp.is_pressed(b), |a| gp.value(a)));
+                    *pad = pad.merge(port.pad.pad(|b| gp.is_pressed(b), |a| gp.value(a)));
                 }
             }
         }

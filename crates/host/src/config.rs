@@ -17,6 +17,9 @@
 //! [[port]]                          # ports 1 to 4, in order
 //! sources = ["keyboard", "gamepad0"]
 //! keys = { KeyJ = "A", KeyK = "B" } # replaces the default layout
+//! pad = { A = "A", X = "B", RB = "Z" } # gamepad buttons (Xbox names)
+//! deadzone = 0.15                   # left stick travel that counts as centred
+//! sensitivity = 1.0                 # left stick scale
 //! ```
 //!
 //! Relative paths are relative to the config file. Unknown keys are errors,
@@ -28,7 +31,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::mapping::{parse_key, Binding, KeyMap};
+use crate::mapping::{parse_key, parse_pad_button, Binding, KeyMap, PadMap};
 
 /// NTSC field rate. The video interface's own timing replaces this once
 /// the renderer reads it.
@@ -73,13 +76,15 @@ pub struct PortConfig {
     pub keyboard: Option<KeyMap>,
     /// Gamepads, by connection order (0 is the first connected).
     pub gamepads: Vec<usize>,
+    /// The gamepad layout for this port's gamepads.
+    pub pad: PadMap,
 }
 
 impl Default for RunConfig {
     fn default() -> Self {
         let pad = |n| PortConfig {
-            keyboard: None,
             gamepads: vec![n],
+            ..PortConfig::default()
         };
         RunConfig {
             frames: None,
@@ -93,6 +98,7 @@ impl Default for RunConfig {
                 PortConfig {
                     keyboard: Some(KeyMap::default()),
                     gamepads: vec![0],
+                    pad: PadMap::default(),
                 },
                 pad(1),
                 pad(2),
@@ -123,6 +129,9 @@ struct RawPort {
     #[serde(default)]
     sources: Vec<String>,
     keys: Option<BTreeMap<String, String>>,
+    pad: Option<BTreeMap<String, String>>,
+    deadzone: Option<f32>,
+    sensitivity: Option<f32>,
 }
 
 impl RunConfig {
@@ -197,6 +206,29 @@ fn port(raw: RawPort) -> Result<PortConfig, String> {
             .collect::<Result<_, String>>()?;
         port.keyboard = Some(KeyMap(map));
     }
+    if (raw.pad.is_some() || raw.deadzone.is_some() || raw.sensitivity.is_some())
+        && port.gamepads.is_empty()
+    {
+        return Err("pad settings given but no gamepad is a source".into());
+    }
+    if let Some(buttons) = raw.pad {
+        port.pad.buttons = buttons
+            .iter()
+            .map(|(k, b)| Ok((parse_pad_button(k)?, Binding::parse(b)?)))
+            .collect::<Result<_, String>>()?;
+    }
+    if let Some(d) = raw.deadzone {
+        if !(0.0..0.9).contains(&d) {
+            return Err(format!("deadzone {d} is not from 0 to 0.9"));
+        }
+        port.pad.deadzone = d;
+    }
+    if let Some(k) = raw.sensitivity {
+        if !(0.1..=4.0).contains(&k) {
+            return Err(format!("sensitivity {k} is not from 0.1 to 4"));
+        }
+        port.pad.sensitivity = k;
+    }
     Ok(port)
 }
 
@@ -237,6 +269,9 @@ mod tests {
             keys = { KeyJ = "A", KeyW = "STICK_UP" }
             [[port]]
             sources = ["gamepad0", "gamepad2"]
+            pad = { RB = "A", lt = "STICK_UP" }
+            deadzone = 0.25
+            sensitivity = 1.5
         "#;
         let cfg = RunConfig::parse(text, Path::new("runs")).unwrap();
         assert_eq!(cfg.frames, Some(600));
@@ -251,6 +286,17 @@ mod tests {
             ]))
         );
         assert_eq!(cfg.ports[1].gamepads, vec![0, 2]);
+        assert_eq!(
+            cfg.ports[1].pad,
+            PadMap {
+                buttons: vec![
+                    (gilrs::Button::RightTrigger, Binding::Button(button::A)),
+                    (gilrs::Button::LeftTrigger2, Binding::StickUp),
+                ],
+                deadzone: 0.25,
+                sensitivity: 1.5,
+            }
+        );
         assert_eq!(cfg.ports[2], PortConfig::default());
     }
 
@@ -261,6 +307,18 @@ mod tests {
             ("debug_port = \"0.0.0.0:6464\"", "loopback"),
             ("frame_rate = 0", "between"),
             ("[[port]]\nsources = [\"mouse\"]", "unknown source"),
+            (
+                "[[port]]\nsources = [\"keyboard\"]\ndeadzone = 0.1",
+                "no gamepad",
+            ),
+            (
+                "[[port]]\nsources = [\"gamepad0\"]\npad = { Guide = \"A\" }",
+                "unknown pad button",
+            ),
+            (
+                "[[port]]\nsources = [\"gamepad0\"]\nsensitivity = 9",
+                "sensitivity",
+            ),
             (
                 "[[port]]\nsources = [\"gamepad0\"]\nkeys = { KeyJ = \"A\" }",
                 "not a source",

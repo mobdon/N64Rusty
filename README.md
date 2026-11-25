@@ -177,8 +177,12 @@ it).
   the stick (left Shift for half tilt), J is A, K is B, Space is Z, Enter is
   Start, Q and E are L and R, T F G H (or numpad 8 4 5 6) are the C buttons
   and 1 to 4 the D-pad. The arrow keys are not used. Keys can be remapped per
-  port. Gamepads: south face button A, west B, left trigger Z, shoulders L and
-  R, right stick the C buttons.
+  port. Gamepads (Xbox layout): A is A, X is B, B and Y are C-down and C-up,
+  LT and RB are Z, LB is L, RT is R, Start is Start, the left stick is the
+  stick, the right stick the C buttons and the d-pad the d-pad. Each port's
+  pad buttons, stick deadzone and sensitivity can be changed in `run.toml`,
+  and controllers can be plugged in while the game runs. Each one is named on
+  the console when found (`controller gamepad0: ...`).
 - **Record and replay.** Input scripts are plain text anchored on frame
   numbers (`frame port buttons x y`, one change per line), so they can be
   written by hand as well as recorded. A recording is written as the run goes,

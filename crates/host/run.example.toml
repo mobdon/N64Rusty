@@ -17,6 +17,13 @@ sources = ["keyboard", "gamepad0"]
 # keys = { KeyJ = "A", KeyK = "B" }  # replaces the default layout; winit key
 #                                     # names (KeyW, Space, ShiftLeft, Digit1).
 #                                     # Arrow keys are refused: movement is WASD.
+# Gamepad layout (Xbox names: A B X Y LB RB LT RT Start Back LS RS DPadUp
+# DPadDown DPadLeft DPadRight). Giving pad replaces the whole default:
+# pad = { A = "A", X = "B", B = "C_DOWN", Y = "C_UP", LT = "Z", RB = "Z", LB = "L", RT = "R", Start = "START", DPadUp = "D_UP", DPadDown = "D_DOWN", DPadLeft = "D_LEFT", DPadRight = "D_RIGHT" }
+# deadzone = 0.15     # left stick travel that still counts as centred (0 to 0.9)
+# sensitivity = 1.0   # left stick scale; 1.25 reaches full tilt sooner (0.1 to 4)
+# The right stick is always the C buttons. To make another pad player 1,
+# use sources = ["gamepad1"]; for keyboard only, sources = ["keyboard"].
 [[port]]
 sources = ["gamepad1"]
 [[port]]
