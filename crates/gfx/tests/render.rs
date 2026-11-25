@@ -452,3 +452,42 @@ fn widescreen_stretches_a_row_of_background_tiles() {
     assert_px(&img, 2, 180, BLUE);
     assert_px(&img, 120, 180, GREEN);
 }
+
+#[test]
+fn sharp_textures_keep_texels_flat_when_upscaled() {
+    let Some(mut r) = renderer() else { return };
+    let mut ram = Ram::default();
+    // 4x1 RGBA16 row: red, green, red, green (one 64-bit line).
+    let mut tex = Vec::new();
+    for t in [0xF801u16, 0x07C1, 0xF801, 0x07C1] {
+        tex.extend_from_slice(&t.to_be_bytes());
+    }
+    let tex = ram.put(&tex);
+    let dl = scene(&mut ram, |_, dl| {
+        // Bilinear filtering, one texel per pixel, as small text is drawn.
+        dl.other_modes(CYCLE_1 | 2 << 12, 0)
+            .combine(pass(TEXEL0))
+            .timg(0, 2, 1, tex)
+            .tile(0, 2, 0, 0, 7)
+            .load_block(7, 4)
+            .tile(0, 2, 1, 0, 0)
+            .tile_size(0, 4, 1)
+            .tex_rect(0, [100, 100, 104, 101], [0, 0], [1 << 10, 1 << 10]);
+    });
+    let f = frame(&mut ram, &dl);
+    let green = [0, 255, 0, 255];
+    // Every screen pixel of every texel shows that texel, at any scale.
+    for scale in [2, 3, 6] {
+        let img = r.render(&f, 320 * scale, 240 * scale).unwrap();
+        for (i, want) in [RED, green, RED, green].into_iter().enumerate() {
+            let x0 = (100 + i as u32) * scale;
+            // Leave the one blended pixel at each texel edge.
+            for x in x0 + 1..x0 + scale - 1 {
+                assert_px(&img, x, 100 * scale + scale / 2, want);
+            }
+            if scale == 2 {
+                assert_px(&img, x0, 201, want);
+            }
+        }
+    }
+}
