@@ -9,8 +9,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use n64rusty_rom::{Rom, BOOT_SEGMENT_ROM};
-use n64rusty_translator::discover::{data_pointers, discover, function_starts, Image};
+use n64rusty_rom::{Rom, BOOT_SEGMENT_ROM, BOOT_SEGMENT_SIZE};
+use n64rusty_translator::discover::{
+    data_pointers, discover, function_starts, overlay_table, Image,
+};
 use n64rusty_translator::{emit, translate_function};
 
 const USAGE: &str = "\
@@ -287,6 +289,23 @@ fn translate(args: &[String]) -> Result<(), String> {
             regions.insert((r, ram, len), Vec::new());
         }
     }
+    // Code the game's own load tables describe but no run has copied yet,
+    // so a mode nobody has played yet still has its code. A copy seen in a
+    // run that maps the same start the same way wins: it has the real
+    // length and pieces.
+    let mut planned = 0;
+    for (r, ram, len) in overlay_table(rom.bytes()) {
+        let in_boot = r.wrapping_sub(boot_rom) < BOOT_SEGMENT_SIZE as u32;
+        let seen = dma.iter().any(|d| {
+            d[2] > 0
+                && r.wrapping_sub(d[0]) < d[2]
+                && r.wrapping_sub(d[0]) == ram.wrapping_sub(d[1])
+        });
+        if !in_boot && !seen && !regions.contains_key(&(r, ram, len)) {
+            regions.insert((r, ram, len), Vec::new());
+            planned += 1;
+        }
+    }
     // Games often copy one long piece of code in several back-to-back
     // copies. Discovery looks at the whole run (so jump tables and calls
     // that cross a copy's edge resolve); each copy then gets the functions
@@ -474,7 +493,7 @@ fn translate(args: &[String]) -> Result<(), String> {
     }
 
     let mut report = format!(
-        "rom sha256: {}\nentry: {:#010x}\nboot segment: {:#010x}..{:#010x}\ncode reached from entry ends at: {:#010x}\nfunctions: {}\njump tables: {}\nsymbols read: {}\nstale boot-image functions dropped: {}\noverlays: {}\nnot translated: {}\n",
+        "rom sha256: {}\nentry: {:#010x}\nboot segment: {:#010x}..{:#010x}\ncode reached from entry ends at: {:#010x}\nfunctions: {}\njump tables: {}\nsymbols read: {}\nstale boot-image functions dropped: {}\noverlays: {} ({} from load tables, not yet seen in a run)\nnot translated: {}\n",
         rom.sha256,
         rom.entry(),
         img.base,
@@ -485,6 +504,7 @@ fn translate(args: &[String]) -> Result<(), String> {
         names.len(),
         stale,
         overlays.len(),
+        planned,
         failed.len(),
     );
     for ((r, ram, len), d) in &overlays {

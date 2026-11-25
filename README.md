@@ -98,6 +98,13 @@ segment code that a later copy overwrites is dropped, and boot code reached
 only through a pointer is added. Repeat until the run reaches its frame
 limit.
 
+`translate` also reads the game's own load tables before any run: a pair
+of ROM offsets (start, end) followed within three words by a RAM address,
+where the code there calls into itself at function starts (or, with no
+such calls, builds addresses inside itself). Each such piece becomes an
+overlay up front, so modes no run has reached yet are already translated.
+A copy seen in a run replaces the guess.
+
 Graphics, audio and input reach the game through
 `n64rusty_runner::devices::Devices` (RSP tasks, audio buffers, frame swaps,
 retrace and controller state). The default runs every graphics task through
