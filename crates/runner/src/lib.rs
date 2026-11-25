@@ -195,10 +195,8 @@ fn record_run(
         }
     }
     // Code run in the interpreter, saved as it was when first run.
-    let forced = *INTERPRET.lock().unwrap();
     for (addr, (lo, bytes)) in interp::seen() {
-        // Code `--interpret` sent to the interpreter has a translation.
-        if bytes.is_empty() || forced.is_some_and(|(a, b)| (a..b).contains(&addr)) {
+        if bytes.is_empty() {
             continue;
         }
         let dir = local.join("images");
@@ -418,7 +416,7 @@ pub fn main_args(
                     let hex = |s: &str| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok();
                     Some((hex(a)?, hex(b)?))
                 });
-                let Some(range) = range else {
+                let Some(range) = range.filter(|(a, b)| a < b) else {
                     eprintln!("error: --interpret needs a hex range like 80000400-80100000");
                     return ExitCode::from(2);
                 };
