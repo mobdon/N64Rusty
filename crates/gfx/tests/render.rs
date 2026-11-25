@@ -423,3 +423,27 @@ fn pictures_between_frames_blend_the_movement() {
     let cut = r.render_between(&far, &cur, 0.5, 320, 240).unwrap();
     assert_eq!(cut.rgba, r.render_letterboxed(&cur, 320, 240).unwrap().rgba);
 }
+
+#[test]
+fn widescreen_stretches_a_row_of_background_tiles() {
+    let Some(mut r) = renderer() else { return };
+    let mut ram = Ram::default();
+    let dl = scene(&mut ram, |_, dl| {
+        dl.other_modes(CYCLE_FILL, 0)
+            // Two tiles edge to edge across the top band: a background.
+            .fill_color(0x07C1_07C1)
+            .fill_rect(0, 0, 159, 39)
+            .fill_rect(160, 0, 319, 39)
+            // Two pieces with a gap along the bottom, as a line of text.
+            .fill_rect(0, 200, 99, 239)
+            .fill_rect(220, 200, 319, 239);
+    });
+    let f = frame(&mut ram, &dl);
+    r.set_widescreen(true);
+    let img = r.render_letterboxed(&f, 640, 360).unwrap();
+    const GREEN: [u8; 4] = [0, 255, 0, 255];
+    assert_px(&img, 2, 20, GREEN);
+    assert_px(&img, 637, 20, GREEN);
+    // The gapped row keeps its 4:3 place.
+    assert_px(&img, 2, 330, BLUE);
+}

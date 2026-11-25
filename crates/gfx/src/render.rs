@@ -545,15 +545,43 @@ impl Renderer {
         // narrowed about the centre to keep its shape, except rectangles
         // spanning the whole frame (backgrounds), which stretch from edge
         // to edge of the target, over the border the game left.
+        // A background may also be a row of tiles: rectangles on the same
+        // lines, edge to edge, that together span the frame.
         let wide = self.wide(frame, width, height);
         let mut stretch = vec![None; frame.vertices.len()];
-        for d in frame.draws().filter(|d| d.state.rect && wide > 1.0) {
-            let range = d.first as usize..(d.first + d.count) as usize;
-            let xs = || frame.vertices[range.clone()].iter().map(|v| v.pos[0]);
-            let x0 = xs().fold(f32::MAX, f32::min);
-            let x1 = xs().fold(f32::MIN, f32::max);
-            if spans_width(x0, x1, frame.width as f32) {
-                stretch[range].fill(Some((x0, x1)));
+        let mut rows = HashMap::<(i32, i32), Vec<_>>::new();
+        // Neighbouring rectangles with one state share a draw: look at each
+        // one (two triangles, six vertices) on its own.
+        let quads = frame
+            .draws()
+            .filter(|d| d.state.rect && wide > 1.0)
+            .flat_map(|d| {
+                let end = (d.first + d.count) as usize;
+                (d.first as usize..end)
+                    .step_by(6)
+                    .map(move |q| q..(q + 6).min(end))
+            });
+        for range in quads {
+            let bound = |k: usize, f: fn(f32, f32) -> f32, start: f32| {
+                frame.vertices[range.clone()]
+                    .iter()
+                    .map(|v| v.pos[k])
+                    .fold(start, f)
+            };
+            let (x0, x1) = (bound(0, f32::min, f32::MAX), bound(0, f32::max, f32::MIN));
+            let (y0, y1) = (bound(1, f32::min, f32::MAX), bound(1, f32::max, f32::MIN));
+            let row = (y0.round() as i32, y1.round() as i32);
+            rows.entry(row).or_default().push((x0, x1, range));
+        }
+        for mut row in rows.into_values() {
+            row.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let edge_to_edge = row.windows(2).all(|w| w[1].0 <= w[0].1 + 1.0);
+            let x0 = row[0].0;
+            let x1 = row.iter().map(|r| r.1).fold(f32::MIN, f32::max);
+            if edge_to_edge && spans_width(x0, x1, frame.width as f32) {
+                for (_, _, range) in row {
+                    stretch[range].fill(Some((x0, x1)));
+                }
             }
         }
         let clip = clip_matrices(frame, transforms);
