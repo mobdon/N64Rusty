@@ -181,7 +181,7 @@ impl Interpreter {
                 textures: [None; 2],
                 rect: false,
                 texel_exact: false,
-                scenery: false,
+                picture: false,
                 color_image: 0,
                 scissor: None,
             },
@@ -852,7 +852,7 @@ impl Interpreter {
         let mut state = self.state.clone();
         state.rect = true;
         state.texel_exact = true;
-        state.scenery = true;
+        state.picture = true;
         state.geometry = 0;
         state.other_h = (state.other_h & !(3 << 20)) | 2 << 20; // copy mode
         state.combine = crate::combiner::TEXEL0_ONLY;

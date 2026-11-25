@@ -383,55 +383,6 @@ fn widescreen_shows_the_sides_and_keeps_shapes() {
 }
 
 #[test]
-fn widescreen_keeps_a_prerendered_background_in_shape() {
-    let Some(mut r) = renderer() else { return };
-    let mut ram = Ram::default();
-    // A full-frame red background picture (2D background copy): 3D draws
-    // are placed against it, so unlike a plain full-width rectangle it is
-    // not stretched, and the frame keeps 4:3 with black bars.
-    let image = ram.put(&[0xF8, 0x01].repeat(320 * 240));
-    let mut bg = Vec::new();
-    for h in [0u16, 320 * 4, 0, 320 * 4, 0, 240 * 4, 0, 240 * 4] {
-        bg.extend_from_slice(&h.to_be_bytes());
-    }
-    bg.extend_from_slice(&image.to_be_bytes());
-    bg.extend_from_slice(&[0, 0, 0, 2, 0, 0, 0, 0]);
-    let bg = ram.put(&bg);
-    let dl = scene(&mut ram, |_, dl| {
-        dl.load_ucode_2d().bg_copy(bg).load_ucode_2d();
-    });
-    let f = frame(&mut ram, &dl);
-    r.set_widescreen(true);
-    let img = r.render_letterboxed(&f, 640, 360).unwrap();
-    assert_px(&img, 320, 180, RED);
-    assert_px(&img, 20, 180, [0, 0, 0, 255]);
-}
-
-/// A red square at object x offset `dx`, drawn from the same display list
-/// code each frame, as a game redraws a moving object.
-fn moved_square(dx: f32) -> Frame {
-    let mut ram = Ram::default();
-    let verts = ram.vertices(&[
-        v(-10, -10, 0, [255; 4]),
-        v(10, -10, 0, [255; 4]),
-        v(10, 10, 0, [255; 4]),
-        v(-10, 10, 0, [255; 4]),
-    ]);
-    let mut m = n64rusty_gfx::IDENTITY;
-    m[3][0] = dx;
-    let mtx = ram.matrix(m);
-    let dl = scene(&mut ram, |_, dl| {
-        dl.mtx(mtx, LOAD)
-            .other_modes(CYCLE_1, 0)
-            .combine(pass(PRIM))
-            .prim(0xFF00_00FF)
-            .vtx(verts, 4, 0)
-            .tri2([0, 1, 2], [0, 2, 3]);
-    });
-    frame(&mut ram, &dl)
-}
-
-#[test]
 fn pictures_between_frames_blend_the_movement() {
     let Some(mut r) = renderer() else { return };
     // The square moves from x = -15 to x = +15 (pixel 136 to 184).
@@ -515,4 +466,55 @@ fn sharp_textures_keep_texels_flat_when_upscaled() {
             }
         }
     }
+}
+
+#[test]
+fn widescreen_widens_a_full_view_overlay_of_triangles() {
+    let Some(mut r) = renderer() else { return };
+    let mut ram = Ram::default();
+    // A fade or flash: a flat quad of two triangles over the whole view.
+    let verts = ram.vertices(&[
+        v(-100, -100, 0, [255; 4]),
+        v(100, -100, 0, [255; 4]),
+        v(100, 100, 0, [255; 4]),
+        v(-100, 100, 0, [255; 4]),
+    ]);
+    let dl = scene(&mut ram, |_, dl| {
+        dl.other_modes(CYCLE_1, 0)
+            .combine(pass(PRIM))
+            .prim(0xFF00_00FF)
+            .vtx(verts, 4, 0)
+            .tri2([0, 1, 2], [0, 2, 3]);
+    });
+    let f = frame(&mut ram, &dl);
+    r.set_widescreen(true);
+    let img = r.render_letterboxed(&f, 640, 360).unwrap();
+    assert_px(&img, 2, 180, RED);
+    assert_px(&img, 637, 180, RED);
+}
+
+#[test]
+fn widescreen_keeps_a_pre_rendered_picture_in_shape() {
+    let Some(mut r) = renderer() else { return };
+    let mut ram = Ram::default();
+    let dl = scene(&mut ram, |_, dl| {
+        dl.other_modes(CYCLE_FILL, 0)
+            .fill_color(0x07C1_07C1)
+            .fill_rect(0, 0, 319, 239);
+    });
+    let mut f = frame(&mut ram, &dl);
+    r.set_widescreen(true);
+    // As a full-width rectangle it is a background and fills the width.
+    let img = r.render_letterboxed(&f, 640, 360).unwrap();
+    assert_px(&img, 2, 180, [0, 255, 0, 255]);
+    // As a pre-rendered room picture it stays 4:3, lined up with the 3D
+    // drawn into it.
+    let last = f.commands.iter_mut().rev().find_map(|c| match c {
+        n64rusty_gfx::Command::Draw(d) => Some(d),
+        _ => None,
+    });
+    last.unwrap().state.picture = true;
+    let img = r.render_letterboxed(&f, 640, 360).unwrap();
+    assert_px(&img, 2, 180, BLUE);
+    assert_px(&img, 320, 180, [0, 255, 0, 255]);
 }

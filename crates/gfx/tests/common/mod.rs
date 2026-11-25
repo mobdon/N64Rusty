@@ -133,14 +133,6 @@ impl Dl {
         self.0.extend([w0, w1]);
         self
     }
-    /// Switches to (or back from) the 2D background microcode.
-    pub fn load_ucode_2d(&mut self) -> &mut Self {
-        self.c(0xDD << 24, 0)
-    }
-    /// `G_BG_COPY` of the background described at `addr` (2D microcode).
-    pub fn bg_copy(&mut self, addr: u32) -> &mut Self {
-        self.c(0x0A << 24, addr)
-    }
     pub fn vtx(&mut self, addr: u32, n: u32, v0: u32) -> &mut Self {
         self.c(0x01 << 24 | n << 12 | (v0 + n) << 1, addr)
     }
