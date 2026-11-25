@@ -8,6 +8,7 @@
 //! opened and no sound is played.
 
 pub mod devices;
+mod interp;
 mod jpeg;
 pub mod live;
 pub mod media;
@@ -126,6 +127,7 @@ fn record_run(
         text.push('\n');
     }
     std::fs::write(local.join("dma.txt"), text)?;
+    let mut new_missing = Vec::new();
     if let os::Outcome::Panic(m) = outcome {
         if let Some(rest) = m.strip_prefix("call to unknown guest function ") {
             let addr_text = rest.split_whitespace().next().unwrap_or("");
@@ -150,10 +152,7 @@ fn record_run(
             // No copy covers it: code in the boot image reached only
             // through a pointer, written with a zero copy.
             let mut found = src.copied().unwrap_or((0, 0, 0));
-            if addr == 0 {
-                return Ok(());
-            }
-            if src.is_none() {
+            if src.is_none() && addr != 0 {
                 if let Some((lo, hi)) = written_code(ram_now, rom, entry, addr) {
                     let dir = local.join("images");
                     std::fs::create_dir_all(&dir)?;
@@ -166,17 +165,33 @@ fn record_run(
                 }
             }
             let (rom, ram, len) = found;
-            let entry = format!("{addr:#010x} {rom:#010x} {ram:#010x} {len:#x}");
-            let mut missing: BTreeSet<String> =
-                read("missing.txt").lines().map(str::to_string).collect();
-            missing.insert(entry);
-            let text: String = missing
-                .iter()
-                .filter(|l| !l.is_empty())
-                .map(|l| format!("{l}\n"))
-                .collect();
-            std::fs::write(local.join("missing.txt"), text)?;
+            // A call to address 0 is a null pointer, not code to translate.
+            if addr != 0 {
+                new_missing.push(format!("{addr:#010x} {rom:#010x} {ram:#010x} {len:#x}"));
+            }
         }
+    }
+    // Code run in the interpreter, saved as it was when first run.
+    for (addr, (lo, bytes)) in interp::seen() {
+        if bytes.is_empty() {
+            continue;
+        }
+        let dir = local.join("images");
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join(format!("{lo:08x}_{addr:08x}.bin")), &bytes)?;
+        let (written, len) = (u32::MAX, bytes.len());
+        new_missing.push(format!("{addr:#010x} {written:#010x} {lo:#010x} {len:#x}"));
+    }
+    if !new_missing.is_empty() {
+        let mut missing: BTreeSet<String> =
+            read("missing.txt").lines().map(str::to_string).collect();
+        missing.extend(new_missing);
+        let text: String = missing
+            .iter()
+            .filter(|l| !l.is_empty())
+            .map(|l| format!("{l}\n"))
+            .collect();
+        std::fs::write(local.join("missing.txt"), text)?;
     }
     Ok(())
 }
@@ -428,6 +443,11 @@ pub fn main_with(game: Game, devices: Option<Box<dyn devices::Devices>>) -> Exit
     let hooked = os::install(&mut ctx, names.iter().map(|(a, n)| (n, a)));
     println!("replaced {} system routines", hooked.len());
     *NAMES.lock().unwrap() = names;
+    let (snap_rom, snap_entry) = (rom_bytes.clone(), game.entry);
+    interp::install(
+        &mut ctx,
+        Box::new(move |ram, addr| written_code(ram, &snap_rom, snap_entry, addr)),
+    );
 
     panic::set_hook(Box::new(|info| {
         let loc = info

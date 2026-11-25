@@ -1,5 +1,5 @@
-//! A plain VR4300 integer interpreter, used only as the reference the
-//! translator is tested against.
+//! A plain VR4300 integer interpreter: the reference the translator is
+//! tested against, and the runner's fallback for code with no translation.
 //!
 //! Written for this project from the VR4300 user's manual and the MIPS III
 //! instruction set description (see CREDITS.md). It shares no code with the
@@ -59,32 +59,32 @@ impl Cpu {
         }
     }
 
-    fn phys(&self, addr: u32, size: u32, pc: u32) -> Result<usize, Stop> {
+    fn phys(mem: &[u8], addr: u32, size: u32, pc: u32) -> Result<usize, Stop> {
         let p = addr & 0x1FFF_FFFF;
-        if p % size != 0 || (p + size) as usize > self.mem.len() {
+        if p % size != 0 || (p + size) as usize > mem.len() {
             return Err(Stop::BadAccess { pc, addr });
         }
         Ok(p as usize)
     }
 
-    fn load(&self, addr: u32, size: u32, pc: u32) -> Result<u64, Stop> {
-        let p = self.phys(addr, size, pc)?;
-        Ok(self.mem[p..p + size as usize]
+    fn load(mem: &[u8], addr: u32, size: u32, pc: u32) -> Result<u64, Stop> {
+        let p = Self::phys(mem, addr, size, pc)?;
+        Ok(mem[p..p + size as usize]
             .iter()
             .fold(0u64, |acc, &b| (acc << 8) | u64::from(b)))
     }
 
-    fn store(&mut self, addr: u32, size: u32, v: u64, pc: u32) -> Result<(), Stop> {
-        let p = self.phys(addr, size, pc)?;
+    fn store(mem: &mut [u8], addr: u32, size: u32, v: u64, pc: u32) -> Result<(), Stop> {
+        let p = Self::phys(mem, addr, size, pc)?;
         for k in 0..size as usize {
             let shift = 8 * (size as usize - 1 - k);
-            self.mem[p + k] = (v >> shift) as u8;
+            mem[p + k] = (v >> shift) as u8;
         }
         Ok(())
     }
 
-    fn byte(&self, addr: u32, pc: u32) -> Result<u8, Stop> {
-        Ok(self.load(addr, 1, pc)? as u8)
+    fn byte(mem: &[u8], addr: u32, pc: u32) -> Result<u8, Stop> {
+        Ok(Self::load(mem, addr, 1, pc)? as u8)
     }
 
     // Floating-point register file. With FR clear the register file is
@@ -275,10 +275,26 @@ impl Cpu {
         Err(Stop::StepLimit)
     }
 
+    /// Continues at `pc`, with no branch pending.
+    pub fn jump_to(&mut self, pc: u32) {
+        self.pc = pc;
+        self.next_pc = pc.wrapping_add(4);
+    }
+
     /// Executes the instruction at `pc`.
     pub fn step(&mut self) -> Result<(), Stop> {
+        let mut mem = std::mem::take(&mut self.mem);
+        let r = self.step_on(&mut mem);
+        self.mem = mem;
+        r
+    }
+
+    /// Executes the instruction at `pc` against `mem` instead of the
+    /// interpreter's own RAM (same addressing: virtual address with the top
+    /// three bits dropped).
+    pub fn step_on(&mut self, mem: &mut [u8]) -> Result<(), Stop> {
         let pc = self.pc;
-        let word = self.load(pc, 4, pc)? as u32;
+        let word = Self::load(mem, pc, 4, pc)? as u32;
         // Default: the next instruction is the one in sequence.
         let mut npc = self.next_pc;
         let mut nnpc = self.next_pc.wrapping_add(4);
@@ -442,31 +458,31 @@ impl Cpu {
             0x0F => self.set(rt, se32(imm << 16)),
             0x18 | 0x19 => self.set(rt, s.wrapping_add(simm as u64)),
             0x20 => {
-                let v = self.load(ea, 1, pc)?;
+                let v = Self::load(mem, ea, 1, pc)?;
                 self.set(rt, v as u8 as i8 as i64 as u64)
             }
             0x21 => {
-                let v = self.load(ea, 2, pc)?;
+                let v = Self::load(mem, ea, 2, pc)?;
                 self.set(rt, v as u16 as i16 as i64 as u64)
             }
             0x23 => {
-                let v = self.load(ea, 4, pc)?;
+                let v = Self::load(mem, ea, 4, pc)?;
                 self.set(rt, se32(v as u32))
             }
             0x24 => {
-                let v = self.load(ea, 1, pc)?;
+                let v = Self::load(mem, ea, 1, pc)?;
                 self.set(rt, v)
             }
             0x25 => {
-                let v = self.load(ea, 2, pc)?;
+                let v = Self::load(mem, ea, 2, pc)?;
                 self.set(rt, v)
             }
             0x27 => {
-                let v = self.load(ea, 4, pc)?;
+                let v = Self::load(mem, ea, 4, pc)?;
                 self.set(rt, v)
             }
             0x37 => {
-                let v = self.load(ea, 8, pc)?;
+                let v = Self::load(mem, ea, 8, pc)?;
                 self.set(rt, v)
             }
             // Unaligned loads, byte by byte. Register bytes are numbered
@@ -487,12 +503,12 @@ impl Cpu {
                 if left {
                     // Bytes ea..end of unit go to the top of the register.
                     for k in 0..(size - off) {
-                        regb[k as usize] = self.byte(ea + k, pc)?;
+                        regb[k as usize] = Self::byte(mem, ea + k, pc)?;
                     }
                 } else {
                     // Bytes base..=ea go to the bottom of the register.
                     for k in 0..=off {
-                        regb[(size - 1 - off + k) as usize] = self.byte(base + k, pc)?;
+                        regb[(size - 1 - off + k) as usize] = Self::byte(mem, base + k, pc)?;
                     }
                 }
                 let v = if size == 4 {
@@ -507,10 +523,10 @@ impl Cpu {
                 };
                 self.set(rt, v);
             }
-            0x28 => self.store(ea, 1, t, pc)?,
-            0x29 => self.store(ea, 2, t, pc)?,
-            0x2B => self.store(ea, 4, t, pc)?,
-            0x3F => self.store(ea, 8, t, pc)?,
+            0x28 => Self::store(mem, ea, 1, t, pc)?,
+            0x29 => Self::store(mem, ea, 2, t, pc)?,
+            0x2B => Self::store(mem, ea, 4, t, pc)?,
+            0x3F => Self::store(mem, ea, 8, t, pc)?,
             // Unaligned stores, byte by byte.
             0x2A | 0x2E | 0x2C | 0x2D => {
                 let size: u32 = if opc == 0x2A || opc == 0x2E { 4 } else { 8 };
@@ -524,12 +540,12 @@ impl Cpu {
                 let left = opc == 0x2A || opc == 0x2C;
                 if left {
                     for k in 0..(size - off) {
-                        self.store(ea + k, 1, u64::from(regb[k as usize]), pc)?;
+                        Self::store(mem, ea + k, 1, u64::from(regb[k as usize]), pc)?;
                     }
                 } else {
                     for k in 0..=off {
                         let b = regb[(size - 1 - off + k) as usize];
-                        self.store(base + k, 1, u64::from(b), pc)?;
+                        Self::store(mem, base + k, 1, u64::from(b), pc)?;
                     }
                 }
             }
@@ -561,15 +577,15 @@ impl Cpu {
                 _ => return Err(unimpl),
             },
             0x31 => {
-                let v = self.load(ea, 4, pc)?;
+                let v = Self::load(mem, ea, 4, pc)?;
                 self.put_w(rt, v as u32)
             }
             0x35 => {
-                let v = self.load(ea, 8, pc)?;
+                let v = Self::load(mem, ea, 8, pc)?;
                 self.put_l(rt, v)
             }
-            0x39 => self.store(ea, 4, u64::from(self.get_w(rt)), pc)?,
-            0x3D => self.store(ea, 8, self.get_l(rt), pc)?,
+            0x39 => Self::store(mem, ea, 4, u64::from(self.get_w(rt)), pc)?,
+            0x3D => Self::store(mem, ea, 8, self.get_l(rt), pc)?,
             _ => return Err(unimpl),
         }
 

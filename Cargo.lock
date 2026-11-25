@@ -1164,6 +1164,7 @@ dependencies = [
  "n64rusty-audio",
  "n64rusty-gfx",
  "n64rusty-host",
+ "n64rusty-refcpu",
  "n64rusty-rom",
  "n64rusty-runtime",
  "winit",
