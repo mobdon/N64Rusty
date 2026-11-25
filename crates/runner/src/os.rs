@@ -1295,6 +1295,98 @@ fn os_ai_set_frequency(c: &mut Ctx) {
     ret(c, f);
 }
 
+/// A debug print routine (`printf`-style: format string, then arguments
+/// the usual way): the text goes to the console, as a development kit
+/// would show it.
+fn debug_print(c: &mut Ctx) {
+    let text = format_guest(c, arg(c, 0), 1);
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        eprintln!("game: {line}");
+    }
+}
+
+/// The NUL-terminated string at `at` (at most 1 KiB).
+fn guest_str(c: &Ctx, at: u32) -> String {
+    (0..1024)
+        .map(|i| c.mem.read_u8(at.wrapping_add(i)))
+        .take_while(|&b| b != 0)
+        .map(char::from)
+        .collect()
+}
+
+/// Formats the guest `printf` format string at `fmt` with the arguments
+/// from argument slot `first` on: %d %i %u %x %X %o %c %s %p %f %e %g,
+/// with flags, width and precision as written.
+fn format_guest(c: &Ctx, fmt: u32, first: usize) -> String {
+    let f = guest_str(c, fmt);
+    let mut out = String::new();
+    let mut k = first;
+    let mut chars = f.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '%' {
+            out.push(ch);
+            continue;
+        }
+        let mut spec = String::new();
+        while let Some(&n) = chars.peek() {
+            chars.next();
+            spec.push(n);
+            if n.is_ascii_alphabetic() && n != 'l' && n != 'h' || n == '%' {
+                break;
+            }
+        }
+        let conv = spec.pop().unwrap_or('%');
+        let width: usize = spec
+            .trim_start_matches(['-', '0', '+', ' ', '#'])
+            .split('.')
+            .next()
+            .and_then(|w| w.trim_end_matches(['l', 'h']).parse().ok())
+            .unwrap_or(0);
+        let zero = spec.starts_with('0');
+        let left = spec.starts_with('-');
+        let prec: Option<usize> = spec
+            .split_once('.')
+            .and_then(|(_, p)| p.trim_end_matches(['l', 'h']).parse().ok());
+        let mut next = || {
+            k += 1;
+            arg(c, k - 1)
+        };
+        let body = match conv {
+            '%' => "%".to_string(),
+            'd' | 'i' => (next() as i32).to_string(),
+            'u' => next().to_string(),
+            'x' => format!("{:x}", next()),
+            'X' => format!("{:X}", next()),
+            'o' => format!("{:o}", next()),
+            'p' => format!("{:08x}", next()),
+            'c' => char::from(next() as u8).to_string(),
+            's' => guest_str(c, next()),
+            'f' | 'e' | 'g' | 'F' | 'E' | 'G' => {
+                // Doubles take an even pair of argument slots.
+                k += k % 2;
+                let hi = u64::from(arg(c, k));
+                let lo = u64::from(arg(c, k + 1));
+                k += 2;
+                let v = f64::from_bits(hi << 32 | lo);
+                match conv {
+                    'e' | 'E' => format!("{v:.*e}", prec.unwrap_or(6)),
+                    _ => format!("{v:.*}", prec.unwrap_or(6)),
+                }
+            }
+            other => format!("%{spec}{other}"),
+        };
+        let pad = width.saturating_sub(body.chars().count());
+        if left {
+            out.push_str(&body);
+            out.extend(std::iter::repeat_n(' ', pad));
+        } else {
+            out.extend(std::iter::repeat_n(if zero { '0' } else { ' ' }, pad));
+            out.push_str(&body);
+        }
+    }
+    out
+}
+
 fn ret_zero(c: &mut Ctx) {
     ret(c, 0);
 }
@@ -1316,6 +1408,10 @@ fn os_set_int_mask(c: &mut Ctx) {
 /// System library routines replaced by the host, by their usual names.
 pub const HOOKS: &[(&str, GuestFn)] = &[
     ("osInitialize", nothing),
+    // Debug text: the system library's own, or a game's (named
+    // `debug_print` in the per-game config).
+    ("osSyncPrintf", debug_print),
+    ("debug_print", debug_print),
     ("osCreateThread", os_create_thread),
     ("osStartThread", os_start_thread),
     ("osStopThread", os_stop_thread),
@@ -1402,13 +1498,7 @@ mod tests {
 
     #[test]
     fn poke_scripts_parse() {
-        let p = parse_pokes(
-            "# warp
-100 0x8011AC80 bb
-200-210 80001000 1 1
-",
-        )
-        .unwrap();
+        let p = parse_pokes("# warp\n100 0x8011AC80 bb\n200-210 80001000 1 1\n").unwrap();
         assert_eq!(
             p[0],
             Poke {
@@ -1431,6 +1521,30 @@ mod tests {
         );
         assert!(parse_pokes("100 8011AC80").is_err());
         assert!(parse_pokes("100 8011AC80 1 3").is_err());
+    }
+
+    #[test]
+    fn formats_a_guest_debug_print() {
+        let mut c = Ctx::new(n64rusty_runtime::Memory::new(0x1000));
+        let put = |c: &mut Ctx, at: u32, s: &str| {
+            for (i, b) in s.bytes().chain([0]).enumerate() {
+                c.mem.write_u8(0x8000_0000 + at + i as u32, b);
+            }
+        };
+        put(&mut c, 0x100, "%s at %08X: %d%% %-3c|%5.2f");
+        put(&mut c, 0x200, "load");
+        c.r[29] = 0x8000_0800;
+        c.r[5] = 0x8000_0200; // %s
+        c.r[6] = 0xAB; // %08X
+        c.r[7] = (-5i32) as u32 as u64; // %d
+        c.mem.write_u32(0x8000_0810, u32::from(b'z')); // %c, slot 4
+        let bits = 2.5f64.to_bits(); // %f, slots 6 and 7
+        c.mem.write_u32(0x8000_0818, (bits >> 32) as u32);
+        c.mem.write_u32(0x8000_081C, bits as u32);
+        assert_eq!(
+            format_guest(&c, 0x8000_0100, 1),
+            "load at 000000AB: -5% z  | 2.50"
+        );
     }
 
     #[test]
