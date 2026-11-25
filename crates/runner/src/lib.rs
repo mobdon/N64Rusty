@@ -36,13 +36,23 @@ pub struct Game {
 
 /// RAM size without the expansion.
 pub const RAM_SIZE: usize = 0x40_0000;
+/// RAM size with the Expansion Pak (`--expansion`).
+pub const RAM_SIZE_EXPANDED: usize = 0x80_0000;
+
+/// Whether this run has the Expansion Pak plugged in.
+static EXPANSION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Builds a context with RAM laid out as the boot code leaves it.
 pub fn boot(rom: &Rom, game: &Game) -> Ctx {
-    let mut mem = Memory::new(RAM_SIZE);
+    let size = if EXPANSION.load(std::sync::atomic::Ordering::Relaxed) {
+        RAM_SIZE_EXPANDED
+    } else {
+        RAM_SIZE
+    };
+    let mut mem = Memory::new(size);
     let seg = rom.boot_segment();
     let at = (rom.entry() & 0x1FFF_FFFF) as usize;
-    let n = seg.len().min(RAM_SIZE - at);
+    let n = seg.len().min(size - at);
     mem.bytes_mut()[at..at + n].copy_from_slice(&seg[..n]);
     // Boot information the boot code stores in low RAM for the system
     // library: TV type (1 = NTSC), ROM base, reset type, boot code id,
@@ -59,11 +69,11 @@ pub fn boot(rom: &Rom, game: &Game) -> Ctx {
     mem.write_u32(0x8000_030C, 0);
     mem.write_u32(0x8000_0310, cic_id);
     mem.write_u32(0x8000_0314, 0);
-    mem.write_u32(0x8000_0318, RAM_SIZE as u32);
+    mem.write_u32(0x8000_0318, size as u32);
     let mut ctx = Ctx::new(mem);
     (game.register)(&mut ctx);
     // A stack at the top of RAM until the game sets its own.
-    ctx.r[29] = sx32(0x8000_0000 + RAM_SIZE as u32 - 0x10);
+    ctx.r[29] = sx32(0x8000_0000 + size as u32 - 0x10);
     ctx
 }
 
@@ -355,6 +365,10 @@ pub fn main_args(
             window = true;
             continue;
         }
+        if flag == "--expansion" {
+            EXPANSION.store(true, std::sync::atomic::Ordering::Relaxed);
+            continue;
+        }
         if flag == "--capture-wide" {
             wide = true;
             continue;
@@ -411,7 +425,7 @@ pub fn main_args(
     }
     let Some(rom_path) = rom_path else {
         eprintln!(
-            "usage: <game> <rom> [--symbols file]... [--config file] [--frames n] [--local dir] [--capture dir] [--capture-every n] [--capture-scale n] [--capture-wide] [--capture-between] [--wav file] [--input script] [--poke script] [--ram-out file] [--save file] [--window] [--run run.toml]"
+            "usage: <game> <rom> [--symbols file]... [--config file] [--frames n] [--local dir] [--capture dir] [--capture-every n] [--capture-scale n] [--capture-wide] [--capture-between] [--wav file] [--input script] [--poke script] [--ram-out file] [--expansion] [--save file] [--window] [--run run.toml]"
         );
         return ExitCode::from(2);
     };

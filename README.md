@@ -147,6 +147,9 @@ Two debugging aids, in headless and window runs alike:
   hold game addresses.
 - `--ram-out file` saves guest RAM when the run ends, to read state back.
 
+`--expansion` runs with the Expansion Pak: 8 MB of RAM instead of 4 MB, as
+games that need it check.
+
 Cartridge save memory (battery-backed SRAM, reached with PI DMA) is kept
 in a file: `--save file`, and window runs default to `save.sra` in the
 per-game folder. The file is read at start and rewritten after every write
