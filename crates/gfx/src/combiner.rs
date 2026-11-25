@@ -87,6 +87,8 @@ pub(crate) struct ShaderKey {
     /// 0 none, 1 against the blend colour's alpha, 2 at one half, 3 both.
     pub alpha_test: u8,
     pub flat: bool,
+    /// Magnified textures keep crisp texel edges (see [`shader`]).
+    pub sharp: bool,
 }
 
 fn color_input(slot: usize, code: u8) -> &'static str {
@@ -138,12 +140,14 @@ pub fn fragment_shader(combine: u64, two_cycle: bool) -> String {
         two_cycle,
         alpha_test: 0,
         flat: false,
+        sharp: false,
     })
 }
 
 pub(crate) fn shader(key: ShaderKey) -> String {
     let c = Combiner::from_raw(key.combine);
     let interp = if key.flat { "@interpolate(flat)" } else { "" };
+    let sample = if key.sharp { "sharp" } else { "textureSample" };
     let mut s = format!(
         "struct U {{ prim: vec4f, env: vec4f, blend: vec4f, misc: vec4f }}
 @group(0) @binding(0) var<uniform> u: U;
@@ -164,11 +168,27 @@ fn vs(@location(0) pos: vec4f, @location(1) color: vec4f, @location(2) uv0: vec2
     return VOut(pos, color, uv0, uv1);
 }}
 
+// Sharp sampling: inside a magnified texel the colour stays flatter and the
+// blend between texels narrows to half a texel, so low resolution textures
+// look clean when upscaled without blocks or the shimmer of point
+// sampling. Minified textures sample as usual (same mip choice).
+fn sharp(t: texture_2d<f32>, s: sampler, uv: vec2f) -> vec4f {{
+    let size = vec2f(textureDimensions(t, 0));
+    let texel = uv * size - 0.5;
+    let seam = floor(texel + 0.5);
+    let per_px = max(fwidth(texel), vec2f(1e-6));
+    // Blend over half a texel at most: crisp, but texels do not turn into
+    // hard blocks.
+    let k = clamp(vec2f(1.0) / per_px, vec2f(1.0), vec2f(2.0));
+    let o = clamp((texel - seam) * k, vec2f(-0.5), vec2f(0.5));
+    return textureSampleGrad(t, s, (seam + o + 0.5) / size, dpdx(uv), dpdy(uv));
+}}
+
 @fragment
 fn fs(v: VOut) -> @location(0) vec4f {{
     let shade = v.color;
-    let t0 = textureSample(tex0, smp0, v.uv0);
-    let t1 = textureSample(tex1, smp1, v.uv1);
+    let t0 = {sample}(tex0, smp0, v.uv0);
+    let t1 = {sample}(tex1, smp1, v.uv1);
     let noise = fract(sin(dot(v.pos.xy, vec2f(12.9898, 78.233))) * 43758.5453);
     var comb = vec4f(0.0);
 "
@@ -215,7 +235,8 @@ mod tests {
             combine: PRIM_ONLY,
             two_cycle: false,
             alpha_test: 0,
-            flat: false
+            flat: false,
+            sharp: false
         })
         .contains("(vec3f(0.0) - vec3f(0.0)) * vec3f(0.0) + u.prim.rgb"));
     }

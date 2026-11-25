@@ -726,7 +726,8 @@ impl Interpreter {
         let corner = |x: usize, y: usize| Vertex {
             pos: [xy[x * 2], xy[1 + y * 2], z],
             transform: t,
-            color: [1.0; 4],
+            // The RDP gives rectangles no shade: the input reads zero.
+            color: [0.0; 4],
             uv: uv(x, y),
         };
         let (a, b, c, d) = (corner(0, 0), corner(1, 0), corner(0, 1), corner(1, 1));

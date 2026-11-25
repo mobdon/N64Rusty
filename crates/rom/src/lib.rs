@@ -13,6 +13,8 @@
 
 use std::fmt;
 
+pub mod signature;
+
 use sha2::{Digest, Sha256};
 
 /// Byte order of a ROM file as found on disk.

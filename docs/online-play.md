@@ -165,3 +165,31 @@ games need. Games are described, not named.
   retraces and uses a 3-second timeout timer on graphics tasks. Lockstep
   should count retraces, not game frames. Audio runs a task about every
   retrace from its own thread.
+
+### Single-player rail shooter with a photo check (second game)
+
+- **Save type.** 128 KB flash chip: commands to its register, status and
+  id reads, 128-byte page writes and sector erases. Both peers must start
+  from the same save file, and a save in progress must finish identically,
+  since the game shows an error screen when a status read disagrees.
+- **Players.** One player. Online play would mean a shared or co-op session;
+  lockstep from boot still applies.
+- **Determinism concerns.**
+  - The game reads back what the RDP drew: it copies blocks of the frame
+    buffer into small images and compares them on the CPU to decide what is
+    in a photo, and draws pictures to show inside other pictures. Those
+    pixels come from the GPU at the game's resolution, so the GPU render
+    must be bit-identical on every host or results (photo scoring, unlocks)
+    will drift.
+  - Most course code is unpacked into RAM at run time; translations run only
+    while their bytes are in RAM, so peers need the same build and the same
+    saved images.
+  - RSP tasks report done after a fixed virtual delay; the scheduler's
+    requests about a running task depend on that timing, so it must come
+    from virtual time only.
+- **Input quirks.** Aiming is a held button (the camera only pans while it is
+  held) and a second button takes the photo; analog stick values matter, so
+  peers must share raw stick values, not a direction.
+- **Timing.** Gameplay runs at 30 frames a second over 60 Hz retraces; audio
+  runs a task every retrace from its own thread. Lockstep should count
+  retraces.

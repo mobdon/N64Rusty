@@ -281,6 +281,13 @@ impl Cpu {
         self.next_pc = pc.wrapping_add(4);
     }
 
+    /// Moves past the instruction at `pc` without running it (the caller ran
+    /// it), keeping a pending branch.
+    pub fn skip(&mut self) {
+        self.pc = self.next_pc;
+        self.next_pc = self.next_pc.wrapping_add(4);
+    }
+
     /// Executes the instruction at `pc`.
     pub fn step(&mut self) -> Result<(), Stop> {
         let mut mem = std::mem::take(&mut self.mem);
