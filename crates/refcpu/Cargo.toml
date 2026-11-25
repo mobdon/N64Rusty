@@ -1,6 +1,6 @@
 [package]
 name = "n64rusty-refcpu"
-description = "Reference VR4300 integer interpreter used only to test the translator"
+description = "Reference VR4300 interpreter: tests the translator, runs untranslated code"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

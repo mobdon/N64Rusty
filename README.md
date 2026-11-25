@@ -98,6 +98,11 @@ functions that only run while their own bytes are in RAM: each is checked
 at its first call, and again after a copy or an I-cache invalidation
 covers it.
 
+Code with no translation at all runs in the reference interpreter
+(`n64rusty-refcpu`) instead of stopping the game, and is saved the same way
+for the next `translate`. Calls it makes into translated code and replaced
+system routines go back through the normal dispatch.
+
 Run `translate` again and it adds that code: code copied in at run time
 becomes an overlay (its own module, active while that copy is in RAM; a
 later copy into part of it hides only the functions it covers), boot
