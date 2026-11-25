@@ -218,8 +218,12 @@ first `.z64`/`.n64`/`.v64` in its own folder, else asks for one in a file
 window. It opens the game with `--window`, and always with `--expansion`
 (8 MB of RAM, as with the Expansion Pak fitted), so games that need it run.
 It needs no settings file: windows default to widescreen, drawing at the
-display's own refresh rate, and crisp textures. A `run.toml` in the game's
-`games/<sha256>/` folder changes any of them.
+display's own refresh rate, and crisp textures. On Windows the window has a menu
+bar: Game (open another ROM), Refresh (match the display, 60, 120 or
+165 Hz) and View (widescreen or normal 4:3, crisp or console textures,
+window size, full screen, also F11). Choices are saved to `settings.toml`
+next to the program, or to the game's own `games/<sha256>/run.toml` when
+it has one.
 
 Its files live next to the program: `games/<sha256>/` per game (the
 routine list `config.toml`, `save.sra`, `run.toml`) and `routines.txt`.

@@ -4,7 +4,9 @@
 //! Double-click it and it plays the ROM given (dropped on it), else the one
 //! picked last time, else one in its own folder, else asks for one. Files
 //! live next to the program: `games/<sha256>/` per game (routine list,
-//! saves, an optional run.toml), `last-rom.txt`, and `routines.txt`, the fingerprints
+//! saves, an optional run.toml), `settings.toml` (window choices made in
+//! the menu, for games without their own run.toml), `last-rom.txt`, and
+//! `routines.txt`, the fingerprints
 //! that find a game's system routines when it has no routine list yet.
 //! With more arguments than the ROM, they work as for a generated game
 //! program (`--frames`, `--capture`, `--window`, ...); `--symbols map.txt`
@@ -75,6 +77,15 @@ fn play(args: &mut Vec<String>, dir: &Path, plain: bool) -> ExitCode {
     }
     if plain {
         args.push("--window".into());
+    }
+    // Menu choices are saved in the game's own run.toml, else in
+    // settings.toml next to the program, shared by every game.
+    if !local.join("run.toml").exists() && !args.iter().any(|a| a == "--run") {
+        let settings = dir.join("settings.toml");
+        if !settings.exists() {
+            let _ = std::fs::write(&settings, "");
+        }
+        args.extend(["--run".into(), settings.display().to_string()]);
     }
     // Like a console with the Expansion Pak: games that need it run, and
     // the others only see more free memory.

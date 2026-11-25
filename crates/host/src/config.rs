@@ -41,6 +41,9 @@ pub const NTSC_RATE: f64 = 60.0 / 1.001;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunConfig {
+    /// The file this config was loaded from, where window choices made in
+    /// the menu are saved.
+    pub path: Option<PathBuf>,
     pub frames: Option<u64>,
     pub frame_rate: f64,
     pub headless: bool,
@@ -66,6 +69,19 @@ pub struct WindowConfig {
     /// Textures as the console filters them, soft when stretched to the
     /// window. Off (the default) keeps magnified texels crisp.
     pub console_filter: bool,
+}
+
+impl WindowConfig {
+    /// How often to draw the window when that is above the game's
+    /// `frame_rate` (by more than rounding: 60 for a 59.94 game is not),
+    /// given the display's rate if known.
+    pub fn redraw_rate(&self, frame_rate: f64, display: Option<f64>) -> Option<f64> {
+        let r = match self.refresh? {
+            0.0 => display?,
+            r => r,
+        };
+        (r > frame_rate + 1.0).then_some(r)
+    }
 }
 
 impl Default for WindowConfig {
@@ -98,6 +114,7 @@ impl Default for RunConfig {
             ..PortConfig::default()
         };
         RunConfig {
+            path: None,
             frames: None,
             frame_rate: NTSC_RATE,
             headless: false,
@@ -150,7 +167,36 @@ impl RunConfig {
     pub fn load(path: &Path) -> Result<RunConfig, String> {
         let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let base = path.parent().unwrap_or(Path::new(""));
-        RunConfig::parse(&text, base).map_err(|e| format!("{}: {e}", path.display()))
+        let mut cfg =
+            RunConfig::parse(&text, base).map_err(|e| format!("{}: {e}", path.display()))?;
+        cfg.path = Some(path.to_path_buf());
+        Ok(cfg)
+    }
+
+    /// Writes the window settings back into the file this config came from,
+    /// keeping its other keys (comments are lost).
+    pub fn save_window(&self) -> Result<(), String> {
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        let mut doc: toml::Table = toml::from_str(&text).map_err(|e| e.to_string())?;
+        let window = doc
+            .entry("window")
+            .or_insert_with(|| toml::Value::Table(Default::default()));
+        let Some(w) = window.as_table_mut() else {
+            return Err("window is not a table".into());
+        };
+        let c = &self.window;
+        w.insert("widescreen".into(), c.widescreen.into());
+        w.insert("console_filter".into(), c.console_filter.into());
+        w.insert("scale".into(), i64::from(c.scale).into());
+        match c.refresh {
+            Some(r) => w.insert("refresh".into(), r.into()),
+            None => w.remove("refresh"),
+        };
+        let out = toml::to_string(&doc).map_err(|e| e.to_string())?;
+        std::fs::write(path, out).map_err(|e| format!("{}: {e}", path.display()))
     }
 
     /// Parses config text; relative paths are taken from `base`.
@@ -359,5 +405,31 @@ mod tests {
             let err = RunConfig::parse(bad, Path::new("")).unwrap_err();
             assert!(err.contains(why), "{bad:?} gave {err}");
         }
+    }
+
+    #[test]
+    fn window_choices_save_back_and_redraw_rates() {
+        let path = std::env::temp_dir().join(format!("run-{}.toml", std::process::id()));
+        std::fs::write(&path, "frames = 9\n").unwrap();
+        let mut cfg = RunConfig::load(&path).unwrap();
+        cfg.window.widescreen = false;
+        cfg.window.refresh = Some(120.0);
+        cfg.save_window().unwrap();
+        let back = RunConfig::load(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(back.frames, Some(9));
+        assert_eq!(back.window, cfg.window);
+        let w = |r| WindowConfig {
+            refresh: r,
+            ..WindowConfig::default()
+        };
+        assert_eq!(w(Some(120.0)).redraw_rate(NTSC_RATE, None), Some(120.0));
+        assert_eq!(w(Some(60.0)).redraw_rate(NTSC_RATE, None), None);
+        assert_eq!(
+            w(Some(0.0)).redraw_rate(NTSC_RATE, Some(165.0)),
+            Some(165.0)
+        );
+        assert_eq!(w(Some(0.0)).redraw_rate(NTSC_RATE, Some(60.0)), None);
+        assert_eq!(w(None).redraw_rate(NTSC_RATE, Some(165.0)), None);
     }
 }
