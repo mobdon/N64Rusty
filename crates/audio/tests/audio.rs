@@ -318,3 +318,31 @@ fn audio_out_needs_a_frequency_and_plays_whole_frames() {
     std::fs::remove_file(&path).unwrap();
     assert_eq!(&b[44..], [1, 0, 2, 0], "the half frame is dropped");
 }
+
+#[test]
+fn third_set_loads_mixes_interleaves_and_saves() {
+    // LOADBUFF, ENVSETUP1/2, ENVMIXER, INTERLEAVE and SAVEBUFF of the
+    // command set with opcodes past 0x0F.
+    let mut ram = Memory::new(0x10000);
+    let (list, src, dst) = (0x8000_0000u32, 0x8000_1000u32, 0x8000_2000u32);
+    for i in 0..16 {
+        ram.write_u16(src + 2 * i, 0x4000);
+    }
+    let cmds: [(u32, u32); 7] = [
+        (0x1402_0000, src & 0xFF_FFFF), // 32 bytes to DMEM 0
+        (0x1200_0000, 0),               // wet 0, no steps
+        (0x1600_0000, 0xFFFF_8000),     // left ~1.0, right 0.5
+        (0x1300_1000, 0x1018_2028),     // 16 samples from 0 to dry L 0x100, R 0x180
+        (0x0D02_0400, 0x0100_0180),     // interleave 32 bytes a side to 0x400
+        (0x1504_0400, dst & 0xFF_FFFF), // save 64 bytes
+        (0x0000_0000, 0),
+    ];
+    for (k, (w0, w1)) in cmds.iter().enumerate() {
+        ram.write_u32(list + 8 * k as u32, *w0);
+        ram.write_u32(list + 8 * k as u32 + 4, *w1);
+    }
+    let mut rsp = AudioRsp::new();
+    rsp.run(&mut ram, list, 8 * cmds.len() as u32);
+    assert_eq!(ram.read_u16(dst) as i16, 0x3FFF); // left: 0x4000 * 0xFFFF >> 16
+    assert_eq!(ram.read_u16(dst + 2) as i16, 0x2000); // right: half
+}
