@@ -109,9 +109,19 @@ impl<G: Guest> App<G> {
                 }
                 return;
             }
-            Action::ToggleMod(path) => {
+            Action::ToggleMod(_) | Action::ToggleModOption(..) => {
                 // Mods install at start, so the program starts again.
-                let restart = std::fs::rename(&path, crate::menu::toggled(&path))
+                let (change, path) = match &action {
+                    Action::ToggleMod(p) => (std::fs::rename(p, crate::menu::toggled(p)), p),
+                    Action::ToggleModOption(p, name) => (
+                        std::fs::read_to_string(p).and_then(|t| {
+                            std::fs::write(p, crate::menu::flip_mod_option(&t, name))
+                        }),
+                        p,
+                    ),
+                    _ => unreachable!(),
+                };
+                let restart = change
                     .map_err(|e| e.to_string())
                     .and_then(|_| std::env::current_exe().map_err(|e| e.to_string()))
                     .and_then(|exe| {
