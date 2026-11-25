@@ -11,9 +11,10 @@ use winit::dpi::LogicalSize;
 use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{Window, WindowId};
+use winit::window::{Fullscreen, Window, WindowId};
 
 use crate::config::RunConfig;
+use crate::menu::{Action, Menu};
 use crate::pad::Pads;
 use crate::session::{Guest, Pacer, Session, Tick};
 
@@ -37,12 +38,9 @@ pub fn run_windowed<G: Guest>(guest: G, cfg: &RunConfig) -> Result<G, String> {
         session,
         cfg: cfg.clone(),
         pacer: Pacer::new(cfg.frame_rate, Instant::now()),
-        redraw: cfg
-            .window
-            .refresh
-            .filter(|&r| r > cfg.frame_rate)
-            .map(|r| Pacer::new(r, Instant::now())),
+        redraw: None,
         window: None,
+        menu: None,
         keys: HashSet::new(),
         gilrs,
         named: Vec::new(),
@@ -57,6 +55,12 @@ pub fn run_windowed<G: Guest>(guest: G, cfg: &RunConfig) -> Result<G, String> {
         .map_err(|e| format!("writing the recording: {e}"))
 }
 
+/// The refresh rate of the display `window` is on, if the system says.
+pub fn display_rate(window: &Window) -> Option<f64> {
+    let mhz = window.current_monitor()?.refresh_rate_millihertz()?;
+    Some(f64::from(mhz) / 1000.0)
+}
+
 struct App<G> {
     session: Session<G>,
     cfg: RunConfig,
@@ -64,6 +68,7 @@ struct App<G> {
     /// Draws between game frames, when the refresh rate is above the game's.
     redraw: Option<Pacer>,
     window: Option<Arc<Window>>,
+    menu: Option<Menu>,
     keys: HashSet<KeyCode>,
     gilrs: Option<Gilrs>,
     /// Controllers already named on the console.
@@ -72,6 +77,55 @@ struct App<G> {
 }
 
 impl<G: Guest> App<G> {
+    /// Applies the window settings: redraw rate, and the guest's picture.
+    fn view(&mut self) {
+        let display = self.window.as_deref().and_then(display_rate);
+        let rate = self.cfg.window.redraw_rate(self.cfg.frame_rate, display);
+        self.redraw = rate.map(|r| Pacer::new(r, Instant::now()));
+        let blend = rate.map(|_| self.cfg.frame_rate);
+        self.session.guest.view(&self.cfg.window, blend);
+        if let Some(m) = &self.menu {
+            m.show(&self.cfg.window);
+        }
+    }
+
+    /// Carries out a menu choice and saves window settings.
+    fn act(&mut self, action: Action, event_loop: &ActiveEventLoop) {
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        let w = &mut self.cfg.window;
+        match action {
+            Action::OpenRom(rom) => {
+                if let Ok(exe) = std::env::current_exe() {
+                    match std::process::Command::new(exe).arg(rom).spawn() {
+                        Ok(_) => event_loop.exit(),
+                        Err(e) => eprintln!("warning: starting the other ROM: {e}"),
+                    }
+                }
+                return;
+            }
+            Action::Refresh(r) => w.refresh = r,
+            Action::Widescreen(on) => w.widescreen = on,
+            Action::ConsoleFilter(on) => w.console_filter = on,
+            Action::Scale(s) => {
+                w.scale = s;
+                window.set_fullscreen(None);
+                let _ =
+                    window.request_inner_size(LogicalSize::new(320.0 * s as f64, 240.0 * s as f64));
+            }
+            Action::Fullscreen => {
+                let full = window.fullscreen().is_none();
+                window.set_fullscreen(full.then_some(Fullscreen::Borderless(None)));
+                return;
+            }
+        }
+        self.view();
+        if let Err(e) = self.cfg.save_window() {
+            eprintln!("warning: saving window settings: {e}");
+        }
+    }
+
     fn live_pads(&mut self) -> Pads {
         let mut pads = Pads::default();
         let gilrs = &mut self.gilrs;
@@ -112,8 +166,10 @@ impl<G: Guest> ApplicationHandler for App<G> {
         match event_loop.create_window(attrs) {
             Ok(window) => {
                 let window = Arc::new(window);
+                self.menu = Menu::new(&window, &self.cfg.window);
                 self.session.guest.attach_window(window.clone());
                 self.window = Some(window);
+                self.view();
             }
             Err(e) => {
                 self.error = Some(format!("opening the window: {e}"));
@@ -134,7 +190,9 @@ impl<G: Guest> ApplicationHandler for App<G> {
                     },
                 ..
             } => {
-                if state == ElementState::Pressed {
+                if state == ElementState::Pressed && key == KeyCode::F11 {
+                    self.act(Action::Fullscreen, event_loop);
+                } else if state == ElementState::Pressed {
                     self.keys.insert(key);
                 } else {
                     self.keys.remove(&key);
@@ -147,6 +205,9 @@ impl<G: Guest> ApplicationHandler for App<G> {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        while let Some(a) = self.menu.as_ref().and_then(Menu::poll) {
+            self.act(a, event_loop);
+        }
         if self.pacer.due(Instant::now()) {
             let live = self.live_pads();
             if self.session.tick(&live, false) == Tick::Done {

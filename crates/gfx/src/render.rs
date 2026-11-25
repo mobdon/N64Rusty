@@ -286,7 +286,7 @@ impl Renderer {
     }
 
     /// Sharp textures (the default): magnified textures keep crisp texel
-    /// edges with a one-pixel blend between texels, instead of the
+    /// edges with a one-screen-pixel blend between texels, instead of the
     /// console's soft filtering stretched to the window. Off gives the
     /// console look.
     pub fn set_sharp_textures(&mut self, on: bool) {

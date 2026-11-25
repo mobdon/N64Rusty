@@ -12,8 +12,9 @@
 //!   bars;
 //! - each audio buffer goes to the speakers on a thread of its own.
 //!
-//! With `refresh` in the window config above the game's rate, the window is
-//! drawn that often: each picture blends object placement from the
+//! With `refresh` in the window config above the game's rate (or 0, the
+//! default, on a display faster than the game), the window is drawn that
+//! often: each picture blends object placement from the
 //! previous game frame to the newest one by how much of a game frame has
 //! passed (see `n64rusty_gfx::interpolate`). The game still runs at its
 //! own rate; what is shown trails it by one game frame.
@@ -201,6 +202,16 @@ impl Guest for Screen {
         }
     }
 
+    fn view(&mut self, w: &n64rusty_host::config::WindowConfig, blend: Option<f64>) {
+        self.widescreen = w.widescreen;
+        self.sharp = !w.console_filter;
+        self.blend = blend.map(|rate| Duration::from_secs_f64(1.0 / rate));
+        if let Some((_, r, _)) = &mut self.window {
+            r.set_widescreen(self.widescreen);
+            r.set_sharp_textures(self.sharp);
+        }
+    }
+
     fn attach_window(&mut self, window: Arc<Window>) {
         let target = Renderer::new().and_then(|mut r| {
             r.set_widescreen(self.widescreen);
@@ -271,11 +282,6 @@ pub fn play(
     let (live, mut screen) = pair(media);
     screen.widescreen = cfg.window.widescreen;
     screen.sharp = !cfg.window.console_filter;
-    screen.blend = cfg
-        .window
-        .refresh
-        .filter(|&r| r > cfg.frame_rate)
-        .map(|_| Duration::from_secs_f64(1.0 / cfg.frame_rate));
     std::thread::Builder::new()
         .name("game".into())
         .spawn(move || std::process::exit(run(Box::new(live)).into()))

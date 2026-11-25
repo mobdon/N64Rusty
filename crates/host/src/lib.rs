@@ -8,6 +8,7 @@
 pub mod config;
 pub mod debug;
 pub mod mapping;
+pub mod menu;
 pub mod pad;
 pub mod script;
 pub mod session;

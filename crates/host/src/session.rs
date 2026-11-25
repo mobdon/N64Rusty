@@ -30,6 +30,11 @@ pub trait Guest {
     /// Draw the window again between game frames, at the `refresh` rate of
     /// the window config. Never called otherwise.
     fn redraw(&mut self) {}
+
+    /// The window settings changed (or the window opened): picture shape,
+    /// texture look, and `Some(game frame rate)` when pictures should blend
+    /// between game frames because the window draws faster than that.
+    fn view(&mut self, _window: &crate::config::WindowConfig, _blend: Option<f64>) {}
 }
 
 /// What [`Session::tick`] did.
