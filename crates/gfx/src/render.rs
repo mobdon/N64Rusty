@@ -297,7 +297,9 @@ impl Renderer {
     /// `height` target is drawn: 1 unless widescreen is on and the target
     /// is wider.
     fn wide(&self, frame: &Frame, width: u32, height: u32) -> f32 {
-        if !self.widescreen {
+        // A pre-rendered background has nothing beyond its 4:3 edges, and
+        // the 3D scene placed against it must not show past them either.
+        if !self.widescreen || frame.draws().any(|d| d.state.scenery) {
             return 1.0;
         }
         let r = (width as f32 * frame.height() as f32) / (height as f32 * frame.width as f32);
@@ -1307,6 +1309,7 @@ mod tests {
             textures: [None; 2],
             rect: false,
             texel_exact: false,
+            scenery: false,
             color_image: 0,
             scissor: None,
         }

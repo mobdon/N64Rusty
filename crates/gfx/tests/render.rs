@@ -382,6 +382,31 @@ fn widescreen_shows_the_sides_and_keeps_shapes() {
     assert_eq!(a.rgba, r.render(&f, 320, 240).unwrap().rgba);
 }
 
+#[test]
+fn widescreen_keeps_a_prerendered_background_in_shape() {
+    let Some(mut r) = renderer() else { return };
+    let mut ram = Ram::default();
+    // A full-frame red background picture (2D background copy): 3D draws
+    // are placed against it, so unlike a plain full-width rectangle it is
+    // not stretched, and the frame keeps 4:3 with black bars.
+    let image = ram.put(&[0xF8, 0x01].repeat(320 * 240));
+    let mut bg = Vec::new();
+    for h in [0u16, 320 * 4, 0, 320 * 4, 0, 240 * 4, 0, 240 * 4] {
+        bg.extend_from_slice(&h.to_be_bytes());
+    }
+    bg.extend_from_slice(&image.to_be_bytes());
+    bg.extend_from_slice(&[0, 0, 0, 2, 0, 0, 0, 0]);
+    let bg = ram.put(&bg);
+    let dl = scene(&mut ram, |_, dl| {
+        dl.load_ucode_2d().bg_copy(bg).load_ucode_2d();
+    });
+    let f = frame(&mut ram, &dl);
+    r.set_widescreen(true);
+    let img = r.render_letterboxed(&f, 640, 360).unwrap();
+    assert_px(&img, 320, 180, RED);
+    assert_px(&img, 20, 180, [0, 0, 0, 255]);
+}
+
 /// A red square at object x offset `dx`, drawn from the same display list
 /// code each frame, as a game redraws a moving object.
 fn moved_square(dx: f32) -> Frame {
