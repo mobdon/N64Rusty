@@ -175,13 +175,14 @@ fn vs(@location(0) pos: vec4f, @location(1) color: vec4f, @location(2) uv0: vec2
 // (same mip choice).
 fn sharp(t: texture_2d<f32>, s: sampler, uv: vec2f) -> vec4f {{
     let size = vec2f(textureDimensions(t, 0));
-    let texel = uv * size - 0.5;
+    let texel = uv * size;
+    // The nearest edge between two texels (texel centres sit at .5).
     let seam = floor(texel + 0.5);
     let per_px = max(fwidth(texel), vec2f(1e-6));
     // Blend over one screen pixel (never wider than plain filtering).
     let k = max(vec2f(1.0) / per_px, vec2f(1.0));
     let o = clamp((texel - seam) * k, vec2f(-0.5), vec2f(0.5));
-    return textureSampleGrad(t, s, (seam + o + 0.5) / size, dpdx(uv), dpdy(uv));
+    return textureSampleGrad(t, s, (seam + o) / size, dpdx(uv), dpdy(uv));
 }}
 
 @fragment
