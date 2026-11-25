@@ -75,6 +75,11 @@ fn play(args: &mut Vec<String>, dir: &Path, plain: bool) -> ExitCode {
     if plain {
         args.push("--window".into());
     }
+    // Like a console with the Expansion Pak: games that need it run, and
+    // the others only see more free memory.
+    if !args.iter().any(|a| a == "--expansion") {
+        args.push("--expansion".into());
+    }
     let game = Game {
         register: |_| {},
         entry: rom.entry(),

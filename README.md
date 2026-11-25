@@ -214,7 +214,8 @@ function runs in the reference interpreter, with system routines replaced
 as usual. On Windows, double-click `n64rusty-play.exe`: it plays a ROM
 dropped on it, else the one picked last time (`last-rom.txt`), else the
 first `.z64`/`.n64`/`.v64` in its own folder, else asks for one in a file
-window. It opens the game with `--window`.
+window. It opens the game with `--window`, and always with `--expansion`
+(8 MB of RAM, as with the Expansion Pak fitted), so games that need it run.
 
 Its files live next to the program: `games/<sha256>/` per game (the
 routine list `config.toml`, `save.sra`, `run.toml`) and `routines.txt`.
