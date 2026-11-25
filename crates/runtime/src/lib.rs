@@ -87,6 +87,9 @@ pub struct Ctx {
     pub deadline: u64,
     /// See [`Ctx::deadline`].
     pub on_deadline: Option<GuestFn>,
+    /// Runs a call to code with no translation (an interpreter, say), given
+    /// the address; without one such a call panics.
+    pub on_missing: Option<fn(&mut Ctx, u32)>,
 }
 
 struct Overlay {
@@ -127,6 +130,7 @@ impl Ctx {
             clock: 0,
             deadline: u64::MAX,
             on_deadline: None,
+            on_missing: None,
         }
     }
 
@@ -279,6 +283,31 @@ impl Ctx {
     /// through here.
     pub fn call(&mut self, addr: u32) {
         let f = self.lookup(addr).or_else(|| self.verify_image(addr));
+        self.tick(addr);
+        match f {
+            Some(f) => {
+                self.depth += 1;
+                f(self);
+                self.depth -= 1;
+            }
+            None if self.on_missing.is_some() => {
+                let run = self.on_missing.unwrap();
+                self.depth += 1;
+                run(self, addr);
+                self.depth -= 1;
+            }
+            None => panic!(
+                "call to unknown guest function {addr:#010x}{}{}",
+                memory::wild_hint(addr),
+                self.overlays_at(addr)
+            ),
+        }
+    }
+
+    /// What every call costs: it goes in the trace and moves the clock, and
+    /// a due deadline runs its handler. An interpreter calls this for the
+    /// calls it makes itself, so time moves as in translated code.
+    pub fn tick(&mut self, addr: u32) {
         self.trace[(self.calls % TRACE_LEN as u64) as usize] = addr;
         self.calls += 1;
         self.clock = self.clock.wrapping_add(u64::from(COUNT_PER_CALL));
@@ -287,18 +316,6 @@ impl Ctx {
                 self.deadline = u64::MAX;
                 h(self);
             }
-        }
-        match f {
-            Some(f) => {
-                self.depth += 1;
-                f(self);
-                self.depth -= 1;
-            }
-            None => panic!(
-                "call to unknown guest function {addr:#010x}{}{}",
-                memory::wild_hint(addr),
-                self.overlays_at(addr)
-            ),
         }
     }
 
