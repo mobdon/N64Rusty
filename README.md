@@ -50,9 +50,12 @@ function pointers built with `lui`/`addiu` that point at a function prologue.
 `--symbols` adds function addresses from a symbol map (lines like
 `name = 0x80001234;`) read from your own local checkout of a decompilation
 project; it is never copied into this repository. Output goes to the
-git-ignored `local/<sha256>/` folder: `out/` (the generated crate, one file
-per 64 KiB of address space, rewritten only when its contents change),
-`report.txt` and a `config.toml` template.
+git-ignored `local/<sha256>/` folder: `out/` (the generated game: one small
+crate per 64 KiB of address space and per overlay under `out/parts/`, each
+rewritten only when its contents change, so adding a function rebuilds one
+part and relinks; formatting is turned off there), `report.txt` and a
+`config.toml` template. Keep `out/target/`: it is the build cache, and
+cleaning it means a full rebuild.
 
 On Linux, building needs `libudev-dev` (for gamepads) and `libasound2-dev`
 (for sound).
