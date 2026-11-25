@@ -248,7 +248,7 @@ To share the program, give the folder with `n64rusty-play.exe` and
 `routines.txt`; each person uses their own ROM. Never share the `games`
 folder's saved images or a ROM. Or build the data in: with
 `N64RUSTY_PLAYER_DATA` set to a local folder holding `routines.txt` and
-`games/<sha256>/config.toml` routine lists when building, the program
+`games/<sha256>/` routine lists (`config.toml`) and settings (`run.toml`, such as widescreen HUD areas) when building, the program
 carries them and the program alone is enough. A built-in list replaces one
 found by fingerprint, but not one written from `--symbols`. Any other arguments work as for a generated
 game program (`--frames`, `--capture`, `--window`, and so on).
