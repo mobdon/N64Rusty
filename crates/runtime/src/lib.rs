@@ -338,6 +338,12 @@ impl Ctx {
     /// What every call costs: it goes in the trace and moves the clock, and
     /// a due deadline runs its handler. An interpreter calls this for the
     /// calls it makes itself, so time moves as in translated code.
+    /// The address of the call being made (the last one [`Ctx::tick`]
+    /// counted): lets one override serve many addresses.
+    pub fn last_call(&self) -> u32 {
+        self.trace[((self.calls + TRACE_LEN as u64 - 1) % TRACE_LEN as u64) as usize]
+    }
+
     pub fn tick(&mut self, addr: u32) {
         self.trace[(self.calls % TRACE_LEN as u64) as usize] = addr;
         self.calls += 1;
