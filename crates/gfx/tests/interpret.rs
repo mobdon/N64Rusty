@@ -604,3 +604,32 @@ fn a_narrow_image_at_a_wide_ones_address_reads_back_alone_at_its_scissor_height(
     it.run_readback(&mut ram.bytes, addr, &mut rb).unwrap();
     assert_eq!(rb.asked, [(img, 4, 7, 1)]);
 }
+
+#[test]
+fn strip_loads_of_a_narrow_image_read_it_once_and_never_the_wide_one_at_its_address() {
+    let mut ram = Ram::default();
+    let img = ram.put(&[0; 16 * 12 * 2]);
+    let mut dl = Dl::default();
+    setup(&mut ram, &mut dl);
+    dl.cimg(img, 4)
+        .other_modes(CYCLE_1, 0)
+        .scissor(0, 0, 4, 7)
+        .tex_rect(0, [0, 0, 4, 7], [0, 0], [1 << 10, 1 << 10])
+        // The full buffer drawn after it, at the same address.
+        .cimg(img, 16)
+        .scissor(0, 0, 16, 12)
+        .tex_rect(0, [0, 0, 16, 12], [0, 0], [1 << 10, 1 << 10])
+        // The small picture copied out in two strips, then the full one.
+        .timg(0, 2, 4, img)
+        .load_block(7, 8)
+        .timg(0, 2, 4, img + 4 * 2 * 2)
+        .load_block(7, 8)
+        .timg(0, 2, 16, img)
+        .load_block(7, 16)
+        .end();
+    let addr = ram.dl(&dl);
+    let mut it = Interpreter::new();
+    let mut rb = Counting { asked: Vec::new() };
+    it.run_readback(&mut ram.bytes, addr, &mut rb).unwrap();
+    assert_eq!(rb.asked, [(img, 4, 7, 1), (img, 16, 12, 1)]);
+}
