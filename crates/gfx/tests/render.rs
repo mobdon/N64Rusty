@@ -409,13 +409,17 @@ fn moved_square(dx: f32) -> Frame {
 #[test]
 fn pictures_between_frames_blend_the_movement() {
     let Some(mut r) = renderer() else { return };
-    // The square moves from x = -50 to x = +50 (pixel 80 to 240).
-    let (prev, cur) = (moved_square(-50.0), moved_square(50.0));
+    // The square moves from x = -15 to x = +15 (pixel 136 to 184).
+    let (prev, cur) = (moved_square(-15.0), moved_square(15.0));
     let at = |img: &Image, x| img.pixel(x, 120) == RED;
     let start = r.render_between(&prev, &cur, 0.0, 320, 240).unwrap();
-    assert!(at(&start, 80) && !at(&start, 160) && !at(&start, 240));
+    assert!(at(&start, 136) && !at(&start, 160) && !at(&start, 184));
     let half = r.render_between(&prev, &cur, 0.5, 320, 240).unwrap();
-    assert!(!at(&half, 80) && at(&half, 160) && !at(&half, 240));
+    assert!(!at(&half, 136) && at(&half, 160) && !at(&half, 184));
     let end = r.render_between(&prev, &cur, 1.0, 320, 240).unwrap();
     assert_eq!(end.rgba, r.render_letterboxed(&cur, 320, 240).unwrap().rgba);
+    // Half the screen in one frame is a cut: shown where it ends up.
+    let (far, cur) = (moved_square(-50.0), moved_square(50.0));
+    let cut = r.render_between(&far, &cur, 0.5, 320, 240).unwrap();
+    assert_eq!(cut.rgba, r.render_letterboxed(&cur, 320, 240).unwrap().rgba);
 }
