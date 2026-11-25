@@ -102,10 +102,12 @@ fn error_box(text: &str) {
 fn error_box(_text: &str) {}
 
 fn play(args: &mut Vec<String>, dir: &Path, plain: bool) -> ExitCode {
+    // Its Game menu can go back to the start screen.
+    n64rusty_host::menu::START_SCREEN.store(true, std::sync::atomic::Ordering::Relaxed);
     let recent = dir.join("recent.txt");
     if args.first().is_none_or(|a| a.starts_with("--")) {
         let recent = n64rusty_host::menu::recent_roms();
-        if plain && !recent.is_empty() {
+        if args.is_empty() && !recent.is_empty() {
             // The start screen has its own window, and a program gets one
             // window loop: the game plays in a fresh start of the program.
             let Some(rom) = n64rusty_host::launcher::pick(&recent) else {

@@ -27,6 +27,10 @@ pub enum Action {
     OpenModsFolder,
 }
 
+/// Set by a program with a start screen (the player): the Game menu then
+/// offers "All games...", which starts the program again with no ROM.
+pub static START_SCREEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// The `mods` folder next to the program.
 pub fn mods_dir() -> Option<std::path::PathBuf> {
     Some(std::env::current_exe().ok()?.parent()?.join("mods"))
@@ -234,7 +238,10 @@ mod imp {
                 mods_folder: MenuItem::new("Open mods folder", true, None),
             };
             let sep0 = PredefinedMenuItem::separator();
-            let mut game: Vec<&dyn muda::IsMenuItem> = vec![&m.list, &m.open];
+            let mut game: Vec<&dyn muda::IsMenuItem> = vec![&m.open];
+            if super::START_SCREEN.load(std::sync::atomic::Ordering::Relaxed) {
+                game.insert(0, &m.list);
+            }
             if !m.games.is_empty() {
                 game.push(&sep0);
             }
