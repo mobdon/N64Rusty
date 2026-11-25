@@ -183,6 +183,71 @@ struct Os {
 
 static OS: OnceLock<Os> = OnceLock::new();
 
+/// A memory write a run makes at each retrace from `from` to `to` (see
+/// `--poke`): a debugging aid, for example to start a game somewhere else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Poke {
+    pub from: u64,
+    pub to: u64,
+    pub addr: u32,
+    pub value: u32,
+    /// 1, 2 or 4.
+    pub bytes: u8,
+}
+
+static POKES: Mutex<Vec<Poke>> = Mutex::new(Vec::new());
+
+/// Sets the memory writes this run makes.
+pub fn set_pokes(pokes: Vec<Poke>) {
+    *POKES.lock().unwrap_or_else(|e| e.into_inner()) = pokes;
+}
+
+/// Parses a poke script: `frame[-last] addr value [bytes]` per line, frame
+/// numbers in decimal (retraces), address and value in hex, bytes 1, 2 or 4
+/// (default 4). `#` starts a comment.
+pub fn parse_pokes(text: &str) -> Result<Vec<Poke>, String> {
+    let hex = |t: &str| u32::from_str_radix(t.trim_start_matches("0x"), 16).ok();
+    let mut out = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let f: Vec<&str> = line.split_whitespace().collect();
+        let bad = || format!("line {}: expected `frame[-last] addr value [bytes]`", n + 1);
+        let (Some(frames), Some(addr), Some(value)) = (f.first(), f.get(1), f.get(2)) else {
+            return Err(bad());
+        };
+        let (from, to) = frames.split_once('-').unwrap_or((frames, frames));
+        let bytes = f.get(3).map_or(Some(4), |b| b.parse().ok());
+        match (from.parse(), to.parse(), hex(addr), hex(value), bytes) {
+            (Ok(from), Ok(to), Some(addr), Some(value), Some(bytes @ (1 | 2 | 4))) => {
+                out.push(Poke {
+                    from,
+                    to,
+                    addr,
+                    value,
+                    bytes,
+                })
+            }
+            _ => return Err(bad()),
+        }
+    }
+    Ok(out)
+}
+
+fn apply_pokes(c: &mut Ctx, frame: u64) {
+    for p in POKES.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        if (p.from..=p.to).contains(&frame) {
+            match p.bytes {
+                1 => c.mem.write_u8(p.addr, p.value as u8),
+                2 => c.mem.write_u16(p.addr, p.value as u16),
+                _ => c.mem.write_u32(p.addr, p.value),
+            }
+        }
+    }
+}
+
 /// Text of the last panic, set by the panic hook.
 pub static PANIC_MESSAGE: Mutex<String> = Mutex::new(String::new());
 
@@ -356,6 +421,7 @@ fn deliver_due(c: &mut Ctx, st: &mut State) {
         flash_ops(c, st);
         st.next_vi += TICKS_PER_FRAME;
         st.frames += 1;
+        apply_pokes(c, st.frames);
         st.devices.retrace(st.frames, st.framebuffer);
         if let Some((mq, msg, every)) = st.vi {
             if every > 0 && st.frames.is_multiple_of(u64::from(every)) {
@@ -1294,7 +1360,13 @@ fn format_guest(c: &Ctx, fmt: u32, first: usize) -> String {
             'o' => format!("{:o}", next()),
             'p' => format!("{:08x}", next()),
             'c' => char::from(next() as u8).to_string(),
-            's' => guest_str(c, next()),
+            's' => {
+                let t = guest_str(c, next());
+                match prec {
+                    Some(p) => t.chars().take(p).collect(),
+                    None => t,
+                }
+            }
             'f' | 'e' | 'g' | 'F' | 'E' | 'G' => {
                 // Doubles take an even pair of argument slots.
                 k += k % 2;
@@ -1302,10 +1374,7 @@ fn format_guest(c: &Ctx, fmt: u32, first: usize) -> String {
                 let lo = u64::from(arg(c, k + 1));
                 k += 2;
                 let v = f64::from_bits(hi << 32 | lo);
-                match conv {
-                    'e' | 'E' => format!("{v:.*e}", prec.unwrap_or(6)),
-                    _ => format!("{v:.*}", prec.unwrap_or(6)),
-                }
+                c_float(v, conv, prec.unwrap_or(6))
             }
             other => format!("%{spec}{other}"),
         };
@@ -1313,12 +1382,67 @@ fn format_guest(c: &Ctx, fmt: u32, first: usize) -> String {
         if left {
             out.push_str(&body);
             out.extend(std::iter::repeat_n(' ', pad));
+        } else if zero && conv != 's' && conv != 'c' {
+            // Zeros go after the sign.
+            let digits = body.strip_prefix('-').map_or(&body[..], |d| {
+                out.push('-');
+                d
+            });
+            out.extend(std::iter::repeat_n('0', pad));
+            out.push_str(digits);
         } else {
-            out.extend(std::iter::repeat_n(if zero { '0' } else { ' ' }, pad));
+            out.extend(std::iter::repeat_n(' ', pad));
             out.push_str(&body);
         }
     }
     out
+}
+
+/// `v` as C's `printf` writes it with conversion `conv` (f e g F E G) and
+/// precision `prec`.
+fn c_float(v: f64, conv: char, prec: usize) -> String {
+    // C writes the exponent with a sign and at least two digits.
+    let exp = |p: usize| {
+        let t = format!("{v:.p$e}");
+        let (m, e) = t.split_once('e').unwrap_or((&t, "0"));
+        let e: i32 = e.parse().unwrap_or(0);
+        format!("{m}e{}{:02}", if e < 0 { '-' } else { '+' }, e.abs())
+    };
+    let t = match conv.to_ascii_lowercase() {
+        'e' => exp(prec),
+        'g' => {
+            let p = prec.max(1);
+            let x = if v == 0.0 {
+                0
+            } else {
+                format!("{v:.*e}", p - 1)
+                    .split_once('e')
+                    .and_then(|(_, e)| e.parse::<i32>().ok())
+                    .unwrap_or(0)
+            };
+            // Trailing zeros (and a bare point) are dropped.
+            let trim = |t: String| {
+                if t.contains('.') {
+                    t.trim_end_matches('0').trim_end_matches('.').to_string()
+                } else {
+                    t
+                }
+            };
+            if x < -4 || x >= p as i32 {
+                let t = exp(p - 1);
+                let (m, e) = t.split_once('e').unwrap_or((&t, ""));
+                format!("{}e{e}", trim(m.to_string()))
+            } else {
+                trim(format!("{v:.*}", (p as i32 - 1 - x).max(0) as usize))
+            }
+        }
+        _ => format!("{v:.prec$}"),
+    };
+    if conv.is_ascii_uppercase() {
+        t.to_uppercase()
+    } else {
+        t
+    }
 }
 
 fn ret_zero(c: &mut Ctx) {
@@ -1431,6 +1555,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn poke_scripts_parse() {
+        let p = parse_pokes("# warp\n100 0x8011AC80 bb\n200-210 80001000 1 1\n").unwrap();
+        assert_eq!(
+            p[0],
+            Poke {
+                from: 100,
+                to: 100,
+                addr: 0x8011_AC80,
+                value: 0xBB,
+                bytes: 4
+            }
+        );
+        assert_eq!(
+            p[1],
+            Poke {
+                from: 200,
+                to: 210,
+                addr: 0x8000_1000,
+                value: 1,
+                bytes: 1
+            }
+        );
+        assert!(parse_pokes("100 8011AC80").is_err());
+        assert!(parse_pokes("100 8011AC80 1 3").is_err());
+    }
+
+    #[test]
     fn formats_a_guest_debug_print() {
         let mut c = Ctx::new(n64rusty_runtime::Memory::new(0x1000));
         let put = |c: &mut Ctx, at: u32, s: &str| {
@@ -1452,6 +1603,21 @@ mod tests {
             format_guest(&c, 0x8000_0100, 1),
             "load at 000000AB: -5% z  | 2.50"
         );
+        put(&mut c, 0x100, "%05d|%.2s");
+        c.r[5] = (-42i32) as u32 as u64;
+        c.r[6] = 0x8000_0200;
+        assert_eq!(format_guest(&c, 0x8000_0100, 1), "-0042|lo");
+    }
+
+    #[test]
+    fn floats_print_as_c_does() {
+        assert_eq!(c_float(1.5, 'e', 6), "1.500000e+00");
+        assert_eq!(c_float(0.00012, 'E', 2), "1.20E-04");
+        assert_eq!(c_float(2.5, 'g', 6), "2.5");
+        assert_eq!(c_float(1234567.0, 'g', 6), "1.23457e+06");
+        assert_eq!(c_float(0.0001, 'g', 6), "0.0001");
+        assert_eq!(c_float(100.0, 'G', 6), "100");
+        assert_eq!(c_float(-3.25, 'f', 1), "-3.2");
     }
 
     #[test]

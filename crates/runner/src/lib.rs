@@ -235,6 +235,9 @@ fn written_code(ram: &[u8], rom: &[u8], entry: u32, addr: u32) -> Option<(u32, u
     Some((base | lo as u32, base | hi as u32))
 }
 
+/// Where `--ram-out` saves RAM at the end of the run.
+static RAM_OUT: Mutex<Option<PathBuf>> = Mutex::new(None);
+
 static NAMES: Mutex<BTreeMap<u32, String>> = Mutex::new(BTreeMap::new());
 
 /// Text describing the state at a panic: recent calls and registers.
@@ -364,6 +367,19 @@ pub fn main_with(game: Game, devices: Option<Box<dyn devices::Devices>>) -> Exit
             "--capture" => capture = Some(PathBuf::from(v)),
             "--wav" => wav = Some(PathBuf::from(v)),
             "--input" => input = Some(PathBuf::from(v)),
+            "--poke" => {
+                match std::fs::read_to_string(v)
+                    .map_err(|e| e.to_string())
+                    .and_then(|t| os::parse_pokes(&t))
+                {
+                    Ok(p) => os::set_pokes(p),
+                    Err(e) => {
+                        eprintln!("error: poke script {v}: {e}");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            "--ram-out" => *RAM_OUT.lock().unwrap() = Some(PathBuf::from(v)),
             "--save" => save = Some(PathBuf::from(v)),
             "--run" => run_config = Some(PathBuf::from(v)),
             "--frames" | "--capture-every" | "--capture-scale" => {
@@ -388,7 +404,7 @@ pub fn main_with(game: Game, devices: Option<Box<dyn devices::Devices>>) -> Exit
     }
     let Some(rom_path) = rom_path else {
         eprintln!(
-            "usage: <game> <rom> [--symbols file]... [--config file] [--frames n] [--local dir] [--capture dir] [--capture-every n] [--capture-scale n] [--capture-wide] [--capture-between] [--wav file] [--input script] [--expansion] [--save file] [--window] [--run run.toml]"
+            "usage: <game> <rom> [--symbols file]... [--config file] [--frames n] [--local dir] [--capture dir] [--capture-every n] [--capture-scale n] [--capture-wide] [--capture-between] [--wav file] [--input script] [--poke script] [--ram-out file] [--expansion] [--save file] [--window] [--run run.toml]"
         );
         return ExitCode::from(2);
     };
@@ -546,6 +562,11 @@ fn run_and_report(
         (ctx.r[31] as u32).wrapping_sub(8)
     );
     print!("{device_summary}");
+    if let Some(p) = RAM_OUT.lock().unwrap().as_ref() {
+        if let Err(e) = std::fs::write(p, ctx.mem.bytes()) {
+            eprintln!("warning: could not write RAM to {}: {e}", p.display());
+        }
+    }
     match outcome {
         os::Outcome::Frames(n) => {
             println!("ran {n} frames without a panic");
