@@ -24,6 +24,10 @@ USAGE:
 COMMANDS:
     info <rom>                 Print byte order, SHA-256, header and boot details
     translate <rom> [OPTIONS]  Find functions in the boot segment and write Rust
+    match <ref-rom> <rom> --symbols <ref-map>...
+                               Print a symbol map for <rom>: each routine named
+                               in the reference map whose code (addresses
+                               masked) is found once in <rom>'s boot segment
     version                    Print tool and runtime versions
     help                       Print this message
 
@@ -54,6 +58,7 @@ fn main() -> ExitCode {
             None => Err("info needs a ROM path".into()),
         },
         Some("translate") => translate(&args[1..]),
+        Some("match") => match_routines(&args[1..]),
         None | Some("help") | Some("--help") | Some("-h") => {
             print!("{USAGE}");
             Ok(())
@@ -529,9 +534,164 @@ fn translate(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// An instruction word with what relocation changes taken out: jump
+/// targets, `lui` values and the offsets of addressing not based on `sp`.
+fn masked(w: u32) -> u32 {
+    match w >> 26 {
+        2 | 3 => w & 0xFC00_0000,
+        0x0F => w & 0xFFFF_0000,
+        0x09 | 0x0D | 0x20..=0x2F | 0x31 | 0x35 | 0x37 | 0x39 | 0x3D | 0x3F
+            if (w >> 21) & 31 != 29 =>
+        {
+            w & 0xFFFF_0000
+        }
+        _ => w,
+    }
+}
+
+fn words(seg: &[u8]) -> Vec<u32> {
+    seg.chunks_exact(4)
+        .map(|c| u32::from_be_bytes(c.try_into().unwrap()))
+        .collect()
+}
+
+/// Finds each reference routine `(addr, name, len in words)` in `target`
+/// (the words of a boot segment loaded at `base`), comparing code with
+/// [`masked`]. A routine found exactly once is named; so is one that a named
+/// routine calls from the same place in both, when its code matches there.
+fn find_routines(
+    reference: &[u32],
+    ref_base: u32,
+    routines: &[(u32, String, usize)],
+    target: &[u32],
+    base: u32,
+) -> Vec<(u32, String)> {
+    let mref: Vec<u32> = reference.iter().map(|&w| masked(w)).collect();
+    let mtgt: Vec<u32> = target.iter().map(|&w| masked(w)).collect();
+    let code = |addr: u32, len: usize| {
+        let at = ((addr - ref_base) / 4) as usize;
+        mref.get(at..at + len)
+    };
+    let fits = |c: &[u32], t: u32| {
+        let i = (t.wrapping_sub(base) / 4) as usize;
+        t >= base && mtgt.get(i..i + c.len()) == Some(c)
+    };
+    let mut index: HashMap<&[u32], Vec<usize>> = HashMap::new();
+    for i in 0..mtgt.len().saturating_sub(2) {
+        index.entry(&mtgt[i..i + 3]).or_default().push(i);
+    }
+    let by_addr: HashMap<u32, usize> = routines.iter().enumerate().map(|(k, r)| (r.0, k)).collect();
+    let mut found: BTreeMap<usize, u32> = BTreeMap::new();
+    for (k, (addr, _, len)) in routines.iter().enumerate() {
+        let Some(c) = code(*addr, *len).filter(|_| *len >= 3) else {
+            continue;
+        };
+        let hits: Vec<usize> = index.get(&c[..3]).into_iter().flatten().copied()
+            .filter(|&i| mtgt.get(i..i + len) == Some(c))
+            .collect();
+        if let [i] = hits[..] {
+            found.insert(k, base + 4 * i as u32);
+        }
+    }
+    // Follow calls out of what is named until nothing new turns up.
+    let mut work: Vec<usize> = found.keys().copied().collect();
+    while let Some(k) = work.pop() {
+        let (addr, _, len) = &routines[k];
+        let (ra, ta) = (((addr - ref_base) / 4) as usize, ((found[&k] - base) / 4) as usize);
+        for j in 0..*len {
+            let (rw, tw) = (reference[ra + j], target.get(ta + j).copied().unwrap_or(0));
+            if rw >> 26 != 3 || tw >> 26 != 3 {
+                continue;
+            }
+            let (rt, tt) = (0x8000_0000 | (rw & 0x03FF_FFFF) << 2, 0x8000_0000 | (tw & 0x03FF_FFFF) << 2);
+            let Some(&callee) = by_addr.get(&rt) else { continue };
+            let (_, _, clen) = &routines[callee];
+            if found.contains_key(&callee) || *clen == 0 {
+                continue;
+            }
+            if code(rt, *clen).is_some_and(|c| fits(c, tt)) {
+                found.insert(callee, tt);
+                work.push(callee);
+            }
+        }
+    }
+    // One target address gets one name: drop any found twice.
+    let mut count: HashMap<u32, usize> = HashMap::new();
+    for a in found.values() {
+        *count.entry(*a).or_default() += 1;
+    }
+    found
+        .into_iter()
+        .filter(|(_, a)| count[a] == 1)
+        .map(|(k, a)| (a, routines[k].1.clone()))
+        .collect()
+}
+
+fn match_routines(args: &[String]) -> Result<(), String> {
+    let mut paths = Vec::new();
+    let mut symbols = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--symbols" {
+            symbols.push(PathBuf::from(it.next().ok_or("--symbols needs a value")?));
+        } else {
+            paths.push(PathBuf::from(a));
+        }
+    }
+    let [ref_path, path] = &paths[..] else {
+        return Err("match needs a reference ROM and a ROM".into());
+    };
+    let (reference, rom) = (load(ref_path)?, load(path)?);
+    let ref_words = words(reference.boot_segment());
+    let (ref_base, ref_end) = (reference.entry(), reference.entry() + 4 * ref_words.len() as u32);
+    let mut syms = Vec::new();
+    for s in &symbols {
+        syms.extend(read_symbols(s)?);
+    }
+    syms.retain(|(a, _)| (ref_base..ref_end).contains(a));
+    syms.sort();
+    // A routine runs to the next named address; padding at its end is not code.
+    let mut routines = Vec::new();
+    for (i, (a, n)) in syms.iter().enumerate() {
+        let next = syms[i + 1..].iter().map(|s| s.0).find(|&b| b > *a).unwrap_or(ref_end);
+        let at = ((a - ref_base) / 4) as usize;
+        let mut len = ((next - a) / 4) as usize;
+        while len > 0 && ref_words[at + len - 1] == 0 {
+            len -= 1;
+        }
+        routines.push((*a, n.clone(), len.min(0x1000)));
+    }
+    let found = find_routines(&ref_words, ref_base, &routines, &words(rom.boot_segment()), rom.entry());
+    eprintln!("{} of {} reference routines found", found.len(), routines.len());
+    for (a, n) in found {
+        println!("{n} = {a:#010X};");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finds_relocated_routine_once() {
+        const B: u32 = 0x8000_0400;
+        let jal = |t: u32| 0x0C00_0000 | (t & 0x0FFF_FFFF) >> 2;
+        // f: lui a0,X; jal g; addiu a0,a0,X; jr ra | g: lw v0,X(a0); jr ra; nop
+        let g = [0x8C82_0010, 0x03E0_0008, 0];
+        let mut reference = vec![0x3C04_8001, jal(B + 16), 0x2484_0010, 0x03E0_0008];
+        reference.extend(g);
+        let routines = [(B, "f".to_string(), 4), (B + 16, "g".to_string(), 2)];
+        // Moved and relinked; g's shape is also found once more before f.
+        let mut target = vec![0x8C82_0020, 0x03E0_0008, 0, 0];
+        target.extend([0x3C04_8002, jal(B + 32), 0x2484_0020, 0x03E0_0008]);
+        target.extend([0x8C82_0040, 0x03E0_0008, 0]);
+        let r = find_routines(&reference, B, &routines, &target, B);
+        assert_eq!(r, vec![(B + 16, "f".to_string()), (B + 32, "g".to_string())]);
+        // f found twice: neither is named.
+        target.extend([0x3C04_8002, jal(B + 32), 0x2484_0020, 0x03E0_0008]);
+        assert!(find_routines(&reference, B, &routines, &target, B).is_empty());
+    }
 
     #[test]
     fn back_to_back_copies_form_one_run() {
