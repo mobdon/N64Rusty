@@ -163,6 +163,44 @@ fn textured_triangles_sample_the_texture() {
 }
 
 #[test]
+fn unchanged_textures_are_uploaded_once() {
+    let Some(mut r) = renderer() else { return };
+    let mut ram = Ram::default();
+    let tex = ram.put(&[0xF8, 0x01, 0xF8, 0x01, 0, 0, 0, 0]);
+    let verts = ram.vertices(&[
+        v(-100, -100, 0, [255; 4]),
+        v(100, -100, 0, [255; 4]),
+        v(0, 100, 0, [255; 4]),
+    ]);
+    let dl = scene(&mut ram, |_, dl| {
+        dl.other_modes(CYCLE_1 | FILTER_POINT, 0)
+            .combine(pass(TEXEL0))
+            .texture(true, 0)
+            .timg(0, 2, 1, tex)
+            .tile(0, 2, 0, 0, 7)
+            .load_block(7, 2)
+            .tile(0, 2, 1, 0, 0)
+            .tile_size(0, 2, 1)
+            .vtx(verts, 3, 0)
+            .tri(0, 1, 2);
+    });
+    let mut f = frame(&mut ram, &dl);
+    let first = r.render(&f, 320, 240).unwrap();
+    assert_px(&first, 160, 120, RED);
+    r.take_stats();
+    let again = r.render(&f, 320, 240).unwrap();
+    assert_eq!(r.take_stats().textures_new, 0, "same texture kept");
+    assert_eq!(first.rgba, again.rgba);
+    // New content under the same size is a new texture.
+    for px in f.textures[0].rgba.chunks_mut(4) {
+        px.copy_from_slice(&[0, 255, 0, 255]);
+    }
+    let changed = r.render(&f, 320, 240).unwrap();
+    assert_eq!(r.take_stats().textures_new, 1);
+    assert_px(&changed, 160, 120, [0, 255, 0, 255]);
+}
+
+#[test]
 fn depth_buffer_keeps_the_nearer_triangle() {
     let Some(mut r) = renderer() else { return };
     let mut ram = Ram::default();
