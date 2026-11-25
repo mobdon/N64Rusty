@@ -382,6 +382,30 @@ fn widescreen_shows_the_sides_and_keeps_shapes() {
     assert_eq!(a.rgba, r.render(&f, 320, 240).unwrap().rgba);
 }
 
+/// A red square at object x offset `dx`, drawn from the same display list
+/// code each frame, as a game redraws a moving object.
+fn moved_square(dx: f32) -> Frame {
+    let mut ram = Ram::default();
+    let verts = ram.vertices(&[
+        v(-10, -10, 0, [255; 4]),
+        v(10, -10, 0, [255; 4]),
+        v(10, 10, 0, [255; 4]),
+        v(-10, 10, 0, [255; 4]),
+    ]);
+    let mut m = n64rusty_gfx::IDENTITY;
+    m[3][0] = dx;
+    let mtx = ram.matrix(m);
+    let dl = scene(&mut ram, |_, dl| {
+        dl.mtx(mtx, LOAD)
+            .other_modes(CYCLE_1, 0)
+            .combine(pass(PRIM))
+            .prim(0xFF00_00FF)
+            .vtx(verts, 4, 0)
+            .tri2([0, 1, 2], [0, 2, 3]);
+    });
+    frame(&mut ram, &dl)
+}
+
 #[test]
 fn pictures_between_frames_blend_the_movement() {
     let Some(mut r) = renderer() else { return };
