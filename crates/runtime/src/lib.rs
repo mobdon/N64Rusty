@@ -268,9 +268,14 @@ impl Ctx {
     /// The function at `addr`: an override, a loaded overlay's, or a
     /// registered one.
     fn lookup(&self, addr: u32) -> Option<GuestFn> {
-        if let Some(f) = self.overrides.get(&addr) {
-            return Some(*f);
+        match self.overrides.get(&addr) {
+            Some(f) => Some(*f),
+            None => self.lookup_game(addr),
         }
+    }
+
+    /// The function at `addr` as the game has it: overrides skipped.
+    fn lookup_game(&self, addr: u32) -> Option<GuestFn> {
         for (i, dead) in self.loaded.iter().rev() {
             if dead.iter().any(|&(lo, hi)| addr >= lo && addr < hi) {
                 continue;
@@ -288,13 +293,26 @@ impl Ctx {
     /// Calls the guest function at `addr`. Every call in generated code goes
     /// through here.
     pub fn call(&mut self, addr: u32) {
-        let forced = self.interpret.is_some_and(|(lo, hi)| {
-            (lo..hi).contains(&addr) && !self.overrides.contains_key(&addr)
-        });
+        self.call_as(addr, true);
+    }
+
+    /// Calls the game's own function at `addr`, skipping an override there,
+    /// so an override can wrap the function it replaces.
+    pub fn call_original(&mut self, addr: u32) {
+        self.call_as(addr, false);
+    }
+
+    fn call_as(&mut self, addr: u32, overrides: bool) {
+        let overridden = overrides && self.overrides.contains_key(&addr);
+        let forced = self
+            .interpret
+            .is_some_and(|(lo, hi)| (lo..hi).contains(&addr) && !overridden);
         let f = if forced {
             None
+        } else if overridden {
+            self.overrides.get(&addr).copied()
         } else {
-            self.lookup(addr).or_else(|| self.verify_image(addr))
+            self.lookup_game(addr).or_else(|| self.verify_image(addr))
         };
         self.tick(addr);
         match f {
@@ -620,6 +638,23 @@ mod tests {
         assert!(
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c.call(0x8000_0010))).is_err()
         );
+    }
+
+    #[test]
+    fn an_override_can_wrap_the_function_it_replaces() {
+        fn game(c: &mut Ctx) {
+            c.r[2] += 1;
+        }
+        fn wrap(c: &mut Ctx) {
+            c.r[2] += 10;
+            c.call_original(0x8000_0400);
+            c.r[2] += 100;
+        }
+        let mut c = Ctx::new(Memory::new(16));
+        c.register(0x8000_0400, game);
+        c.set_override(0x8000_0400, wrap);
+        c.call(0x8000_0400);
+        assert_eq!(c.r[2], 111);
     }
 
     #[test]
