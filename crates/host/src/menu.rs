@@ -19,6 +19,9 @@ pub enum Action {
     Fullscreen,
     /// Turn the mod file on or off and start the program again.
     ToggleMod(std::path::PathBuf),
+    /// Flip one `name = on|off` line of a mod's options file and start the
+    /// program again.
+    ToggleModOption(std::path::PathBuf, String),
     OpenModsFolder,
 }
 
@@ -48,6 +51,42 @@ pub fn mods() -> Vec<(std::path::PathBuf, bool)> {
         .collect();
     v.sort();
     v
+}
+
+/// A mod's options file: `<mod name>.txt` beside it, which the mod writes.
+pub fn mod_options_file(path: &std::path::Path) -> std::path::PathBuf {
+    let n = path.file_name().unwrap_or_default().to_string_lossy();
+    let base = n.trim_end_matches(".off");
+    let name = base.rsplit_once('.').map_or(base, |(a, _)| a);
+    path.with_file_name(format!("{name}.txt"))
+}
+
+/// The `name = on|off` lines of an options file; other lines are ignored.
+pub fn mod_options(text: &str) -> Vec<(String, bool)> {
+    text.lines()
+        .filter_map(|l| {
+            let (k, v) = l.split_once('=')?;
+            match v.trim() {
+                "on" => Some((k.trim().to_string(), true)),
+                "off" => Some((k.trim().to_string(), false)),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// `text` with option `name` flipped between on and off.
+pub fn flip_mod_option(text: &str, name: &str) -> String {
+    text.lines()
+        .map(|l| match l.split_once('=') {
+            Some((k, v)) if k.trim() == name && ["on", "off"].contains(&v.trim()) => {
+                let to = if v.trim() == "on" { "off" } else { "on" };
+                format!("{} = {to}", k.trim())
+            }
+            _ => l.to_string(),
+        })
+        .map(|l| l + "\n")
+        .collect()
 }
 
 /// The file name that turns the mod at `path` on or off.
@@ -124,6 +163,8 @@ mod imp {
         scales: Vec<MenuItem>,
         full: MenuItem,
         mods: Vec<(CheckMenuItem, std::path::PathBuf)>,
+        /// Each mod's options: item, options file, option name.
+        mod_options: Vec<(CheckMenuItem, std::path::PathBuf, String)>,
         mods_folder: MenuItem,
     }
 
@@ -175,6 +216,17 @@ mod imp {
                         )
                     })
                     .collect(),
+                mod_options: mods()
+                    .into_iter()
+                    .flat_map(|(p, on)| {
+                        let file = mod_options_file(&p);
+                        let text = std::fs::read_to_string(&file).unwrap_or_default();
+                        mod_options(&text).into_iter().map(move |(k, v)| {
+                            let label = format!("    {}", k.replace('&', "&&"));
+                            (CheckMenuItem::new(label, on, v, None), file.clone(), k)
+                        })
+                    })
+                    .collect(),
                 mods_folder: MenuItem::new("Open mods folder", true, None),
             };
             let sep0 = PredefinedMenuItem::separator();
@@ -198,11 +250,17 @@ mod imp {
             let refresh = Submenu::with_items("Refresh", true, &refresh).ok()?;
             let view = Submenu::with_items("View", true, &view).ok()?;
             let sep3 = PredefinedMenuItem::separator();
-            let mut modm: Vec<&dyn muda::IsMenuItem> = m
-                .mods
-                .iter()
-                .map(|(i, _)| i as &dyn muda::IsMenuItem)
-                .collect();
+            let mut modm: Vec<&dyn muda::IsMenuItem> = Vec::new();
+            for (i, p) in &m.mods {
+                modm.push(i);
+                let file = mod_options_file(p);
+                modm.extend(
+                    m.mod_options
+                        .iter()
+                        .filter(|(_, f, _)| *f == file)
+                        .map(|(o, _, _)| o as &dyn muda::IsMenuItem),
+                );
+            }
             if !m.mods.is_empty() {
                 modm.push(&sep3);
             }
@@ -230,6 +288,9 @@ mod imp {
             }
             if let Some((_, p)) = self.mods.iter().find(|(i, _)| *i.id() == id) {
                 return Some(Action::ToggleMod(p.clone()));
+            }
+            if let Some((_, f, k)) = self.mod_options.iter().find(|(i, _, _)| *i.id() == id) {
+                return Some(Action::ToggleModOption(f.clone(), k.clone()));
             }
             if let Some(k) = self.refresh.iter().position(|i| *i.id() == id) {
                 return Some(Action::Refresh(REFRESH[k].1));
@@ -263,8 +324,23 @@ mod imp {
 
 #[cfg(test)]
 mod tests {
-    use super::toggled;
+    use super::{flip_mod_option, mod_options, mod_options_file, toggled};
     use std::path::Path;
+
+    #[test]
+    fn mod_options_read_and_flip() {
+        let text = "# comment\nbeam magic = on\nother = off\n";
+        assert_eq!(
+            mod_options(text),
+            vec![("beam magic".into(), true), ("other".into(), false)]
+        );
+        let flipped = flip_mod_option(text, "beam magic");
+        assert_eq!(flipped, "# comment\nbeam magic = off\nother = off\n");
+        assert_eq!(
+            mod_options_file(Path::new("mods/strong-form.dll.off")),
+            Path::new("mods/strong-form.txt")
+        );
+    }
 
     #[test]
     fn toggling_a_mod_adds_or_drops_off() {
