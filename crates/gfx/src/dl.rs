@@ -76,6 +76,9 @@ pub struct Interpreter {
     segments: [u32; 16],
     modelview: Vec<Mat4>,
     projection: Mat4,
+    /// The combined matrix after a `gSPInsertMatrix` edit, until the next
+    /// matrix load recomputes it.
+    mvp: Option<Mat4>,
     viewport: Viewport,
     vtx: [Loaded; VTX_BUFFER],
     geometry: u32,
@@ -107,6 +110,7 @@ impl Interpreter {
             segments: [0; 16],
             modelview: vec![IDENTITY],
             projection: IDENTITY,
+            mvp: None,
             viewport: Viewport {
                 scale: [160.0, 120.0],
                 trans: [160.0, 120.0],
@@ -305,6 +309,7 @@ impl Interpreter {
             }
         }
         // F3DEX2 stores the push flag inverted.
+        self.mvp = None;
         let params = (w0 & 0xFF) ^ 1;
         let (push, load, projection) = (params & 1 != 0, params & 2 != 0, params & 4 != 0);
         if projection {
@@ -338,6 +343,29 @@ impl Interpreter {
                         l.color = [24, 16, 8].map(|s| ((w1 >> s) & 0xFF) as f32 / 255.0);
                     }
                 }
+            }
+            // gSPInsertMatrix: overwrite two 16-bit halves (integer parts in
+            // the first 32 bytes, fractions in the next 32) of the combined
+            // modelview-projection matrix. Games build billboards this way.
+            0x00 if offset < 64 => {
+                let mut m = self
+                    .mvp
+                    .unwrap_or_else(|| mat_mul(self.modelview.last().unwrap(), &self.projection));
+                let frac = offset >= 32;
+                let first = ((offset % 32) / 2) as usize;
+                for (k, half) in [(first, w1 >> 16), (first + 1, w1 & 0xFFFF)] {
+                    let Some(v) = m.get_mut(k / 4).and_then(|r| r.get_mut(k % 4)) else {
+                        continue;
+                    };
+                    let fixed = (*v * 65536.0).round() as i32;
+                    let fixed = if frac {
+                        (fixed & !0xFFFF) | half as i32
+                    } else {
+                        (half as i16 as i32) << 16 | (fixed & 0xFFFF)
+                    };
+                    *v = fixed as f32 / 65536.0;
+                }
+                self.mvp = Some(m);
             }
             0x04 | 0x08 | 0x0C | 0x0E => {}
             _ => self.warn(format!("moveword {index:#x} at {at:#010x}")),
@@ -387,10 +415,14 @@ impl Interpreter {
             self.warn(format!("bad vertex load at {at:#010x}"));
             return Ok(());
         }
-        let mv = *self.modelview.last().unwrap();
+        let lights_mv = *self.modelview.last().unwrap();
+        let (mv, projection) = match self.mvp {
+            Some(m) => (m, IDENTITY),
+            None => (*self.modelview.last().unwrap(), self.projection),
+        };
         self.frame.transforms.push(Transform {
             modelview: mv,
-            projection: self.projection,
+            projection,
             viewport: self.viewport,
             tag: at,
         });
@@ -407,7 +439,7 @@ impl Interpreter {
                     b(13)? as i8 as f32,
                     b(14)? as i8 as f32,
                 ];
-                let lc = self.light(&mv, n);
+                let lc = self.light(&lights_mv, n);
                 [lc[0], lc[1], lc[2], b(15)? as f32 / 255.0]
             } else {
                 [b(12)?, b(13)?, b(14)?, b(15)?].map(|c| c as f32 / 255.0)
