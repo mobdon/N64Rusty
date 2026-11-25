@@ -489,6 +489,8 @@ fn run_and_report(
         println!("  rom {rom_off:#09x} -> {ram:#010x} len {len:#x}");
     }
     println!("threads:\n{threads}");
+    // The thread that was on the CPU last keeps its registers in `ctx`.
+    println!("  last on the CPU: call at {:#010x}", (ctx.r[31] as u32).wrapping_sub(8));
     print!("{device_summary}");
     match outcome {
         os::Outcome::Frames(n) => {
