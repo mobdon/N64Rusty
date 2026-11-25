@@ -588,14 +588,44 @@ impl Renderer {
             }
         }
         let clip = clip_matrices(frame, transforms);
+        let at = |v: &crate::Vertex| {
+            clip.get(v.transform as usize)
+                .map_or([0.0; 4], |m| transform(m, v.pos))
+        };
+        // A backdrop drawn first (a sky made for the original view's width)
+        // ends at the 4:3 edges: stretch it like a background. It is the
+        // leading run of 3D draws that each cover nine tenths of the width.
+        let mut backdrop = vec![false; frame.vertices.len()];
+        if wide > 1.0 {
+            for d in frame
+                .draws()
+                .filter(|d| d.state.color_image == frame.color_image)
+            {
+                if d.state.rect {
+                    continue;
+                }
+                let range = d.first as usize..(d.first + d.count) as usize;
+                let (mut x0, mut x1) = (1.0f32, -1.0f32);
+                for v in &frame.vertices[range.clone()] {
+                    let p = at(v);
+                    if p[3] > 0.0 {
+                        x0 = x0.min(p[0] / p[3]);
+                        x1 = x1.max(p[0] / p[3]);
+                    }
+                }
+                if x1.min(1.0) - x0.max(-1.0) < 1.8 {
+                    break;
+                }
+                backdrop[range].fill(true);
+            }
+        }
         let mut verts = Vec::with_capacity(frame.vertices.len() * VERTEX_FLOATS);
-        for (v, stretch) in frame.vertices.iter().zip(stretch) {
-            let mut p = clip
-                .get(v.transform as usize)
-                .map_or([0.0; 4], |m| transform(m, v.pos));
+        for ((v, stretch), backdrop) in frame.vertices.iter().zip(stretch).zip(backdrop) {
+            let mut p = at(v);
             match stretch {
                 // Rectangles are in pixels with w = 1.
                 Some((x0, x1)) => p[0] = 2.0 * (v.pos[0] - x0) / (x1 - x0) - 1.0,
+                None if backdrop => {}
                 None => p[0] /= wide,
             }
             verts.extend_from_slice(&p);
