@@ -369,6 +369,13 @@ impl Ctx {
         self.lookup(addr).is_some()
     }
 
+    /// Whether a call to `addr` would run translated code: a registered or
+    /// overridden function, or a saved-image function whose bytes are in RAM
+    /// now (checking it, as a call would).
+    pub fn has_translation(&mut self, addr: u32) -> bool {
+        self.lookup(addr).is_some() || self.verify_image(addr).is_some()
+    }
+
     /// The most recent call targets, oldest first.
     pub fn recent_calls(&self) -> Vec<u32> {
         let n = self.calls.min(TRACE_LEN as u64) as usize;
