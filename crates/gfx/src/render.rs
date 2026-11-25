@@ -647,6 +647,24 @@ impl Renderer {
                 backdrop[range].fill(true);
             }
         }
+        // A flat overlay facing the camera and covering the whole view (a
+        // fade or a flash drawn as triangles) covers the wide view too.
+        if wide > 1.0 {
+            for d in frame.draws().filter(|d| !d.state.rect) {
+                let range = d.first as usize..(d.first + d.count) as usize;
+                let ps: Vec<_> = frame.vertices[range.clone()].iter().map(at).collect();
+                let w = ps[0][3];
+                let flat = w > 0.0 && ps.iter().all(|p| (p[3] - w).abs() <= w * 1e-3);
+                let ext = |k: usize, f: fn(f32, f32) -> f32, s: f32| {
+                    ps.iter().map(|p| p[k] / p[3]).fold(s, f)
+                };
+                let covers =
+                    |k| ext(k, f32::min, f32::MAX) <= -0.98 && ext(k, f32::max, f32::MIN) >= 0.98;
+                if flat && covers(0) && covers(1) {
+                    backdrop[range].fill(true);
+                }
+            }
+        }
         let mut verts = Vec::with_capacity(frame.vertices.len() * VERTEX_FLOATS);
         for ((v, stretch), backdrop) in frame.vertices.iter().zip(stretch).zip(backdrop) {
             let mut p = at(v);

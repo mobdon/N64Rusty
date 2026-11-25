@@ -491,3 +491,28 @@ fn sharp_textures_keep_texels_flat_when_upscaled() {
         }
     }
 }
+
+#[test]
+fn widescreen_widens_a_full_view_overlay_of_triangles() {
+    let Some(mut r) = renderer() else { return };
+    let mut ram = Ram::default();
+    // A fade or flash: a flat quad of two triangles over the whole view.
+    let verts = ram.vertices(&[
+        v(-100, -100, 0, [255; 4]),
+        v(100, -100, 0, [255; 4]),
+        v(100, 100, 0, [255; 4]),
+        v(-100, 100, 0, [255; 4]),
+    ]);
+    let dl = scene(&mut ram, |_, dl| {
+        dl.other_modes(CYCLE_1, 0)
+            .combine(pass(PRIM))
+            .prim(0xFF00_00FF)
+            .vtx(verts, 4, 0)
+            .tri2([0, 1, 2], [0, 2, 3]);
+    });
+    let f = frame(&mut ram, &dl);
+    r.set_widescreen(true);
+    let img = r.render_letterboxed(&f, 640, 360).unwrap();
+    assert_px(&img, 2, 180, RED);
+    assert_px(&img, 637, 180, RED);
+}
