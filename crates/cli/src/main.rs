@@ -295,13 +295,22 @@ fn translate(args: &[String]) -> Result<(), String> {
     // length and pieces.
     let mut planned = 0;
     for (r, ram, len) in overlay_table(rom.bytes()) {
-        let in_boot = r.wrapping_sub(boot_rom) < BOOT_SEGMENT_SIZE as u32;
+        // The boot image read in place is already translated; the same
+        // bytes loaded somewhere else are an overlay like any other.
+        let boot_in_place = r.wrapping_sub(boot_rom) < BOOT_SEGMENT_SIZE as u32
+            && r.wrapping_sub(boot_rom) == ram.wrapping_sub(img.base);
         let seen = dma.iter().any(|d| {
             d[2] > 0
                 && r.wrapping_sub(d[0]) < d[2]
                 && r.wrapping_sub(d[0]) == ram.wrapping_sub(d[1])
         });
-        if !in_boot && !seen && !regions.contains_key(&(r, ram, len)) {
+        // The same test copies seen in runs get: laid out like code.
+        let end = (r as usize + len as usize).min(rom.bytes().len());
+        let code = function_starts(&Image {
+            base: ram,
+            bytes: &rom.bytes()[r as usize..end],
+        });
+        if !boot_in_place && !seen && !code.is_empty() && !regions.contains_key(&(r, ram, len)) {
             regions.insert((r, ram, len), Vec::new());
             planned += 1;
         }
