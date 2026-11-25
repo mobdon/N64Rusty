@@ -969,7 +969,9 @@ fn os_epi_start_dma(c: &mut Ctx) {
     let dev = c.mem.read_u32(mb + 0x0C);
     let len = c.mem.read_u32(mb + 0x10);
     let mut st = lock();
-    pi_dma(c, &mut st, dir, base.wrapping_add(dev), ram, len);
+    // The system library ORs the handle base with the device address: a
+    // handle may give the full address in either.
+    pi_dma(c, &mut st, dir, base | dev, ram, len);
     if mq != 0 {
         put_message(c, &mut st, mq, mb, false);
     }
