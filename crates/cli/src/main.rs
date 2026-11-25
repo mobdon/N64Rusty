@@ -3,7 +3,7 @@
 //! Everything it writes for a game goes under `local/<sha256>/`, which is
 //! git-ignored: generated Rust, reports and the per-game config.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -146,27 +146,52 @@ fn write_if_changed(path: &Path, contents: &str) -> Result<bool, String> {
     Ok(true)
 }
 
-/// The run of back-to-back copies (each one starting in ROM and RAM where
-/// the one before ends) that `c` belongs to, as one `(rom, ram, len)`.
-fn run_of(copies: &[(u32, u32, u32)], c: (u32, u32, u32)) -> (u32, u32, u32) {
-    let joins = |a: &(u32, u32, u32), b: &(u32, u32, u32)| {
-        a.2 > 0 && b.2 > 0 && a.0.wrapping_add(a.2) == b.0 && a.1.wrapping_add(a.2) == b.1
-    };
-    let (mut lo, mut hi) = (c, c);
-    // Bounded, so a wrapped-around chain cannot loop forever.
-    for _ in 0..copies.len() {
-        match copies.iter().find(|p| joins(p, &lo)) {
-            Some(&p) => lo = p,
-            None => break,
+/// Every cartridge copy, indexed by where each one starts and ends, so
+/// following a run of back-to-back copies is one lookup per step (games make
+/// tens of thousands of copies).
+struct Copies {
+    n: usize,
+    by_start: HashMap<(u32, u32), (u32, u32, u32)>,
+    by_end: HashMap<(u32, u32), (u32, u32, u32)>,
+}
+
+impl Copies {
+    fn new(copies: &[(u32, u32, u32)]) -> Self {
+        let (mut by_start, mut by_end) = (HashMap::new(), HashMap::new());
+        // The first copy in the list wins, as a front-to-back search would.
+        for &c in copies.iter().filter(|c| c.2 > 0) {
+            by_start.entry((c.0, c.1)).or_insert(c);
+            by_end
+                .entry((c.0.wrapping_add(c.2), c.1.wrapping_add(c.2)))
+                .or_insert(c);
+        }
+        Copies {
+            n: copies.len(),
+            by_start,
+            by_end,
         }
     }
-    for _ in 0..copies.len() {
-        match copies.iter().find(|n| joins(&hi, n)) {
-            Some(&n) => hi = n,
-            None => break,
+
+    /// The run of back-to-back copies (each one starting in ROM and RAM where
+    /// the one before ends) that `c` belongs to, as one `(rom, ram, len)`.
+    fn run_of(&self, c: (u32, u32, u32)) -> (u32, u32, u32) {
+        let (mut lo, mut hi) = (c, c);
+        // Bounded, so a wrapped-around chain cannot loop forever.
+        for _ in 0..self.n {
+            match self.by_end.get(&(lo.0, lo.1)).filter(|_| lo.2 > 0) {
+                Some(&p) => lo = p,
+                None => break,
+            }
         }
+        for _ in 0..self.n {
+            let end = (hi.0.wrapping_add(hi.2), hi.1.wrapping_add(hi.2));
+            match self.by_start.get(&end).filter(|_| hi.2 > 0) {
+                Some(&n) => hi = n,
+                None => break,
+            }
+        }
+        (lo.0, lo.1, hi.0.wrapping_add(hi.2).wrapping_sub(lo.0))
     }
-    (lo.0, lo.1, hi.0.wrapping_add(hi.2).wrapping_sub(lo.0))
 }
 
 fn translate(args: &[String]) -> Result<(), String> {
@@ -267,10 +292,19 @@ fn translate(args: &[String]) -> Result<(), String> {
     // that cross a copy's edge resolve); each copy then gets the functions
     // that start inside it.
     let copies: Vec<(u32, u32, u32)> = dma.iter().map(|d| (d[0], d[1], d[2])).collect();
+    let index = Copies::new(&copies);
     let mut runs: BTreeMap<(u32, u32, u32), Vec<u32>> = BTreeMap::new();
     for (&c, entries) in &regions {
-        runs.entry(run_of(&copies, c)).or_default().extend(entries);
+        runs.entry(index.run_of(c)).or_default().extend(entries);
     }
+    // Which run each copy belongs to, worked out once.
+    let copy_runs: Vec<_> = copies
+        .iter()
+        .chain(regions.keys())
+        .copied()
+        .filter(|c| c.2 > 0)
+        .map(|c| (c, index.run_of(c)))
+        .collect();
     let mut overlays = Vec::new();
     for (&(r, ram, len), entries) in &runs {
         let start = r as usize;
@@ -292,11 +326,10 @@ fn translate(args: &[String]) -> Result<(), String> {
             &data_pointers(&oimg),
             Some(ram.wrapping_add(len)),
         );
-        let mut chunks: Vec<(u32, u32, u32)> = copies
+        let mut chunks: Vec<(u32, u32, u32)> = copy_runs
             .iter()
-            .chain(regions.keys())
-            .copied()
-            .filter(|&c| c.2 > 0 && run_of(&copies, c) == (r, ram, len))
+            .filter(|(_, run)| *run == (r, ram, len))
+            .map(|&(c, _)| c)
             .collect();
         chunks.sort_unstable();
         chunks.dedup();
@@ -491,13 +524,14 @@ mod tests {
             (0x5000, 0x8030_0000, 0x0),
         ];
         let run = (0x1000, 0x8030_0000, 0x1c0);
+        let index = Copies::new(&copies);
         for c in &copies[..3] {
-            assert_eq!(run_of(&copies, *c), run);
+            assert_eq!(index.run_of(*c), run);
         }
-        assert_eq!(run_of(&copies, copies[3]), copies[3]);
-        assert_eq!(run_of(&copies, copies[4]), copies[4]);
+        assert_eq!(index.run_of(copies[3]), copies[3]);
+        assert_eq!(index.run_of(copies[4]), copies[4]);
         // A copy not in the list still finds its neighbours.
-        assert_eq!(run_of(&copies, (0x0f00, 0x802f_ff00, 0x100)).2, 0x2c0);
+        assert_eq!(index.run_of((0x0f00, 0x802f_ff00, 0x100)).2, 0x2c0);
     }
 
     #[test]
