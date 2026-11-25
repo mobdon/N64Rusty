@@ -335,14 +335,15 @@ fn translate(args: &[String]) -> Result<(), String> {
         file.push_str(&translate_one(f));
         file.push('\n');
     }
-    // One file per overlay.
-    for ((r, _, _), d) in &overlays {
+    // One file per overlay; the same ROM bytes copied to two RAM places are
+    // two overlays.
+    for ((r, ram, _), d) in &overlays {
         let mut file = HEADER.to_string();
         for f in &d.functions {
             file.push_str(&translate_one(f));
             file.push('\n');
         }
-        files.insert(format!("ovl_{r:07x}"), file);
+        files.insert(format!("ovl_{r:07x}_{ram:08x}"), file);
     }
 
     // Each file of generated code is its own crate under `parts/`, so a
@@ -390,7 +391,7 @@ fn translate(args: &[String]) -> Result<(), String> {
         for f in &d.functions {
             let _ = writeln!(
                 register,
-                "        ({:#010x}, ovl_{r:07x}::{}),",
+                "        ({:#010x}, ovl_{r:07x}_{ram:08x}::{}),",
                 f.addr,
                 emit::fn_name(f.addr)
             );
