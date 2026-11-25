@@ -14,6 +14,9 @@ pub const SRAM_BASE: u32 = 0x0800_0000;
 const SRAM_END: u32 = 0x1000_0000;
 /// Standard SRAM size; larger saves grow the memory as the game writes.
 const SRAM_SIZE: usize = 0x8000;
+/// The most save memory kept: banked SRAM reaches past 0xC_0000. A write
+/// beyond is dropped, so a stray DMA cannot grow the save without bound.
+const SRAM_MAX: usize = 0x10_0000;
 
 /// Save memory and the file that backs it.
 pub struct Save {
@@ -62,6 +65,13 @@ impl Save {
 
     /// Writes `data` at `off` and rewrites the file.
     pub fn write(&mut self, off: usize, data: &[u8]) {
+        if off + data.len() > SRAM_MAX {
+            eprintln!(
+                "warning: save memory write at {off:#x}+{:#x} is past {SRAM_MAX:#x}, dropped",
+                data.len()
+            );
+            return;
+        }
         if self.sram.len() < off + data.len() {
             self.sram.resize(off + data.len(), 0);
         }
@@ -134,6 +144,13 @@ mod tests {
         let mut out = [0u8; 2];
         s.read(0x800F, &mut out);
         assert_eq!(out, [7, 0]);
+    }
+
+    #[test]
+    fn writes_past_the_limit_are_dropped() {
+        let mut s = Save::in_memory();
+        s.write(0x7FF_0000, &[1; 16]);
+        assert_eq!(s.sram.len(), SRAM_SIZE);
     }
 
     #[test]
