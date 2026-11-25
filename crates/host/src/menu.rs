@@ -36,9 +36,11 @@ pub fn recent_roms() -> Vec<std::path::PathBuf> {
     else {
         return Vec::new();
     };
-    std::fs::read_to_string(dir.join("recent.txt"))
-        .unwrap_or_default()
-        .lines()
+    // last-rom.txt: the one ROM older players remembered.
+    let read = |f| std::fs::read_to_string(dir.join(f)).unwrap_or_default();
+    let (list, old) = (read("recent.txt"), read("last-rom.txt"));
+    list.lines()
+        .chain(old.lines().filter(|l| !list.lines().any(|r| r == *l)))
         .map(std::path::PathBuf::from)
         .filter(|p| p.is_file())
         .collect()
@@ -98,7 +100,12 @@ mod imp {
                 games: recent_roms()
                     .into_iter()
                     .map(|p| {
-                        let name = p.file_stem().unwrap_or_default().to_string_lossy();
+                        // Windows reads '&' as a shortcut marker.
+                        let name = p
+                            .file_stem()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .replace('&', "&&");
                         (MenuItem::new(name, true, None), p)
                     })
                     .collect(),
