@@ -69,6 +69,13 @@ pub struct WindowConfig {
     /// Textures as the console filters them, soft when stretched to the
     /// window. Off (the default) keeps magnified texels crisp.
     pub console_filter: bool,
+    /// Per-game HUD areas kept at the window's edges in widescreen:
+    /// `[x0, y0, x1, y1, side]` in the game's 4:3 pixels, side -1 (left) or
+    /// 1 (right). Screen-space pieces wholly inside one move with it.
+    pub hud: Vec<[f32; 5]>,
+    /// Use `hud` only while the 32-bit RAM word at the first address holds
+    /// the second value (a game mode meaning "in play"); always if unset.
+    pub hud_when: Option<[u32; 2]>,
 }
 
 impl WindowConfig {
@@ -92,6 +99,8 @@ impl Default for WindowConfig {
             widescreen: true,
             refresh: Some(0.0),
             console_filter: false,
+            hud: Vec::new(),
+            hud_when: None,
         }
     }
 }
@@ -330,6 +339,8 @@ mod tests {
             scale = 3
             widescreen = true
             refresh = 144
+            hud = [[0, 0, 150, 60, -1]]
+            hud_when = [0x80001234, 0]
             [[port]]
             sources = ["keyboard"]
             keys = { KeyJ = "A", KeyW = "STICK_UP" }
@@ -346,6 +357,8 @@ mod tests {
         assert_eq!(cfg.window.scale, 3);
         assert!(cfg.window.widescreen);
         assert_eq!(cfg.window.refresh, Some(144.0));
+        assert_eq!(cfg.window.hud, vec![[0.0, 0.0, 150.0, 60.0, -1.0]]);
+        assert_eq!(cfg.window.hud_when, Some([0x8000_1234, 0]));
         assert_eq!(
             cfg.ports[0].keyboard,
             Some(KeyMap(vec![

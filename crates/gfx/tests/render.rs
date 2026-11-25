@@ -542,3 +542,39 @@ fn widescreen_keeps_a_pre_rendered_picture_in_shape() {
     assert_px(&img, 2, 180, BLUE);
     assert_px(&img, 320, 180, [0, 255, 0, 255]);
 }
+
+#[test]
+fn widescreen_moves_hud_pieces_in_their_areas_to_the_edges() {
+    let Some(mut r) = renderer() else { return };
+    let mut ram = Ram::default();
+    let dl = scene(&mut ram, |_, dl| {
+        dl.other_modes(CYCLE_FILL, 0)
+            .fill_color(0x07C1_07C1)
+            // A heart at the left, a button at the right.
+            .fill_rect(10, 10, 29, 29)
+            .fill_rect(290, 10, 309, 29)
+            // A dialog box reaching into the left area, with a letter on it.
+            .fill_rect(20, 150, 299, 199)
+            .fill_color(0xF801_F801)
+            .fill_rect(30, 160, 39, 169);
+    });
+    let mut f = frame(&mut ram, &dl);
+    f.hud = vec![
+        [0.0, 0.0, 100.0, 240.0, -1.0],
+        [220.0, 0.0, 320.0, 60.0, 1.0],
+    ];
+    r.set_widescreen(true);
+    // 640x360: the 4:3 picture is 480 wide at 80..560, 1.5 pixels a pixel.
+    let img = r.render_letterboxed(&f, 640, 360).unwrap();
+    const GREEN: [u8; 4] = [0, 255, 0, 255];
+    // Left piece: 15..45 instead of 95..125; right one 595..625.
+    assert_px(&img, 30, 30, GREEN);
+    assert_px(&img, 110, 30, BLUE);
+    assert_px(&img, 610, 30, GREEN);
+    // The letter stays on its box: 125..140 across.
+    assert_px(&img, 132, 247, RED);
+    // Without areas nothing moves.
+    f.hud.clear();
+    let img = r.render_letterboxed(&f, 640, 360).unwrap();
+    assert_px(&img, 110, 30, GREEN);
+}
