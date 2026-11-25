@@ -516,3 +516,29 @@ fn widescreen_widens_a_full_view_overlay_of_triangles() {
     assert_px(&img, 2, 180, RED);
     assert_px(&img, 637, 180, RED);
 }
+
+#[test]
+fn widescreen_keeps_a_pre_rendered_picture_in_shape() {
+    let Some(mut r) = renderer() else { return };
+    let mut ram = Ram::default();
+    let dl = scene(&mut ram, |_, dl| {
+        dl.other_modes(CYCLE_FILL, 0)
+            .fill_color(0x07C1_07C1)
+            .fill_rect(0, 0, 319, 239);
+    });
+    let mut f = frame(&mut ram, &dl);
+    r.set_widescreen(true);
+    // As a full-width rectangle it is a background and fills the width.
+    let img = r.render_letterboxed(&f, 640, 360).unwrap();
+    assert_px(&img, 2, 180, [0, 255, 0, 255]);
+    // As a pre-rendered room picture it stays 4:3, lined up with the 3D
+    // drawn into it.
+    let last = f.commands.iter_mut().rev().find_map(|c| match c {
+        n64rusty_gfx::Command::Draw(d) => Some(d),
+        _ => None,
+    });
+    last.unwrap().state.picture = true;
+    let img = r.render_letterboxed(&f, 640, 360).unwrap();
+    assert_px(&img, 2, 180, BLUE);
+    assert_px(&img, 320, 180, [0, 255, 0, 255]);
+}

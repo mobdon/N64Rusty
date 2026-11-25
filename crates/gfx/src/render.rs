@@ -570,7 +570,9 @@ impl Renderer {
         // one (two triangles, six vertices) on its own.
         let quads = frame
             .draws()
-            .filter(|d| d.state.rect && wide > 1.0)
+            // A pre-rendered picture has 3D drawn into it (a room around a
+            // character): stretched, the two would part. It keeps its shape.
+            .filter(|d| d.state.rect && !d.state.picture && wide > 1.0)
             .flat_map(|d| {
                 let end = (d.first + d.count) as usize;
                 (d.first as usize..end)
@@ -1325,6 +1327,7 @@ mod tests {
             textures: [None; 2],
             rect: false,
             texel_exact: false,
+            picture: false,
             color_image: 0,
             scissor: None,
         }
