@@ -8,6 +8,7 @@
 //! opened and no sound is played.
 
 pub mod devices;
+mod jpeg;
 pub mod live;
 pub mod media;
 pub mod os;

@@ -95,6 +95,9 @@ pub struct Interpreter {
     rdphalf1: u32,
     tmem: Tmem,
     rect_transform: Option<u32>,
+    /// Running the 2D (sprite and background) microcode a display list
+    /// switched to with `G_LOAD_UCODE`, whose low opcodes differ.
+    ucode_2d: bool,
     frame: Frame,
 }
 
@@ -145,6 +148,7 @@ impl Interpreter {
             rdphalf1: 0,
             tmem: Tmem::default(),
             rect_transform: None,
+            ucode_2d: false,
             frame: Frame {
                 width: 320,
                 ..Frame::default()
@@ -174,12 +178,25 @@ impl Interpreter {
     pub fn run(&mut self, rdram: &[u8], addr: u32) -> Result<(), GfxError> {
         let mut pc = self.phys(addr);
         let mut stack: Vec<u32> = Vec::new();
+        // Every task starts on its own (3D) microcode.
+        self.ucode_2d = false;
         for _ in 0..MAX_COMMANDS {
             let w0 = rd32(rdram, pc, pc)?;
             let w1 = rd32(rdram, pc + 4, pc)?;
             let at = pc;
             pc += 8;
+            if self.ucode_2d && (w0 >> 24 <= 0x0B || matches!(w0 >> 24, 0xDA | 0xDC)) {
+                match w0 >> 24 {
+                    0x0A => self.bg_copy(rdram, w1, at)?,
+                    op => self.warn(format!("unknown 2D command {op:#04x} at {at:#010x}")),
+                }
+                continue;
+            }
             match w0 >> 24 {
+                // shortcut: games switch between their 3D microcode and the
+                // 2D one and back, so each load toggles; track the loaded
+                // code's address if a game loads a third microcode.
+                0xDD => self.ucode_2d = !self.ucode_2d,
                 0x01 => self.vertices(rdram, w0, w1, at)?,
                 0x02 => self.modify_vertex(w0, w1, at),
                 0xED => {
@@ -633,6 +650,56 @@ impl Interpreter {
             |_, _| [[0.0; 2]; 2],
             state,
         );
+    }
+
+    /// `G_BG_COPY` (2D microcode): copies part of a background image in
+    /// RAM to the screen one texel per pixel. Only 16-bit RGBA images.
+    fn bg_copy(&mut self, rdram: &[u8], w1: u32, at: u32) -> Result<(), GfxError> {
+        let a = self.phys(w1);
+        let h = |o: u32| rd16(rdram, a + o, at);
+        let (image_x, image_w, frame_x, frame_w) = (h(0)?, h(2)?, h(4)? as i16, h(6)?);
+        let (image_y, image_h, frame_y, frame_h) = (h(8)?, h(10)?, h(12)? as i16, h(14)?);
+        let image = self.phys(rd32(rdram, a + 16, at)?);
+        let (fmt, siz) = (rd8(rdram, a + 22, at)?, rd8(rdram, a + 23, at)?);
+        if (fmt, siz) != (0, 2) {
+            self.warn(format!(
+                "background format {fmt}/{siz} not drawn at {at:#010x}"
+            ));
+            return Ok(());
+        }
+        let (w, ht) = (u32::from(image_w / 4), u32::from(image_h / 4));
+        let mut rgba = Vec::with_capacity((w * ht * 4) as usize);
+        for i in 0..w * ht {
+            let c = rgba5551(rd16(rdram, image + 2 * i, at)?);
+            rgba.extend(c.map(|v| (v * 255.0) as u8));
+        }
+        let index = self.frame.textures.len() as u32;
+        self.frame.textures.push(crate::Texture {
+            width: w.max(1),
+            height: ht.max(1),
+            rgba,
+            wrap: [crate::Wrap::Clamp; 2],
+        });
+        let (x0, y0) = (f32::from(frame_x) / 4.0, f32::from(frame_y) / 4.0);
+        let (fw, fh) = (f32::from(frame_w) / 4.0, f32::from(frame_h) / 4.0);
+        let (s0, t0) = (f32::from(image_x) / 32.0, f32::from(image_y) / 32.0);
+        let uv = [
+            [s0 / w as f32, t0 / ht as f32],
+            [(s0 + fw) / w as f32, (t0 + fh) / ht as f32],
+        ];
+        let mut state = self.state.clone();
+        state.rect = true;
+        state.texel_exact = true;
+        state.geometry = 0;
+        state.other_h = (state.other_h & !(3 << 20)) | 2 << 20; // copy mode
+        state.combine = crate::combiner::TEXEL0_ONLY;
+        state.textures = [Some(index), None];
+        self.push_rect(
+            [x0, y0, x0 + fw, y0 + fh],
+            |x, y| [[uv[x][0], uv[y][1]]; 2],
+            state,
+        );
+        Ok(())
     }
 
     fn texture_rect(&mut self, w0: u32, w1: u32, h1: u32, h2: u32, flip: bool) {
