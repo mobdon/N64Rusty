@@ -37,6 +37,11 @@ pub fn run_windowed<G: Guest>(guest: G, cfg: &RunConfig) -> Result<G, String> {
         session,
         cfg: cfg.clone(),
         pacer: Pacer::new(cfg.frame_rate, Instant::now()),
+        redraw: cfg
+            .window
+            .refresh
+            .filter(|&r| r > cfg.frame_rate)
+            .map(|r| Pacer::new(r, Instant::now())),
         window: None,
         keys: HashSet::new(),
         gilrs,
@@ -56,6 +61,8 @@ struct App<G> {
     session: Session<G>,
     cfg: RunConfig,
     pacer: Pacer,
+    /// Draws between game frames, when the refresh rate is above the game's.
+    redraw: Option<Pacer>,
     window: Option<Arc<Window>>,
     keys: HashSet<KeyCode>,
     gilrs: Option<Gilrs>,
@@ -150,6 +157,13 @@ impl<G: Guest> ApplicationHandler for App<G> {
                 w.request_redraw();
             }
         }
-        event_loop.set_control_flow(ControlFlow::WaitUntil(self.pacer.next()));
+        let mut next = self.pacer.next();
+        if let Some(r) = &mut self.redraw {
+            if r.due(Instant::now()) {
+                self.session.guest.redraw();
+            }
+            next = next.min(r.next());
+        }
+        event_loop.set_control_flow(ControlFlow::WaitUntil(next));
     }
 }

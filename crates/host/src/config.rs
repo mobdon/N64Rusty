@@ -13,6 +13,7 @@
 //! title = "n64rusty"
 //! scale = 2                         # window is 320x240 times this
 //! widescreen = false                # fill a wide window, showing more
+//! refresh = 144                     # draw this often, blending frames
 //!
 //! [[port]]                          # ports 1 to 4, in order
 //! sources = ["keyboard", "gamepad0"]
@@ -57,6 +58,10 @@ pub struct WindowConfig {
     /// Fill a window wider than 4:3 with more of the scene instead of
     /// black bars.
     pub widescreen: bool,
+    /// Draw the window this many times per second, with pictures blended
+    /// between game frames; the game itself keeps `frame_rate`. None (the
+    /// default) draws once per game frame.
+    pub refresh: Option<f64>,
 }
 
 impl Default for WindowConfig {
@@ -65,6 +70,7 @@ impl Default for WindowConfig {
             title: "n64rusty".into(),
             scale: 2,
             widescreen: false,
+            refresh: None,
         }
     }
 }
@@ -264,6 +270,8 @@ mod tests {
             debug_port = "127.0.0.1:6464"
             [window]
             scale = 3
+            widescreen = true
+            refresh = 144
             [[port]]
             sources = ["keyboard"]
             keys = { KeyJ = "A", KeyW = "STICK_UP" }
@@ -278,6 +286,8 @@ mod tests {
         assert_eq!(cfg.frame_rate, 50.0);
         assert_eq!(cfg.replay, Some(PathBuf::from("runs").join("in.txt")));
         assert_eq!(cfg.window.scale, 3);
+        assert!(cfg.window.widescreen);
+        assert_eq!(cfg.window.refresh, Some(144.0));
         assert_eq!(
             cfg.ports[0].keyboard,
             Some(KeyMap(vec![

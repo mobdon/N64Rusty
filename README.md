@@ -141,6 +141,14 @@ full-width backgrounds stretch to the edges. Things the game itself leaves
 out of view (objects it culls past the original edge) stay missing.
 `--capture-wide` saves headless captures in 16:9 the same way.
 
+`refresh = 144` (any rate above the game's) under `[window]` draws the
+window that often. Each picture between two game frames blends where
+every 3D object is, matched by the display list code that drew it, so
+motion is smoother while the game keeps running at its own rate. What you
+see trails the game by one frame, and 2D elements move only on game frames.
+`--capture-between` also saves, with each headless capture, the picture
+half-way from the frame before.
+
 On Windows, one script does it all: it builds the translator, translates
 your ROM, builds the game program, copies it to `local\<sha256>\game.exe` and
 starts it with `--window`. From the repository folder in PowerShell:
