@@ -432,6 +432,11 @@ impl Renderer {
                     address_mode_v: mode(wrap[1]),
                     mag_filter: filter,
                     min_filter: filter,
+                    mipmap_filter: if linear {
+                        wgpu::MipmapFilterMode::Linear
+                    } else {
+                        wgpu::MipmapFilterMode::Nearest
+                    },
                     ..Default::default()
                 })
             })
@@ -843,27 +848,60 @@ fn upload(
     height: u32,
     rgba: &[u8],
 ) -> wgpu::TextureView {
-    let size = wgpu::Extent3d {
-        width,
-        height,
-        depth_or_array_layers: 1,
-    };
+    // Smaller copies for textures seen from afar: drawn at a higher
+    // resolution than the console's, distant ground would shimmer.
+    let levels = 32 - width.max(height).max(1).leading_zeros();
     let tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("n64 texture"),
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        ..target_desc(size)
+        mip_level_count: levels,
+        ..target_desc(wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        })
     });
-    queue.write_texture(
-        tex.as_image_copy(),
-        rgba,
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(width * 4),
-            rows_per_image: Some(height),
-        },
-        size,
-    );
+    let (mut w, mut h, mut level) = (width, height, rgba.to_vec());
+    for mip in 0..levels {
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                mip_level: mip,
+                ..tex.as_image_copy()
+            },
+            &level,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(w * 4),
+                rows_per_image: Some(h),
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        (level, w, h) = half(&level, w, h);
+    }
     tex.create_view(&Default::default())
+}
+
+/// RGBA8 `w` x `h` averaged down to half size in each direction (at least
+/// one pixel).
+fn half(src: &[u8], w: u32, h: u32) -> (Vec<u8>, u32, u32) {
+    let (nw, nh) = ((w / 2).max(1), (h / 2).max(1));
+    let mut out = Vec::with_capacity((nw * nh * 4) as usize);
+    for y in 0..nh {
+        for x in 0..nw {
+            for c in 0..4 {
+                let px = |dx: u32, dy: u32| {
+                    let (sx, sy) = ((2 * x + dx).min(w - 1), (2 * y + dy).min(h - 1));
+                    u32::from(src[((sy * w + sx) * 4 + c) as usize])
+                };
+                out.push(((px(0, 0) + px(1, 0) + px(0, 1) + px(1, 1) + 2) / 4) as u8);
+            }
+        }
+    }
+    (out, nw, nh)
 }
 
 fn floats(v: &[f32]) -> Vec<u8> {
