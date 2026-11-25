@@ -79,9 +79,13 @@ order, on a virtual clock: retrace and timer interrupts arrive on time
 even while a thread is busy, and when every thread waits, time jumps to the
 next event. The game always runs at its original speed in game time.
 
-A run stops after `--frames` retraces, on a deadlock, or at the first
-panic, and prints the threads, the cartridge copies and the most recent
-calls. It also writes two files next to `out/`:
+A run stops after `--frames` retraces, on a deadlock, at the first
+panic, or on a hang (no retrace for 5 seconds of host time: a guest loop
+that makes no calls, so game time cannot move), and prints the threads,
+the cartridge copies and the most recent calls. Any access past RAM that is
+not through the KSEG0/KSEG1 windows (a wild pointer, or TLB-mapped memory,
+which is not modelled yet) panics there; an address starting `0x27BD` is
+also named as code read as a pointer. It also writes two files next to `out/`:
 
 - `dma.txt`: every cartridge copy seen (ROM offset, RAM address, length).
 - `missing.txt`: each call into code that was never translated, with the

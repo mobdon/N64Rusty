@@ -60,7 +60,7 @@ impl Memory {
     #[cold]
     #[inline(never)]
     fn io_get(&self, vaddr: u32, p: usize, out: &mut [u8]) {
-        let Some(io) = &self.io else {
+        let Some(io) = self.io.as_deref().filter(|_| unmapped_ok(vaddr)) else {
             out_of_range(vaddr)
         };
         for (k, b) in out.iter_mut().enumerate() {
@@ -79,7 +79,7 @@ impl Memory {
     #[cold]
     #[inline(never)]
     fn io_put(&mut self, vaddr: u32, p: usize, data: &[u8]) {
-        let Some(io) = &mut self.io else {
+        let Some(io) = self.io.as_deref_mut().filter(|_| unmapped_ok(vaddr)) else {
             out_of_range(vaddr)
         };
         for (k, &b) in data.iter().enumerate() {
@@ -252,10 +252,33 @@ fn misaligned(vaddr: u32, len: usize) -> ! {
     panic!("misaligned {len}-byte guest access at {vaddr:#010x}")
 }
 
+/// Hardware outside RAM is only reached through the unmapped windows
+/// (KSEG0 `0x8000_0000`, KSEG1 `0xA000_0000`). Anything else past RAM is a
+/// TLB address, which is not modelled, or a wild pointer: stop there
+/// instead of storing it as a register.
+fn unmapped_ok(vaddr: u32) -> bool {
+    (0x8000_0000..0xC000_0000).contains(&vaddr)
+}
+
+/// Extra words for a crash at an address that is really an instruction or
+/// data read as a pointer.
+pub(crate) fn wild_hint(addr: u32) -> &'static str {
+    if addr >> 16 == 0x27BD {
+        " (looks like the instruction addiu sp, sp, n: a pointer overwritten with code)"
+    } else if !(0x8000_0000..0xC000_0000).contains(&addr) {
+        " (not a KSEG0/KSEG1 address: a wild or overwritten pointer, or TLB-mapped memory)"
+    } else {
+        ""
+    }
+}
+
 #[cold]
 #[inline(never)]
 fn out_of_range(vaddr: u32) -> ! {
-    panic!("guest access outside RAM at {vaddr:#010x}")
+    panic!(
+        "guest access outside RAM at {vaddr:#010x}{}",
+        wild_hint(vaddr)
+    )
 }
 
 #[cfg(test)]
@@ -305,6 +328,30 @@ mod tests {
         assert_eq!(m.read_u64(0x8000_0000), 0x1122_3344_5566_A1B2);
         m.sdr(0x8000_0001, 0xA1B2_C3D4_E5F6_0718);
         assert_eq!(m.read_u64(0x8000_0000), 0x0718_3344_5566_A1B2);
+    }
+
+    #[test]
+    #[should_panic(expected = "0x27bdffe8 (looks like the instruction addiu sp")]
+    fn pointer_overwritten_with_code_stops() {
+        let mut m = ram();
+        m.set_io(Io {
+            sp_mem: vec![0; 0x2000],
+            rom: Arc::from(vec![]),
+            regs: HashMap::new(),
+        });
+        m.read_u32(0x27BD_FFE8);
+    }
+
+    #[test]
+    #[should_panic(expected = "not a KSEG0/KSEG1 address")]
+    fn mapped_segment_past_ram_stops() {
+        let mut m = ram();
+        m.set_io(Io {
+            sp_mem: vec![0; 0x2000],
+            rom: Arc::from(vec![]),
+            regs: HashMap::new(),
+        });
+        m.write_u32(0xC000_0040, 1);
     }
 
     #[test]

@@ -237,7 +237,8 @@ impl Ctx {
                 self.depth -= 1;
             }
             None => panic!(
-                "call to unknown guest function {addr:#010x}{}",
+                "call to unknown guest function {addr:#010x}{}{}",
+                memory::wild_hint(addr),
                 self.overlays_at(addr)
             ),
         }

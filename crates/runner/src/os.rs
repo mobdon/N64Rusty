@@ -55,7 +55,14 @@ pub enum Outcome {
     Deadlock(String),
     /// The boot code returned without starting a thread.
     Returned,
+    /// No retrace for [`HANG_WALL`] of host time: a guest loop that makes
+    /// no calls, so virtual time cannot move. Threads and recent calls.
+    Hang(String),
 }
+
+/// Host time without a single retrace after which a run counts as hung.
+/// A game frame takes milliseconds headless; any call advances the clock.
+pub const HANG_WALL: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Wait {
@@ -579,11 +586,36 @@ pub fn run(
     );
     spawn_thread(0, 0);
     os().cv.notify_all();
-    let st = lock();
-    let mut st = os()
-        .cv
-        .wait_while(st, |s| s.done.is_none() && !boot_returned(s))
-        .unwrap_or_else(|e| e.into_inner());
+    let mut st = lock();
+    let mut seen = u64::MAX;
+    loop {
+        let (g, wait) = os()
+            .cv
+            .wait_timeout_while(st, HANG_WALL, |s| s.done.is_none() && !boot_returned(s))
+            .unwrap_or_else(|e| e.into_inner());
+        st = g;
+        if !wait.timed_out() {
+            break;
+        }
+        if st.frames == seen {
+            // SAFETY: none. The guest thread is still running and may write
+            // registers while this reads them: a data race on plain
+            // integers, accepted because the values only go into a report
+            // printed just before the process exits. The call trace itself
+            // is not written by a loop that makes no calls.
+            // shortcut: racy read for diagnostics; make the trace atomic if this report is ever trusted for more.
+            let c: &Ctx = unsafe { &*os().ctx.load(Ordering::Acquire) };
+            let d = format!(
+                "{}\nthe running thread is {:?}\n{}",
+                st.describe_threads(),
+                st.current,
+                crate::crash_report(c)
+            );
+            st.done = Some(Outcome::Hang(d));
+            break;
+        }
+        seen = st.frames;
+    }
     let outcome = st.done.clone().unwrap_or(Outcome::Returned);
     let report = std::mem::take(&mut st.report);
     (outcome, report, st.frames)
