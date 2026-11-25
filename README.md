@@ -348,5 +348,8 @@ Licensed under either of
 at your option. Unless you state otherwise, any contribution you submit for
 inclusion is dual licensed as above, without any additional terms.
 
+AI agents and people may work on this code without asking permission; see
+[AGENTS.md](AGENTS.md) for the short list of project rules.
+
 Modelled on [N64Recomp](https://github.com/N64Recomp/N64Recomp) (MIT). See
 [CREDITS.md](CREDITS.md) and [NOTICE](NOTICE).
