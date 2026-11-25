@@ -149,6 +149,11 @@ impl Ctx {
 
     /// Replaces the function at `addr`. Overrides win over registered
     /// functions, so a hook can stand in for any guest routine.
+    /// The override at `addr`, if any.
+    pub fn override_at(&self, addr: u32) -> Option<GuestFn> {
+        self.overrides.get(&addr).copied()
+    }
+
     pub fn set_override(&mut self, addr: u32, f: GuestFn) {
         self.overrides.insert(addr, f);
     }

@@ -564,6 +564,7 @@ pub fn main_args(
         flash: Default::default(),
     });
     let hooked = os::install(&mut ctx, names.iter().map(|(a, n)| (n, a)));
+    mods::route(&mut ctx);
     println!("replaced {} system routines", hooked.len());
     *NAMES.lock().unwrap() = names;
     let (snap_rom, snap_entry) = (rom_bytes.clone(), game.entry);

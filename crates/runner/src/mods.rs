@@ -12,6 +12,9 @@ use n64rusty_runtime::Ctx;
 /// Mod hooks by the guest address they replace.
 static HOOKS: Mutex<Option<HashMap<u32, Hook>>> = Mutex::new(None);
 
+/// What a hooked address ran before the mods: a replaced system routine.
+static REPLACED: Mutex<Option<HashMap<u32, n64rusty_runtime::GuestFn>>> = Mutex::new(None);
+
 /// The mods turned on, loaded; the `mods` folder is made if missing, so
 /// players can find it.
 pub fn load() -> Vec<(String, libloading::Library)> {
@@ -75,7 +78,20 @@ fn ctx(c: *mut c_void) -> &'static mut Ctx {
 }
 
 extern "C" fn call_original(c: *mut c_void, addr: u32) {
-    ctx(c).call_original(addr);
+    original(ctx(c), addr);
+}
+
+/// Runs what `addr` ran before the mods hooked it.
+fn original(c: &mut Ctx, addr: u32) {
+    let replaced = REPLACED
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|r| r.get(&addr).copied());
+    match replaced {
+        Some(f) => f(c),
+        None => c.call_original(addr),
+    }
 }
 
 extern "C" fn regs(c: *mut c_void) -> *mut u64 {
@@ -92,7 +108,22 @@ fn dispatch(c: &mut Ctx) {
         .and_then(|h| h.get(&addr).copied());
     match hook {
         Some(h) => h(c as *mut Ctx as *mut c_void),
-        None => c.call_original(addr),
+        None => original(c, addr),
+    }
+}
+
+/// Routes every hooked address through [`dispatch`]; a hook on a replaced
+/// system routine wraps the replacement, so this runs after those are in.
+pub fn route(c: &mut Ctx) {
+    for a in hooked() {
+        if let Some(f) = c.override_at(a) {
+            REPLACED
+                .lock()
+                .unwrap()
+                .get_or_insert_with(HashMap::new)
+                .insert(a, f);
+        }
+        c.set_override(a, dispatch);
     }
 }
 
@@ -151,9 +182,6 @@ pub fn install(
             drop_hooks_since(&before);
         }
     }
-    for a in hooked() {
-        c.set_override(a, dispatch);
-    }
 }
 
 #[cfg(test)]
@@ -169,5 +197,22 @@ mod tests {
         set_override(0x8000_2000, hook);
         drop_hooks_since(&before);
         assert_eq!(hooked(), vec![0x8000_1000]);
+    }
+
+    #[test]
+    fn a_hook_on_a_replaced_routine_wraps_the_replacement() {
+        fn replacement(c: &mut Ctx) {
+            c.r[2] = 7;
+        }
+        extern "C" fn wrap(c: *mut c_void) {
+            call_original(c, 0x8000_3000);
+            ctx(c).r[2] += 1;
+        }
+        let mut c = Ctx::new(n64rusty_runtime::Memory::new(16));
+        c.set_override(0x8000_3000, replacement);
+        set_override(0x8000_3000, wrap);
+        route(&mut c);
+        c.call(0x8000_3000);
+        assert_eq!(c.r[2], 8);
     }
 }
