@@ -117,6 +117,40 @@ fn read_symbols(path: &Path) -> Result<Vec<(u32, String)>, String> {
     Ok(out)
 }
 
+/// The RAM images runs saved for the ROM with this SHA-256 (see
+/// [`written_images`]), as (base address, bytes).
+fn saved_images(sha256: &str) -> Result<Vec<(u32, Vec<u8>)>, String> {
+    let dir = PathBuf::from("local").join(sha256).join("images");
+    let mut paths: Vec<PathBuf> = fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    paths.sort();
+    let mut out = Vec::new();
+    for p in paths {
+        let stem = p
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let Some(base) = stem
+            .split('_')
+            .next()
+            .and_then(|h| u32::from_str_radix(h, 16).ok())
+        else {
+            continue;
+        };
+        // One unreadable image is skipped, not fatal for the whole match.
+        match fs::read(&p) {
+            Ok(bytes) => out.push((base, bytes)),
+            Err(e) => eprintln!("warning: skipped {}: {e}", p.display()),
+        }
+    }
+    Ok(out)
+}
+
 /// The `missing.txt` rom column of code the game wrote into RAM itself.
 const WRITTEN: u32 = u32::MAX;
 
@@ -757,7 +791,21 @@ fn match_routines(args: &[String]) -> Result<(), String> {
         return Err("match needs a reference ROM and a ROM".into());
     };
     let (reference, rom) = (load(ref_path)?, load(path)?);
-    let ref_words = words(reference.boot_segment());
+    let mut ref_words = words(reference.boot_segment());
+    let ref_base = reference.entry();
+    // The reference's code saved from RAM (`images/`) stands in for the
+    // packed bytes the boot image holds at those addresses.
+    for (base, bytes) in saved_images(&reference.sha256)? {
+        if base < ref_base || base - ref_base >= 0x0100_0000 {
+            continue;
+        }
+        let at = ((base - ref_base) / 4) as usize;
+        let w = words(&bytes);
+        if ref_words.len() < at + w.len() {
+            ref_words.resize(at + w.len(), 0);
+        }
+        ref_words[at..at + w.len()].copy_from_slice(&w);
+    }
     let (ref_base, ref_end) = (
         reference.entry(),
         reference.entry() + 4 * ref_words.len() as u32,
@@ -778,6 +826,16 @@ fn match_routines(args: &[String]) -> Result<(), String> {
             .unwrap_or(ref_end);
         let at = ((a - ref_base) / 4) as usize;
         let mut len = ((next - a) / 4) as usize;
+        // Names can be sparse: a routine also ends at the first return
+        // followed by the start of another.
+        if let Some(k) = (0..len).find(|&k| {
+            // The word after the delay slot must exist to start a routine.
+            at + k + 2 < ref_words.len()
+                && ref_words[at + k] == 0x03E0_0008
+                && starts_function(&ref_words, at + k + 2)
+        }) {
+            len = len.min(k + 2);
+        }
         while len > 0 && ref_words[at + len - 1] == 0 {
             len -= 1;
         }
@@ -792,28 +850,7 @@ fn match_routines(args: &[String]) -> Result<(), String> {
     );
     // Also the code runs saved from RAM (`images/`), for library routines
     // the game keeps in code it unpacks itself.
-    let images = PathBuf::from("local").join(&rom.sha256).join("images");
-    let mut saved: Vec<PathBuf> = fs::read_dir(&images)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| e.path())
-        .collect();
-    saved.sort();
-    for p in saved {
-        let stem = p
-            .file_stem()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        let Some(base) = stem
-            .split('_')
-            .next()
-            .and_then(|h| u32::from_str_radix(h, 16).ok())
-        else {
-            continue;
-        };
-        let bytes = fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+    for (base, bytes) in saved_images(&rom.sha256)? {
         for (a, n) in find_routines(&ref_words, ref_base, &routines, &words(&bytes), base) {
             if found.iter().all(|(fa, fname)| *fa != a && *fname != n) {
                 found.push((a, n));
