@@ -30,7 +30,7 @@ mod tmem;
 
 pub use capture::{write_png, Capture};
 pub use combiner::{fragment_shader, Combiner};
-pub use dl::{GfxError, Interpreter};
+pub use dl::{GfxError, Interpreter, Readback};
 pub use render::{fit, Image, RenderError, Renderer, WindowTarget};
 
 /// A 4x4 matrix in N64 layout: row vectors, so a point transforms as

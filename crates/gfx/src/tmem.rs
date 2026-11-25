@@ -234,6 +234,22 @@ impl Tmem {
         }
     }
 
+    /// The texture image the next load reads: (address, width, size code).
+    pub fn image(&self) -> (u32, u32, u32) {
+        self.image
+    }
+
+    /// RGBA8 at texel coordinates (`s`, `t`) of `tile`, as a copy-mode
+    /// rectangle reads it: from the tile's corner, wrapped by its mask.
+    pub fn texel_at(&self, tile: usize, s: f32, t: f32, tlut: u32) -> [u8; 4] {
+        let tl = self.tiles[tile & 7];
+        let c = |v: f32, k: usize| {
+            let x = (v - tl.ul[k] as f32 / 4.0).max(0.0) as u32;
+            wrap_mask(x, tl.mask[k], tl.cm[k])
+        };
+        self.texel(&tl, c(s, 0), c(t, 1), tlut)
+    }
+
     /// RGBA8 of texel (`x`, `y`) of `t`.
     fn texel(&self, t: &Tile, x: u32, y: u32, tlut: u32) -> [u8; 4] {
         let row = t.tmem as usize * 8 + y as usize * Self::stride(t);

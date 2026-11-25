@@ -1182,12 +1182,39 @@ fn os_sp_task_start_go(c: &mut Ctx) {
     let kind = c.mem.read_u32(task);
     let mut st = lock();
     st.devices.rsp_task(c, task);
-    post_event(c, &mut st, event::SP);
-    // Graphics tasks also finish on the RDP.
+    // The task is done at once here, but it reports done a little later,
+    // as on the console: games send requests about a running task (which
+    // frame buffer it fills) after starting it.
+    // shortcut: one fixed time for every task, not its real length.
+    let at = c.clock + TASK_TICKS;
     if kind == 1 {
-        post_event(c, &mut st, event::DP);
+        post_event_at(c, &mut st, event::SP, at, 1);
+        // Graphics tasks also finish on the RDP.
+        post_event_at(c, &mut st, event::DP, at + 1, 2);
+    } else {
+        post_event_at(c, &mut st, event::SP, at, 3);
     }
     let _st = reschedule(c, st);
+}
+
+/// How long an RSP task takes to report done, in COUNT ticks (1 ms).
+const TASK_TICKS: u64 = COUNT_HZ / 1000;
+
+/// Posts the message registered for event `e` at clock `at`, as a timer
+/// under `key`: a small number no guest timer has (theirs are addresses).
+fn post_event_at(c: &mut Ctx, st: &mut State, e: u32, at: u64, key: u32) {
+    if let Some(&(mq, msg)) = st.events.get(&e) {
+        st.timers.insert(
+            key,
+            Timer {
+                at,
+                interval: 0,
+                mq,
+                msg,
+            },
+        );
+        arm(c, st);
+    }
 }
 
 fn os_ai_set_next_buffer(c: &mut Ctx) {
