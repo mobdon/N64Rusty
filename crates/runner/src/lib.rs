@@ -130,10 +130,18 @@ fn record_run(
             let addr_text = rest.split_whitespace().next().unwrap_or("");
             let addr = u32::from_str_radix(addr_text.trim_start_matches("0x"), 16).unwrap_or(0);
             // Which copy put code there: the latest one covering it.
+            // The copy must still be what is there: the game may have
+            // written other code over it since (unpacking, for example).
+            let still_there = |r: u32, ram: u32| {
+                let (at, from) = ((addr & 0x1FFF_FFFC) as usize, (r + (addr & !3) - ram) as usize);
+                let n = 16.min(ram_now.len().saturating_sub(at));
+                rom.get(from..from + n).is_some_and(|b| b == &ram_now[at..at + n])
+            };
             let src = dma
                 .iter()
                 .rev()
-                .find(|(_, ram, len)| addr >= *ram && addr < ram.wrapping_add(*len));
+                .find(|(_, ram, len)| addr >= *ram && addr < ram.wrapping_add(*len))
+                .filter(|(r, ram, _)| still_there(*r, *ram));
             // No copy covers it: code in the boot image reached only
             // through a pointer, written with a zero copy.
             let mut found = src.copied().unwrap_or((0, 0, 0));

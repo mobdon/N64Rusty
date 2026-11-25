@@ -11,7 +11,7 @@ use std::process::ExitCode;
 
 use n64rusty_rom::{Rom, BOOT_SEGMENT_ROM, BOOT_SEGMENT_SIZE};
 use n64rusty_translator::discover::{
-    data_pointers, discover, function_starts, overlay_table, Discovery, Image,
+    data_pointers, discover, discover_layout, function_starts, overlay_table, Discovery, Image,
 };
 use n64rusty_translator::{emit, translate_function};
 
@@ -120,12 +120,14 @@ fn read_symbols(path: &Path) -> Result<Vec<(u32, String)>, String> {
 /// The `missing.txt` rom column of code the game wrote into RAM itself.
 const WRITTEN: u32 = u32::MAX;
 
-/// The code in each RAM image a run saved under `images/` (see the runner's
-/// `record_run`), found from the missing calls into it, as one module each.
-/// Discovery first follows those calls; then every function the layout
-/// shows between the first and last one found is taken too, but not past
-/// them: the image may hold unrelated code or data around it.
-fn written_images(local: &Path, missing: &[Vec<u32>]) -> Result<Vec<(String, Discovery)>, String> {
+/// The code in each RAM image a run saved under `images/<ram>_<call>.bin`
+/// (see the runner's `record_run`), found from the call that missed, as one
+/// module each.
+/// Discovery starts from that call; every function start the layout of the
+/// image shows is taken too, unless it lands inside one already found. The image may also hold other code loaded nearby:
+/// harmless, since each function only runs while its bytes are in RAM, and
+/// what decodes as data is dropped.
+fn written_images(local: &Path) -> Result<Vec<(String, Discovery)>, String> {
     let mut out = Vec::new();
     let Ok(dir) = fs::read_dir(local.join("images")) else {
         return Ok(out);
@@ -134,29 +136,19 @@ fn written_images(local: &Path, missing: &[Vec<u32>]) -> Result<Vec<(String, Dis
     paths.sort();
     for path in paths {
         let stem = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
-        let Some(base) = stem.split('_').next().and_then(|h| u32::from_str_radix(h, 16).ok()) else {
+        let hex: Vec<u32> = stem.split('_').filter_map(|h| u32::from_str_radix(h, 16).ok()).collect();
+        let [base, called] = hex[..] else {
             continue;
         };
         let bytes = fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         let img = Image { base, bytes: &bytes };
         let end = base.wrapping_add(bytes.len() as u32);
-        let entries: Vec<u32> = missing
-            .iter()
-            .filter(|m| m[1] == WRITTEN && img.contains(m[0]))
-            .map(|m| m[0])
-            .collect();
-        let first = discover(&img, &entries, &[], Some(end));
-        let span = |d: &Discovery| {
-            let lo = d.functions.iter().map(|f| f.addr).min()?;
-            let hi = d.functions.iter().map(|f| f.addr + 4 * f.words.len() as u32).max()?;
-            Some((lo, hi))
-        };
-        let Some((lo, hi)) = span(&first) else { continue };
-        let inside = |a: &u32| (lo..hi).contains(a);
-        let mut starts = entries.clone();
-        starts.extend(function_starts(&img).into_iter().filter(inside));
-        let pointers: Vec<u32> = data_pointers(&img).into_iter().filter(inside).collect();
-        out.push((format!("img_{stem}"), discover(&img, &starts, &pointers, Some(hi))));
+        // Only the call that saved this image: other misses in the same
+        // range may have been into other code loaded there at other times.
+        let entries = vec![called];
+        let mut layout = function_starts(&img);
+        layout.extend(data_pointers(&img));
+        out.push((format!("img_{stem}"), discover_layout(&img, &entries, &[], &layout, Some(end))));
     }
     Ok(out)
 }
@@ -423,7 +415,7 @@ fn translate(args: &[String]) -> Result<(), String> {
     }
 
     // Code the game wrote into RAM itself, saved by runs that called into it.
-    let images = written_images(&local, &missing)?;
+    let images = written_images(&local)?;
 
     let mut failed = Vec::new();
     let mut translate_one = |f: &n64rusty_translator::Function| {
