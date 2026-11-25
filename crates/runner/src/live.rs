@@ -7,21 +7,27 @@
 //! - each host frame (paced at the game's own rate, never faster) hands one
 //!   set of controller states to the game, and the game's next retrace
 //!   waits for it, so the game can never run ahead of the host;
-//! - each finished frame the game shows is rendered at the window's size,
-//!   keeping the game's 4:3 shape with black bars;
+//! - each finished frame the game shows is rendered on the GPU straight
+//!   into the window at its size, keeping the game's 4:3 shape with black
+//!   bars;
 //! - each audio buffer goes to the speakers on a thread of its own.
+//!
+//! With `refresh` in the window config above the game's rate, the window is
+//! drawn that often: each picture blends object placement from the
+//! previous game frame to the newest one by how much of a game frame has
+//! passed (see `n64rusty_gfx::interpolate`). The game still runs at its
+//! own rate; what is shown trails it by one game frame.
 //!
 //! With `headless = true` in the run config nothing is opened: frames run
 //! as fast as the game allows and input comes from the replay script, which
 //! is how this path is tested.
 
-use std::num::NonZeroU32;
 use std::process::ExitCode;
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use n64rusty_gfx::{Frame, Image, Renderer};
+use n64rusty_gfx::{Frame, Renderer, WindowTarget};
 use n64rusty_host::{Guest, Pads, RunConfig};
 use n64rusty_runtime::Ctx;
 use winit::window::Window;
@@ -33,8 +39,6 @@ use crate::media::Media;
 type Shown = Arc<Mutex<Option<Frame>>>;
 /// Audio buffers for the speakers: rate and interleaved left/right samples.
 type Sound = (u32, Vec<i16>);
-/// The window and the pixel buffer drawn into it.
-type Surface = softbuffer::Surface<Arc<Window>, Arc<Window>>;
 
 /// The game side: the default devices, with controller input and pacing
 /// from the host frame loop.
@@ -112,9 +116,14 @@ pub struct Screen {
     input: SyncSender<Pads>,
     shown: Shown,
     sound: Option<Receiver<Sound>>,
-    window: Option<(Arc<Window>, Surface)>,
-    renderer: Option<Renderer>,
-    renderer_failed: bool,
+    window: Option<(Arc<Window>, Renderer, WindowTarget)>,
+    widescreen: bool,
+    /// One game frame, when pictures are blended between game frames.
+    blend: Option<Duration>,
+    /// The game frame before the newest one.
+    prev: Option<Frame>,
+    /// The newest game frame and when it arrived.
+    cur: Option<(Frame, Instant)>,
 }
 
 /// Connects the two sides. `media` supplies graphics, audio and capture.
@@ -137,8 +146,10 @@ pub fn pair(mut media: Media) -> (Live, Screen) {
         shown,
         sound: Some(sound_rx),
         window: None,
-        renderer: None,
-        renderer_failed: false,
+        widescreen: false,
+        blend: None,
+        prev: None,
+        cur: None,
     };
     (live, screen)
 }
@@ -159,14 +170,43 @@ impl Guest for Screen {
                 Err(TrySendError::Disconnected(_)) => return,
             }
         }
-        self.present();
+        if self.blend.is_some() {
+            self.redraw();
+        } else {
+            self.present();
+        }
+    }
+
+    fn redraw(&mut self) {
+        let Some(period) = self.blend else { return };
+        let taken = self.shown.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(f) = taken {
+            self.prev = self.cur.take().map(|(f, _)| f);
+            self.cur = Some((f, Instant::now()));
+        }
+        let (Some((window, renderer, target)), Some((cur, at))) = (&mut self.window, &self.cur)
+        else {
+            return;
+        };
+        let size = window.inner_size();
+        let t = (at.elapsed().as_secs_f32() / period.as_secs_f32()).min(1.0);
+        let r = match &self.prev {
+            Some(prev) => renderer.present_between(prev, cur, t, target, size.width, size.height),
+            None => renderer.present(cur, target, size.width, size.height),
+        };
+        if let Err(e) = r {
+            eprintln!("warning: frame not shown: {e}");
+        }
     }
 
     fn attach_window(&mut self, window: Arc<Window>) {
-        let surface = softbuffer::Context::new(window.clone())
-            .and_then(|c| softbuffer::Surface::new(&c, window.clone()));
-        match surface {
-            Ok(s) => self.window = Some((window, s)),
+        let target = Renderer::new().and_then(|mut r| {
+            r.set_widescreen(self.widescreen);
+            let t = r.window_target(window.clone())?;
+            Ok((r, t))
+        });
+        match target {
+            Ok((r, t)) => self.window = Some((window, r, t)),
             Err(e) => eprintln!("warning: cannot draw into the window: {e}"),
         }
         if let Some(rx) = self.sound.take() {
@@ -192,75 +232,17 @@ fn speakers(rx: Receiver<Sound>) {
 
 impl Screen {
     /// Draws the newest finished frame, if there is one, at the window's
-    /// size.
+    /// size, straight on the GPU.
     fn present(&mut self) {
-        let Some((window, surface)) = &mut self.window else {
+        let Some((window, renderer, target)) = &mut self.window else {
             return;
         };
         let Some(frame) = self.shown.lock().unwrap_or_else(|e| e.into_inner()).take() else {
             return;
         };
         let size = window.inner_size();
-        let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else {
-            return; // minimised
-        };
-        if self.renderer.is_none() && !self.renderer_failed {
-            match Renderer::new() {
-                Ok(r) => self.renderer = Some(r),
-                Err(e) => {
-                    eprintln!("warning: no renderer, nothing is drawn: {e}");
-                    self.renderer_failed = true;
-                }
-            }
-        }
-        let Some(renderer) = self.renderer.as_mut() else {
-            return;
-        };
-        let (x, y, fw, fh) = fit(w.get(), h.get(), frame.width.max(1), frame.height());
-        // shortcut: the frame is read back and copied into the window on
-        // the CPU; render straight into a window surface if this is slow.
-        let image = match renderer.render(&frame, fw, fh) {
-            Ok(i) => i,
-            Err(e) => {
-                eprintln!("warning: frame not drawn: {e}");
-                return;
-            }
-        };
-        let result = surface.resize(w, h).and_then(|()| {
-            let mut buf = surface.buffer_mut()?;
-            letterbox(&image, x, y, w.get(), &mut buf);
-            buf.present()
-        });
-        if let Err(e) = result {
+        if let Err(e) = renderer.present(&frame, target, size.width, size.height) {
             eprintln!("warning: frame not shown: {e}");
-        }
-    }
-}
-
-/// The largest rectangle with the frame's shape that fits the window,
-/// centred: `(x, y, width, height)`.
-pub fn fit(win_w: u32, win_h: u32, frame_w: u32, frame_h: u32) -> (u32, u32, u32, u32) {
-    let (fw, fh) = (frame_w as u64, frame_h as u64);
-    let (w, h) = if win_w as u64 * fh <= win_h as u64 * fw {
-        (win_w as u64, win_w as u64 * fh / fw)
-    } else {
-        (win_h as u64 * fw / fh, win_h as u64)
-    };
-    let (w, h) = (w.max(1) as u32, h.max(1) as u32);
-    ((win_w - w.min(win_w)) / 2, (win_h - h.min(win_h)) / 2, w, h)
-}
-
-/// Copies `image` into a window buffer `width` pixels wide at (x, y), black
-/// elsewhere. Window pixels are `0x00RRGGBB`.
-pub fn letterbox(image: &Image, x: u32, y: u32, width: u32, buf: &mut [u32]) {
-    buf.fill(0);
-    let height = buf.len() as u32 / width.max(1);
-    for row in 0..image.height.min(height.saturating_sub(y)) {
-        let cols = image.width.min(width.saturating_sub(x)) as usize;
-        let src = &image.rgba[(row * image.width * 4) as usize..][..cols * 4];
-        let at = ((y + row) * width + x) as usize;
-        for (d, s) in buf[at..at + cols].iter_mut().zip(src.as_chunks::<4>().0) {
-            *d = (s[0] as u32) << 16 | (s[1] as u32) << 8 | s[2] as u32;
         }
     }
 }
@@ -274,7 +256,22 @@ pub fn play(
     media: Media,
     run: impl FnOnce(Box<dyn Devices>) -> u8 + Send + 'static,
 ) -> ExitCode {
-    let (live, screen) = pair(media);
+    // A crash closes the window and often the console with it: keep the
+    // message in crash.txt in the per-game folder as well.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_hook(info);
+        let thread = std::thread::current().name().unwrap_or("?").to_string();
+        let trace = std::backtrace::Backtrace::force_capture();
+        let _ = std::fs::write("crash.txt", format!("thread {thread}: {info}\n\n{trace}\n"));
+    }));
+    let (live, mut screen) = pair(media);
+    screen.widescreen = cfg.window.widescreen;
+    screen.blend = cfg
+        .window
+        .refresh
+        .filter(|&r| r > cfg.frame_rate)
+        .map(|_| Duration::from_secs_f64(1.0 / cfg.frame_rate));
     std::thread::Builder::new()
         .name("game".into())
         .spawn(move || std::process::exit(run(Box::new(live)).into()))
@@ -296,28 +293,6 @@ pub fn play(
 mod tests {
     use super::*;
     use n64rusty_host::pad::button;
-
-    #[test]
-    fn fit_keeps_the_shape_and_centres() {
-        assert_eq!(fit(640, 480, 320, 240), (0, 0, 640, 480));
-        assert_eq!(fit(1920, 1080, 320, 240), (240, 0, 1440, 1080));
-        assert_eq!(fit(800, 1000, 320, 240), (0, 200, 800, 600));
-        assert_eq!(fit(1, 1, 320, 240), (0, 0, 1, 1));
-    }
-
-    #[test]
-    fn letterbox_places_the_image_with_black_bars() {
-        let image = Image {
-            width: 2,
-            height: 1,
-            rgba: vec![255, 0, 0, 255, 0, 0, 255, 255],
-        };
-        let mut buf = vec![7; 4 * 3];
-        letterbox(&image, 1, 1, 4, &mut buf);
-        assert_eq!(buf[..4], [0; 4]);
-        assert_eq!(buf[4..8], [0, 0xFF0000, 0x0000FF, 0]);
-        assert_eq!(buf[8..], [0; 4]);
-    }
 
     /// A stand-in for the game: retraces as fast as it can and reads the
     /// controllers after each, as a game's controller thread does.

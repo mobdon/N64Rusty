@@ -177,7 +177,8 @@ fn loads_and_decodes_an_rgba16_texture() {
     assert_eq!(&t.rgba[..8], &[255, 0, 0, 255, 0, 255, 0, 255]);
     assert_eq!(&t.rgba[12..16], &[255, 255, 255, 255]);
     assert_eq!(&t.rgba[16..20], &[0, 0, 0, 0]);
-    assert_eq!(t.wrap, [Wrap::Repeat; 2]);
+    // No mask: the hardware cannot wrap, so the tile clamps.
+    assert_eq!(t.wrap, [Wrap::Clamp; 2]);
     assert_eq!(f.vertices[1].uv[0], [1.0, 0.0]);
     assert_eq!(f.vertices[2].uv[0], [0.0, 1.0]);
 }
@@ -244,6 +245,37 @@ fn lights_vertices_from_normals() {
     assert_eq!(c[1], 0.0);
     assert!((c[2] - 0.2).abs() < 1e-5, "{c:?}");
     assert_eq!(c[3], 200.0 / 255.0);
+}
+
+#[test]
+fn light_colour_command_changes_a_loaded_light() {
+    let mut ram = Ram::default();
+    let verts = ram.vertices(&[V {
+        pos: [0, 0, 0],
+        st: [0, 0],
+        rgba: [0, 0, 127, 255],
+    }]);
+    let light = ram.put(&[128, 0, 0, 0, 128, 0, 0, 0, 0, 0, 127, 0, 0, 0, 0, 0]);
+    let ambient = ram.put(&[0, 0, 0, 0, 0, 0, 0, 0]);
+    let mut dl = Dl::default();
+    setup(&mut ram, &mut dl);
+    dl.geometry(0, G_LIGHTING)
+        .num_lights(1)
+        .light(light, 1)
+        .light(ambient, 2)
+        // gSPLightColor: light 1 becomes full green (both colour words),
+        // the ambient (light 2, offset 24) a little blue.
+        .light_color(0, 0x00FF_0000)
+        .light_color(4, 0x00FF_0000)
+        .light_color(24, 0x0000_3300)
+        .vtx(verts, 1, 0)
+        .tri(0, 0, 0)
+        .end();
+    let addr = ram.dl(&dl);
+    let c = run(&ram, addr).vertices[0].color;
+    assert_eq!(c[0], 0.0, "{c:?}");
+    assert_eq!(c[1], 1.0, "{c:?}");
+    assert!((c[2] - 0.2).abs() < 1e-5, "{c:?}");
 }
 
 #[test]
@@ -403,4 +435,21 @@ fn modify_vertex_overwrites_colour_texture_and_screen_position() {
     assert_ne!(moved.transform, f.vertices[0].transform);
     let d = f.draws().next().unwrap();
     assert_eq!(d.state.scissor, Some([8.0, 16.0, 300.0, 200.0]));
+}
+
+#[test]
+fn insert_matrix_edits_the_combined_matrix() {
+    let mut ram = Ram::default();
+    let verts = ram.vertices(&[v(0, 0, 0, [255; 4]); 3]);
+    let mut dl = Dl::default();
+    setup(&mut ram, &mut dl);
+    // Integer parts of elements 0 and 1 become 2 and 0; fractions stay.
+    dl.0.extend([0xDB00_0000, 0x0002_0000]);
+    dl.vtx(verts, 3, 0).tri(0, 1, 2).end();
+    let addr = ram.dl(&dl);
+    let f = run(&ram, addr);
+    assert!(f.warnings.is_empty(), "{:?}", f.warnings);
+    let t = &f.transforms[f.vertices[0].transform as usize];
+    assert!((t.modelview[0][0] - 2.01).abs() < 1e-3, "{:?}", t.modelview);
+    assert_eq!(t.projection, n64rusty_gfx::IDENTITY);
 }

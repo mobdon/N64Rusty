@@ -20,6 +20,8 @@ use crate::devices::{Devices, Pad};
 const TASK_GFX: u32 = 1;
 /// `OSTask.t.type` of an audio task.
 const TASK_AUDIO: u32 = 2;
+/// Picture decode (inverse DCT and colour conversion of JPEG blocks).
+const TASK_JPEG: u32 = 4;
 /// Offset of `OSTask.t.data_ptr`: the display list or audio command list.
 const TASK_DATA_PTR: u32 = 0x30;
 /// Offset of `OSTask.t.data_size`.
@@ -50,6 +52,13 @@ pub struct Media {
     every: u64,
     /// Saved frames are this many times the game's resolution.
     scale: u32,
+    /// Saved frames are 16:9 widescreen.
+    wide: bool,
+    /// Also save the picture half-way from the frame before each saved one,
+    /// as a high refresh rate window would show it.
+    between: bool,
+    /// The frame before the next one to save, kept when `between` is set.
+    prev: Option<Frame>,
     renderer: Option<Renderer>,
     renderer_failed: bool,
     tasks: u64,
@@ -99,6 +108,9 @@ impl Media {
             capture,
             every: every.max(1),
             scale: 1,
+            wide: false,
+            between: false,
+            prev: None,
             renderer: None,
             renderer_failed: false,
             tasks: 0,
@@ -118,18 +130,42 @@ impl Media {
         self
     }
 
+    /// Saves frames 16:9 wide, as the window's widescreen option draws them.
+    pub fn with_widescreen(mut self, on: bool) -> Self {
+        self.wide = on;
+        self
+    }
+
+    /// Also saves `frame_<n>_half.png`: half-way from frame n-1 to frame n.
+    pub fn with_between(mut self, on: bool) -> Self {
+        self.between = on;
+        self
+    }
+
     /// Hands every finished frame to `slot`, replacing one not yet taken.
     pub fn show_frames(&mut self, slot: Arc<Mutex<Option<Frame>>>) {
         self.shown = Some(slot);
     }
 
     fn save(&mut self, frame: u64, f: &Frame) {
+        let prev = self.prev.take();
+        self.save_as(&format!("frame_{frame:05}.png"), f, None);
+        if let Some(p) = prev {
+            self.save_as(&format!("frame_{frame:05}_half.png"), f, Some(&p));
+        }
+    }
+
+    /// Renders `f` (half-way from `prev`, if given) and saves it as `name`.
+    fn save_as(&mut self, name: &str, f: &Frame, prev: Option<&Frame>) {
         let Some(dir) = self.capture.clone() else {
             return;
         };
         if self.renderer.is_none() && !self.renderer_failed {
             match Renderer::new() {
-                Ok(r) => self.renderer = Some(r),
+                Ok(mut r) => {
+                    r.set_widescreen(self.wide);
+                    self.renderer = Some(r);
+                }
                 Err(e) => {
                     eprintln!("warning: no off-screen renderer, frames are not saved: {e}");
                     self.renderer_failed = true;
@@ -139,19 +175,23 @@ impl Media {
         let Some(r) = self.renderer.as_mut() else {
             return;
         };
-        let (w, h) = (f.width.max(1) * self.scale, f.height() * self.scale);
-        let result = r
-            .render(f, w, h)
-            .map_err(|e| e.to_string())
-            .and_then(|img| {
-                std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-                let path = dir.join(format!("frame_{frame:05}.png"));
-                write_png(&path, &img).map_err(|e| e.to_string())?;
-                Ok(path)
-            });
+        let (mut w, h) = (f.width.max(1) * self.scale, f.height() * self.scale);
+        if self.wide {
+            w = (h * 16 / 9).max(w);
+        }
+        let img = match prev {
+            Some(p) => r.render_between(p, f, 0.5, w, h),
+            None => r.render(f, w, h),
+        };
+        let result = img.map_err(|e| e.to_string()).and_then(|img| {
+            std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            let path = dir.join(name);
+            write_png(&path, &img).map_err(|e| e.to_string())?;
+            Ok(path)
+        });
         match result {
             Ok(p) => self.saved.push(p),
-            Err(e) => eprintln!("warning: frame {frame} not saved: {e}"),
+            Err(e) => eprintln!("warning: {name} not saved: {e}"),
         }
     }
 }
@@ -177,6 +217,13 @@ impl Devices for Media {
             let (sound, mem) = (&mut self.sound, &mut ctx.mem);
             if let Err(e) = panic::catch_unwind(AssertUnwindSafe(|| sound.run(mem, list, len))) {
                 self.audio_failed = Some(panic_text(&*e));
+            }
+            return;
+        }
+        if kind == TASK_JPEG {
+            let data = ctx.mem.read_u32(task + TASK_DATA_PTR);
+            if data != 0 {
+                crate::jpeg::run(&mut ctx.mem, data);
             }
             return;
         }
@@ -253,6 +300,9 @@ impl Devices for Media {
         }
         if self.swaps.is_multiple_of(self.every) {
             self.save(frame, &f);
+        }
+        if self.between && self.capture.is_some() && (self.swaps + 1).is_multiple_of(self.every) {
+            self.prev = Some(f.clone());
         }
         if let Some(slot) = &self.shown {
             *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(f);

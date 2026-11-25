@@ -76,6 +76,9 @@ pub struct Interpreter {
     segments: [u32; 16],
     modelview: Vec<Mat4>,
     projection: Mat4,
+    /// The combined matrix after a `gSPInsertMatrix` edit, until the next
+    /// matrix load recomputes it.
+    mvp: Option<Mat4>,
     viewport: Viewport,
     vtx: [Loaded; VTX_BUFFER],
     geometry: u32,
@@ -92,6 +95,9 @@ pub struct Interpreter {
     rdphalf1: u32,
     tmem: Tmem,
     rect_transform: Option<u32>,
+    /// Running the 2D (sprite and background) microcode a display list
+    /// switched to with `G_LOAD_UCODE`, whose low opcodes differ.
+    ucode_2d: bool,
     frame: Frame,
 }
 
@@ -107,6 +113,7 @@ impl Interpreter {
             segments: [0; 16],
             modelview: vec![IDENTITY],
             projection: IDENTITY,
+            mvp: None,
             viewport: Viewport {
                 scale: [160.0, 120.0],
                 trans: [160.0, 120.0],
@@ -130,6 +137,7 @@ impl Interpreter {
                 fog: [0.0; 4],
                 textures: [None; 2],
                 rect: false,
+                texel_exact: false,
                 color_image: 0,
                 scissor: None,
             },
@@ -140,6 +148,7 @@ impl Interpreter {
             rdphalf1: 0,
             tmem: Tmem::default(),
             rect_transform: None,
+            ucode_2d: false,
             frame: Frame {
                 width: 320,
                 ..Frame::default()
@@ -169,12 +178,25 @@ impl Interpreter {
     pub fn run(&mut self, rdram: &[u8], addr: u32) -> Result<(), GfxError> {
         let mut pc = self.phys(addr);
         let mut stack: Vec<u32> = Vec::new();
+        // Every task starts on its own (3D) microcode.
+        self.ucode_2d = false;
         for _ in 0..MAX_COMMANDS {
             let w0 = rd32(rdram, pc, pc)?;
             let w1 = rd32(rdram, pc + 4, pc)?;
             let at = pc;
             pc += 8;
+            if self.ucode_2d && (w0 >> 24 <= 0x0B || matches!(w0 >> 24, 0xDA | 0xDC)) {
+                match w0 >> 24 {
+                    0x0A => self.bg_copy(rdram, w1, at)?,
+                    op => self.warn(format!("unknown 2D command {op:#04x} at {at:#010x}")),
+                }
+                continue;
+            }
             match w0 >> 24 {
+                // shortcut: games switch between their 3D microcode and the
+                // 2D one and back, so each load toggles; track the loaded
+                // code's address if a game loads a third microcode.
+                0xDD => self.ucode_2d = !self.ucode_2d,
                 0x01 => self.vertices(rdram, w0, w1, at)?,
                 0x02 => self.modify_vertex(w0, w1, at),
                 0xED => {
@@ -305,6 +327,7 @@ impl Interpreter {
             }
         }
         // F3DEX2 stores the push flag inverted.
+        self.mvp = None;
         let params = (w0 & 0xFF) ^ 1;
         let (push, load, projection) = (params & 1 != 0, params & 2 != 0, params & 4 != 0);
         if projection {
@@ -328,9 +351,41 @@ impl Interpreter {
         match index {
             0x02 => self.num_lights = (w1 / 24).min(7) as usize,
             0x06 => self.segments[(offset / 4) as usize & 0xF] = w1 & 0x00FF_FFFF,
-            // Fog factors, light colours, clip ratio, perspective norm: not
+            // Fog factors, clip ratio, perspective norm: not
             // needed by this renderer.
-            0x04 | 0x08 | 0x0A | 0x0C | 0x0E => {}
+            // Light colour (`gSPLightColor`): light n's two colour words
+            // are at n * 24 and n * 24 + 4; the second is a copy.
+            0x0A => {
+                if offset % 24 == 0 {
+                    if let Some(l) = self.lights.get_mut((offset / 24) as usize) {
+                        l.color = [24, 16, 8].map(|s| ((w1 >> s) & 0xFF) as f32 / 255.0);
+                    }
+                }
+            }
+            // gSPInsertMatrix: overwrite two 16-bit halves (integer parts in
+            // the first 32 bytes, fractions in the next 32) of the combined
+            // modelview-projection matrix. Games build billboards this way.
+            0x00 if offset < 64 => {
+                let mut m = self
+                    .mvp
+                    .unwrap_or_else(|| mat_mul(self.modelview.last().unwrap(), &self.projection));
+                let frac = offset >= 32;
+                let first = ((offset % 32) / 2) as usize;
+                for (k, half) in [(first, w1 >> 16), (first + 1, w1 & 0xFFFF)] {
+                    let Some(v) = m.get_mut(k / 4).and_then(|r| r.get_mut(k % 4)) else {
+                        continue;
+                    };
+                    let fixed = (*v * 65536.0).round() as i32;
+                    let fixed = if frac {
+                        (fixed & !0xFFFF) | half as i32
+                    } else {
+                        (half as i16 as i32) << 16 | (fixed & 0xFFFF)
+                    };
+                    *v = fixed as f32 / 65536.0;
+                }
+                self.mvp = Some(m);
+            }
+            0x04 | 0x08 | 0x0C | 0x0E => {}
             _ => self.warn(format!("moveword {index:#x} at {at:#010x}")),
         }
     }
@@ -378,10 +433,14 @@ impl Interpreter {
             self.warn(format!("bad vertex load at {at:#010x}"));
             return Ok(());
         }
-        let mv = *self.modelview.last().unwrap();
+        let lights_mv = *self.modelview.last().unwrap();
+        let (mv, projection) = match self.mvp {
+            Some(m) => (m, IDENTITY),
+            None => (*self.modelview.last().unwrap(), self.projection),
+        };
         self.frame.transforms.push(Transform {
             modelview: mv,
-            projection: self.projection,
+            projection,
             viewport: self.viewport,
             tag: at,
         });
@@ -398,7 +457,7 @@ impl Interpreter {
                     b(13)? as i8 as f32,
                     b(14)? as i8 as f32,
                 ];
-                let lc = self.light(&mv, n);
+                let lc = self.light(&lights_mv, n);
                 [lc[0], lc[1], lc[2], b(15)? as f32 / 255.0]
             } else {
                 [b(12)?, b(13)?, b(14)?, b(15)?].map(|c| c as f32 / 255.0)
@@ -593,6 +652,56 @@ impl Interpreter {
         );
     }
 
+    /// `G_BG_COPY` (2D microcode): copies part of a background image in
+    /// RAM to the screen one texel per pixel. Only 16-bit RGBA images.
+    fn bg_copy(&mut self, rdram: &[u8], w1: u32, at: u32) -> Result<(), GfxError> {
+        let a = self.phys(w1);
+        let h = |o: u32| rd16(rdram, a + o, at);
+        let (image_x, image_w, frame_x, frame_w) = (h(0)?, h(2)?, h(4)? as i16, h(6)?);
+        let (image_y, image_h, frame_y, frame_h) = (h(8)?, h(10)?, h(12)? as i16, h(14)?);
+        let image = self.phys(rd32(rdram, a + 16, at)?);
+        let (fmt, siz) = (rd8(rdram, a + 22, at)?, rd8(rdram, a + 23, at)?);
+        if (fmt, siz) != (0, 2) {
+            self.warn(format!(
+                "background format {fmt}/{siz} not drawn at {at:#010x}"
+            ));
+            return Ok(());
+        }
+        let (w, ht) = (u32::from(image_w / 4), u32::from(image_h / 4));
+        let mut rgba = Vec::with_capacity((w * ht * 4) as usize);
+        for i in 0..w * ht {
+            let c = rgba5551(rd16(rdram, image + 2 * i, at)?);
+            rgba.extend(c.map(|v| (v * 255.0) as u8));
+        }
+        let index = self.frame.textures.len() as u32;
+        self.frame.textures.push(crate::Texture {
+            width: w.max(1),
+            height: ht.max(1),
+            rgba,
+            wrap: [crate::Wrap::Clamp; 2],
+        });
+        let (x0, y0) = (f32::from(frame_x) / 4.0, f32::from(frame_y) / 4.0);
+        let (fw, fh) = (f32::from(frame_w) / 4.0, f32::from(frame_h) / 4.0);
+        let (s0, t0) = (f32::from(image_x) / 32.0, f32::from(image_y) / 32.0);
+        let uv = [
+            [s0 / w as f32, t0 / ht as f32],
+            [(s0 + fw) / w as f32, (t0 + fh) / ht as f32],
+        ];
+        let mut state = self.state.clone();
+        state.rect = true;
+        state.texel_exact = true;
+        state.geometry = 0;
+        state.other_h = (state.other_h & !(3 << 20)) | 2 << 20; // copy mode
+        state.combine = crate::combiner::TEXEL0_ONLY;
+        state.textures = [Some(index), None];
+        self.push_rect(
+            [x0, y0, x0 + fw, y0 + fh],
+            |x, y| [[uv[x][0], uv[y][1]]; 2],
+            state,
+        );
+        Ok(())
+    }
+
     fn texture_rect(&mut self, w0: u32, w1: u32, h1: u32, h2: u32, flip: bool) {
         let fixed = |v: u32, sh: u32| ((v >> sh) & 0xFFF) as f32 / 4.0;
         let (x1, y1, x0, y0) = (fixed(w0, 12), fixed(w0, 0), fixed(w1, 12), fixed(w1, 0));
@@ -615,6 +724,8 @@ impl Interpreter {
         let st = [[s, t], [s + w * dsdx, t + h * dtdy]];
         let mut state = self.state.clone();
         state.rect = true;
+        state.texel_exact = copy
+            || (dsdx.abs() == 1.0 && dtdy.abs() == 1.0 && s.fract() == 0.0 && t.fract() == 0.0);
         state.geometry = 0;
         let tlut = (self.state.other_h >> 14) & 3;
         let b0 = self.tmem.bind(tile, tlut, &mut self.frame.textures);

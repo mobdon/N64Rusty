@@ -114,51 +114,125 @@ impl KeyMap {
     }
 }
 
-/// Controller state from a gamepad, read through `pressed` and `axis` so it
-/// can be tested without a device. Layout: south face button A, west B,
-/// left trigger Z, shoulders L and R, right stick the C buttons.
-pub fn gamepad_pad(pressed: impl Fn(Button) -> bool, axis: impl Fn(Axis) -> f32) -> Pad {
-    let mut buttons = 0;
-    for (from, to) in [
-        (Button::South, button::A),
-        (Button::West, button::B),
-        (Button::LeftTrigger2, button::Z),
-        (Button::Start, button::START),
-        (Button::DPadUp, button::D_UP),
-        (Button::DPadDown, button::D_DOWN),
-        (Button::DPadLeft, button::D_LEFT),
-        (Button::DPadRight, button::D_RIGHT),
-        (Button::LeftTrigger, button::L),
-        (Button::RightTrigger, button::R),
-        (Button::RightTrigger2, button::R),
-    ] {
-        if pressed(from) {
-            buttons |= to;
+/// Parses a gamepad button by its Xbox name: `A`, `B`, `X`, `Y`, `LB`,
+/// `RB`, `LT`, `RT`, `Start`, `Back`, `LS`, `RS` (stick clicks) and
+/// `DPadUp`, `DPadDown`, `DPadLeft`, `DPadRight`. Other pads use the same
+/// positions (`A` is the bottom face button).
+pub fn parse_pad_button(name: &str) -> Result<Button, String> {
+    Ok(match name.to_ascii_uppercase().as_str() {
+        "A" => Button::South,
+        "B" => Button::East,
+        "X" => Button::West,
+        "Y" => Button::North,
+        "LB" => Button::LeftTrigger,
+        "RB" => Button::RightTrigger,
+        "LT" => Button::LeftTrigger2,
+        "RT" => Button::RightTrigger2,
+        "START" => Button::Start,
+        "BACK" => Button::Select,
+        "LS" => Button::LeftThumb,
+        "RS" => Button::RightThumb,
+        "DPADUP" => Button::DPadUp,
+        "DPADDOWN" => Button::DPadDown,
+        "DPADLEFT" => Button::DPadLeft,
+        "DPADRIGHT" => Button::DPadRight,
+        _ => {
+            return Err(format!(
+                "unknown pad button `{name}` (use A, B, X, Y, LB, RB, LT, RT, Start, Back, LS, RS, DPadUp..)"
+            ))
+        }
+    })
+}
+
+/// Gamepad layout for one port: buttons, and how the sticks feel.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PadMap {
+    pub buttons: Vec<(Button, Binding)>,
+    /// Left stick travel (0 to 1) that still counts as centred.
+    pub deadzone: f32,
+    /// Left stick scale: above 1 reaches full tilt before the stick's edge.
+    pub sensitivity: f32,
+}
+
+impl Default for PadMap {
+    /// Xbox layout: A is A, B is B, X and Y are C-down and C-up, LT and RB
+    /// are Z, LB is L, RT is R. The left stick is the stick, the right
+    /// stick the four C buttons, the d-pad the d-pad.
+    fn default() -> Self {
+        use Binding::Button as B;
+        PadMap {
+            buttons: vec![
+                (Button::South, B(button::A)),
+                (Button::East, B(button::B)),
+                (Button::West, B(button::C_DOWN)),
+                (Button::North, B(button::C_UP)),
+                (Button::LeftTrigger2, B(button::Z)),
+                (Button::RightTrigger, B(button::Z)),
+                (Button::LeftTrigger, B(button::L)),
+                (Button::RightTrigger2, B(button::R)),
+                (Button::Start, B(button::START)),
+                (Button::DPadUp, B(button::D_UP)),
+                (Button::DPadDown, B(button::D_DOWN)),
+                (Button::DPadLeft, B(button::D_LEFT)),
+                (Button::DPadRight, B(button::D_RIGHT)),
+            ],
+            deadzone: 0.15,
+            sensitivity: 1.0,
         }
     }
-    let (cx, cy) = (axis(Axis::RightStickX), axis(Axis::RightStickY));
-    for (on, bit) in [
-        (cy > 0.5, button::C_UP),
-        (cy < -0.5, button::C_DOWN),
-        (cx < -0.5, button::C_LEFT),
-        (cx > 0.5, button::C_RIGHT),
-    ] {
-        if on {
-            buttons |= bit;
+}
+
+impl PadMap {
+    /// Controller state from a gamepad, read through `pressed` and `axis`
+    /// so it can be tested without a device.
+    pub fn pad(&self, pressed: impl Fn(Button) -> bool, axis: impl Fn(Axis) -> f32) -> Pad {
+        let mut pad = Pad::default();
+        let (mut up, mut down, mut left, mut right, mut half) = (false, false, false, false, false);
+        for &(from, to) in &self.buttons {
+            if !pressed(from) {
+                continue;
+            }
+            match to {
+                Binding::Button(b) => pad.buttons |= b,
+                Binding::StickUp => up = true,
+                Binding::StickDown => down = true,
+                Binding::StickLeft => left = true,
+                Binding::StickRight => right = true,
+                Binding::Half => half = true,
+            }
         }
-    }
-    let stick = |v: f32| {
-        let v = if v.abs() < 0.1 {
-            0.0
+        let (cx, cy) = (axis(Axis::RightStickX), axis(Axis::RightStickY));
+        for (on, bit) in [
+            (cy > 0.5, button::C_UP),
+            (cy < -0.5, button::C_DOWN),
+            (cx < -0.5, button::C_LEFT),
+            (cx > 0.5, button::C_RIGHT),
+        ] {
+            if on {
+                pad.buttons |= bit;
+            }
+        }
+        // Radial deadzone, then the rest of the travel spread over the full
+        // range, so small tilts still register and diagonals stay round.
+        let (x, y) = (axis(Axis::LeftStickX), axis(Axis::LeftStickY));
+        let len = (x * x + y * y).sqrt();
+        let (x, y) = if len <= self.deadzone || len == 0.0 {
+            (0.0, 0.0)
         } else {
-            v.clamp(-1.0, 1.0)
+            let k =
+                (len - self.deadzone) / (1.0 - self.deadzone).max(1e-3) * self.sensitivity / len;
+            (x * k, y * k)
         };
-        (v * STICK_MAX as f32).round() as i8
-    };
-    Pad {
-        buttons,
-        x: stick(axis(Axis::LeftStickX)),
-        y: stick(axis(Axis::LeftStickY)),
+        let reach = if half { STICK_MAX / 2 } else { STICK_MAX } as f32;
+        let to_n64 = |v: f32| (v.clamp(-1.0, 1.0) * reach).round() as i8;
+        pad.x = to_n64(x);
+        pad.y = to_n64(y);
+        // Pad buttons bound to the stick push it all the way (or halfway).
+        if up || down || left || right {
+            pad.x = to_n64((right as i8 - left as i8) as f32);
+            pad.y = to_n64((up as i8 - down as i8) as f32);
+        }
+        pad
     }
 }
 
@@ -209,11 +283,15 @@ mod tests {
 
     #[test]
     fn gamepad_layout() {
-        let pad = gamepad_pad(
-            |b| matches!(b, Button::South | Button::LeftTrigger2),
+        let pad = PadMap::default().pad(
+            |b| {
+                matches!(
+                    b,
+                    Button::South | Button::East | Button::West | Button::LeftTrigger2
+                )
+            },
             |a| match a {
                 Axis::LeftStickX => 1.0,
-                Axis::LeftStickY => -0.05,
                 Axis::RightStickY => 0.9,
                 _ => 0.0,
             },
@@ -221,10 +299,44 @@ mod tests {
         assert_eq!(
             pad,
             Pad {
-                buttons: button::A | button::Z | button::C_UP,
+                buttons: button::A | button::B | button::C_DOWN | button::Z | button::C_UP,
                 x: STICK_MAX,
                 y: 0
             }
         );
+    }
+
+    #[test]
+    fn gamepad_rebinds_deadzone_and_sensitivity() {
+        assert_eq!(parse_pad_button("rb"), Ok(Button::RightTrigger));
+        assert!(parse_pad_button("Guide").is_err());
+        let map = PadMap {
+            buttons: vec![(Button::East, Binding::Button(button::B))],
+            deadzone: 0.2,
+            sensitivity: 2.0,
+        };
+        let pad = |x: f32, pressed: bool| {
+            map.pad(
+                |b| pressed && b == Button::East,
+                |a| if a == Axis::LeftStickX { x } else { 0.0 },
+            )
+        };
+        assert_eq!(pad(0.15, false).x, 0, "inside the deadzone");
+        // Past the deadzone, doubled: (0.4 - 0.2) / 0.8 * 2 = half tilt.
+        assert_eq!(pad(0.4, false).x, STICK_MAX / 2);
+        assert_eq!(pad(-1.0, false).x, -STICK_MAX, "clamped");
+        assert_eq!(pad(0.0, true).buttons, button::B);
+        assert_eq!(pad(0.0, false).buttons, 0, "the default layout is replaced");
+        let walk = PadMap {
+            buttons: vec![(Button::LeftTrigger, Binding::Half)],
+            ..PadMap::default()
+        };
+        let x = walk
+            .pad(
+                |b| b == Button::LeftTrigger,
+                |a| (a == Axis::LeftStickX) as u8 as f32,
+            )
+            .x;
+        assert_eq!(x, STICK_MAX / 2, "HALF halves the stick");
     }
 }

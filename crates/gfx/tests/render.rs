@@ -304,3 +304,151 @@ fn renderers_on_many_threads_at_once() {
         t.join().unwrap();
     }
 }
+
+#[test]
+fn window_path_letterboxes_at_window_size() {
+    let Some(mut r) = renderer() else { return };
+    let mut ram = Ram::default();
+    let dl = scene(&mut ram, |_, _| {});
+    let f = frame(&mut ram, &dl);
+    // A wide window: 4:3 picture 640x480 in the middle, bars at the sides.
+    assert_eq!(n64rusty_gfx::fit(800, 480, 320, 240), (80, 0, 640, 480));
+    let img = r.render_letterboxed(&f, 800, 480).unwrap();
+    assert_px(&img, 40, 240, [0, 0, 0, 255]);
+    assert_px(&img, 760, 240, [0, 0, 0, 255]);
+    assert_px(&img, 90, 10, BLUE);
+    assert_px(&img, 710, 470, BLUE);
+}
+
+#[test]
+fn window_path_draws_at_full_screen_sizes() {
+    let Some(mut r) = renderer() else { return };
+    let mut ram = Ram::default();
+    let dl = scene(&mut ram, |_, _| {});
+    let f = frame(&mut ram, &dl);
+    // A 4K full-screen window: wider and taller than the 2048 the lowest
+    // GPU limits allow, which crashed going full screen.
+    let img = r.render_letterboxed(&f, 3840, 2160).unwrap();
+    assert_px(&img, 100, 1080, [0, 0, 0, 255]);
+    assert_px(&img, 1920, 1080, BLUE);
+}
+
+#[test]
+fn widescreen_shows_the_sides_and_keeps_shapes() {
+    let Some(mut r) = renderer() else { return };
+    let mut ram = Ram::default();
+    // A triangle just past the right edge of the 4:3 view.
+    let verts = ram.vertices(&[
+        v(105, -20, 0, [255; 4]),
+        v(130, -20, 0, [255; 4]),
+        v(130, 20, 0, [255; 4]),
+    ]);
+    let dl = scene(&mut ram, |_, dl| {
+        dl.other_modes(CYCLE_1, 0)
+            .combine(pass(PRIM))
+            .prim(0xFF00_00FF)
+            .vtx(verts, 3, 0)
+            .tri(0, 1, 2)
+            // A small centred rectangle, as a HUD element: 20 pixels wide.
+            .other_modes(CYCLE_FILL, 0)
+            .fill_color(0x07C1_07C1)
+            .fill_rect(150, 110, 169, 129);
+    });
+    let f = frame(&mut ram, &dl);
+    const GREEN: [u8; 4] = [0, 255, 0, 255];
+    const BLACK: [u8; 4] = [0, 0, 0, 255];
+
+    // Off: black bars, the triangle is outside the picture.
+    let img = r.render_letterboxed(&f, 640, 360).unwrap();
+    assert_px(&img, 5, 180, BLACK);
+    assert_px(&img, 615, 180, BLACK);
+
+    r.set_widescreen(true);
+    let img = r.render_letterboxed(&f, 640, 360).unwrap();
+    // The full-width background reaches both edges.
+    assert_px(&img, 2, 180, BLUE);
+    assert_px(&img, 637, 180, BLUE);
+    // The 4:3 picture keeps its shape in the middle (1.5 times larger),
+    // so the triangle shows in the extra width at the side.
+    assert_px(&img, 615, 180, RED);
+    // The rectangle is 30 pixels wide, not stretched to 40.
+    assert_px(&img, 320, 180, GREEN);
+    assert_px(&img, 338, 180, BLUE);
+    assert_px(&img, 302, 180, BLUE);
+
+    // A 4:3 target is the same as without widescreen.
+    let a = r.render(&f, 320, 240).unwrap();
+    r.set_widescreen(false);
+    assert_eq!(a.rgba, r.render(&f, 320, 240).unwrap().rgba);
+}
+
+/// A red square at object x offset `dx`, drawn from the same display list
+/// code each frame, as a game redraws a moving object.
+fn moved_square(dx: f32) -> Frame {
+    let mut ram = Ram::default();
+    let verts = ram.vertices(&[
+        v(-10, -10, 0, [255; 4]),
+        v(10, -10, 0, [255; 4]),
+        v(10, 10, 0, [255; 4]),
+        v(-10, 10, 0, [255; 4]),
+    ]);
+    let mut m = n64rusty_gfx::IDENTITY;
+    m[3][0] = dx;
+    let mtx = ram.matrix(m);
+    let dl = scene(&mut ram, |_, dl| {
+        dl.mtx(mtx, LOAD)
+            .other_modes(CYCLE_1, 0)
+            .combine(pass(PRIM))
+            .prim(0xFF00_00FF)
+            .vtx(verts, 4, 0)
+            .tri2([0, 1, 2], [0, 2, 3]);
+    });
+    frame(&mut ram, &dl)
+}
+
+#[test]
+fn pictures_between_frames_blend_the_movement() {
+    let Some(mut r) = renderer() else { return };
+    // The square moves from x = -15 to x = +15 (pixel 136 to 184).
+    let (prev, cur) = (moved_square(-15.0), moved_square(15.0));
+    let at = |img: &Image, x| img.pixel(x, 120) == RED;
+    let start = r.render_between(&prev, &cur, 0.0, 320, 240).unwrap();
+    assert!(at(&start, 136) && !at(&start, 160) && !at(&start, 184));
+    let half = r.render_between(&prev, &cur, 0.5, 320, 240).unwrap();
+    assert!(!at(&half, 136) && at(&half, 160) && !at(&half, 184));
+    let end = r.render_between(&prev, &cur, 1.0, 320, 240).unwrap();
+    assert_eq!(end.rgba, r.render_letterboxed(&cur, 320, 240).unwrap().rgba);
+    // Half the screen in one frame is a cut: shown where it ends up.
+    let (far, cur) = (moved_square(-50.0), moved_square(50.0));
+    let cut = r.render_between(&far, &cur, 0.5, 320, 240).unwrap();
+    assert_eq!(cut.rgba, r.render_letterboxed(&cur, 320, 240).unwrap().rgba);
+}
+
+#[test]
+fn widescreen_stretches_a_row_of_background_tiles() {
+    let Some(mut r) = renderer() else { return };
+    let mut ram = Ram::default();
+    let dl = scene(&mut ram, |_, dl| {
+        dl.other_modes(CYCLE_FILL, 0)
+            // Two tiles edge to edge across the top band: a background.
+            .fill_color(0x07C1_07C1)
+            .fill_rect(0, 0, 159, 39)
+            .fill_rect(160, 0, 319, 39)
+            // Two pieces with a gap along the bottom, as a line of text.
+            .fill_rect(0, 200, 99, 239)
+            .fill_rect(220, 200, 319, 239)
+            // A menu grid row edge to edge but inset from the frame edges.
+            .fill_rect(25, 100, 159, 139)
+            .fill_rect(160, 100, 294, 139);
+    });
+    let f = frame(&mut ram, &dl);
+    r.set_widescreen(true);
+    let img = r.render_letterboxed(&f, 640, 360).unwrap();
+    const GREEN: [u8; 4] = [0, 255, 0, 255];
+    assert_px(&img, 2, 20, GREEN);
+    assert_px(&img, 637, 20, GREEN);
+    // The gapped row and the inset grid keep their 4:3 place.
+    assert_px(&img, 2, 330, BLUE);
+    assert_px(&img, 2, 180, BLUE);
+    assert_px(&img, 120, 180, GREEN);
+}

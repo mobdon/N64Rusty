@@ -31,7 +31,7 @@ mod tmem;
 pub use capture::{write_png, Capture};
 pub use combiner::{fragment_shader, Combiner};
 pub use dl::{GfxError, Interpreter};
-pub use render::{Image, RenderError, Renderer};
+pub use render::{fit, Image, RenderError, Renderer, WindowTarget};
 
 /// A 4x4 matrix in N64 layout: row vectors, so a point transforms as
 /// `p * m` and `m[3]` holds the translation.
@@ -109,6 +109,9 @@ pub struct RenderState {
     pub textures: [Option<u32>; 2],
     /// Screen-space rectangle (fill or texture rectangle), not a triangle.
     pub rect: bool,
+    /// A texture rectangle stepping one texel per pixel: filtering would
+    /// only ever land on texel corners, so it reads single texels.
+    pub texel_exact: bool,
     /// Address of the colour image this was drawn into.
     pub color_image: u32,
     /// Scissor box in framebuffer pixels (x0, y0, x1, y1), if one was set.
@@ -164,6 +167,69 @@ impl Frame {
     }
 }
 
+/// The transforms of `cur` moved back towards `prev`: `t` = 0 gives
+/// `prev`'s matrices, 1 gives `cur`'s. Transforms are matched by
+/// [`Transform::tag`], the n-th use of a tag in `cur` with the n-th in
+/// `prev`; one with no match keeps `cur`'s matrices. Nothing is blended
+/// across a jump: an object whose origin moves more than a quarter of the
+/// screen in one frame (a camera cut, a teleport), or a frame of another
+/// size. Only placement is blended, so game logic and game speed are
+/// untouched.
+///
+/// shortcut: matrices are blended element by element, which shrinks a
+/// fast-turning object a little mid-way; decompose into rotation, scale and
+/// translation if that shows.
+pub fn interpolate(prev: &Frame, cur: &Frame, t: f32) -> Vec<Transform> {
+    use std::collections::HashMap;
+    if prev.width != cur.width {
+        return cur.transforms.clone();
+    }
+    let mut by_tag: HashMap<u32, Vec<&Transform>> = HashMap::new();
+    for p in &prev.transforms {
+        by_tag.entry(p.tag).or_default().push(p);
+    }
+    let mut used: HashMap<u32, usize> = HashMap::new();
+    let lerp = |a: f32, b: f32| a + (b - a) * t;
+    let mat = |a: &Mat4, b: &Mat4| -> Mat4 {
+        std::array::from_fn(|i| std::array::from_fn(|j| lerp(a[i][j], b[i][j])))
+    };
+    let pair = |a: [f32; 2], b: [f32; 2]| [lerp(a[0], b[0]), lerp(a[1], b[1])];
+    cur.transforms
+        .iter()
+        .map(|c| {
+            let n = used.entry(c.tag).or_default();
+            let p = by_tag.get(&c.tag).and_then(|v| v.get(*n));
+            *n += 1;
+            match p.filter(|p| !jumped(p, c)) {
+                Some(p) => Transform {
+                    modelview: mat(&p.modelview, &c.modelview),
+                    projection: mat(&p.projection, &c.projection),
+                    viewport: Viewport {
+                        scale: pair(p.viewport.scale, c.viewport.scale),
+                        trans: pair(p.viewport.trans, c.viewport.trans),
+                    },
+                    tag: c.tag,
+                },
+                None => c.clone(),
+            }
+        })
+        .collect()
+}
+
+/// Whether the origin of `b` is more than a quarter of the screen away from
+/// that of `a`, on screen. Origins behind the camera are not compared.
+fn jumped(a: &Transform, b: &Transform) -> bool {
+    let screen = |t: &Transform| {
+        let m = mat_mul(&t.modelview, &t.projection);
+        let w = m[3][3];
+        (w > 0.0).then(|| [m[3][0] / w, m[3][1] / w])
+    };
+    match (screen(a), screen(b)) {
+        (Some(p), Some(q)) => (p[0] - q[0]).hypot(p[1] - q[1]) > 0.5,
+        _ => false,
+    }
+}
+
 /// Multiply two N64 matrices (`a` applied first).
 pub fn mat_mul(a: &Mat4, b: &Mat4) -> Mat4 {
     let mut r = [[0.0; 4]; 4];
@@ -181,3 +247,61 @@ pub const IDENTITY: Mat4 = [
     [0.0, 0.0, 1.0, 0.0],
     [0.0, 0.0, 0.0, 1.0],
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tf(tag: u32, x: f32) -> Transform {
+        let mut modelview = IDENTITY;
+        modelview[3][0] = x;
+        // w = 1000 at the origin: screen x is x / 1000.
+        let mut projection = IDENTITY;
+        projection[3][3] = 1000.0;
+        Transform {
+            modelview,
+            projection,
+            viewport: Viewport {
+                scale: [160.0, 120.0],
+                trans: [160.0, 120.0],
+            },
+            tag,
+        }
+    }
+
+    fn frame(transforms: Vec<Transform>) -> Frame {
+        Frame {
+            transforms,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn interpolate_matches_by_tag_and_use() {
+        // Tag 7 is used twice (one routine drawing two objects); tag 9
+        // only exists in the newer frame.
+        let prev = frame(vec![tf(7, 0.0), tf(7, 10.0), tf(5, 100.0)]);
+        let cur = frame(vec![tf(5, 200.0), tf(7, 4.0), tf(7, 20.0), tf(9, 50.0)]);
+        let x = |t: &[Transform]| t.iter().map(|t| t.modelview[3][0]).collect::<Vec<_>>();
+        assert_eq!(x(&interpolate(&prev, &cur, 0.5)), [150.0, 2.0, 15.0, 50.0]);
+        assert_eq!(x(&interpolate(&prev, &cur, 0.0)), [100.0, 0.0, 10.0, 50.0]);
+        assert_eq!(interpolate(&prev, &cur, 1.0), cur.transforms);
+    }
+
+    #[test]
+    fn interpolate_skips_jumps() {
+        // 400 is a move of 0.4 on screen; 900 (almost half the screen) is
+        // a camera cut.
+        let prev = frame(vec![tf(1, 0.0), tf(2, 0.0)]);
+        let cur = frame(vec![tf(1, 400.0), tf(2, 900.0)]);
+        let x: Vec<_> = interpolate(&prev, &cur, 0.5)
+            .iter()
+            .map(|t| t.modelview[3][0])
+            .collect();
+        assert_eq!(x, [200.0, 900.0]);
+        // A frame of another size: nothing is blended.
+        let mut wider = frame(vec![tf(1, 400.0)]);
+        wider.width = 640;
+        assert_eq!(interpolate(&prev, &wider, 0.5), wider.transforms);
+    }
+}

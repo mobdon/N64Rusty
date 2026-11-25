@@ -8,9 +8,12 @@
 //! opened and no sound is played.
 
 pub mod devices;
+mod interp;
+mod jpeg;
 pub mod live;
 pub mod media;
 pub mod os;
+pub mod save;
 
 use std::collections::BTreeMap;
 use std::panic;
@@ -100,10 +103,17 @@ fn label(names: &BTreeMap<u32, String>, a: u32) -> String {
 /// all zero for code in the boot image).
 /// Both live in the per-game folder. `n64rusty translate` reads them to find
 /// code the game loads at run time.
+///
+/// Code no copy covers and that is not the boot image's own bytes was written
+/// by the game itself (unpacked, for example). Its line has rom `0xffffffff`
+/// and the RAM around it is saved to `images/<ram>_<addr>.bin` for translate.
 fn record_run(
     local: &std::path::Path,
     dma: &[(u32, u32, u32)],
     outcome: &os::Outcome,
+    ram_now: &[u8],
+    rom: &[u8],
+    entry: u32,
 ) -> std::io::Result<()> {
     use std::collections::BTreeSet;
     let read = |name: &str| std::fs::read_to_string(local.join(name)).unwrap_or_default();
@@ -117,34 +127,102 @@ fn record_run(
         text.push('\n');
     }
     std::fs::write(local.join("dma.txt"), text)?;
+    let mut new_missing = Vec::new();
     if let os::Outcome::Panic(m) = outcome {
         if let Some(rest) = m.strip_prefix("call to unknown guest function ") {
             let addr_text = rest.split_whitespace().next().unwrap_or("");
             let addr = u32::from_str_radix(addr_text.trim_start_matches("0x"), 16).unwrap_or(0);
             // Which copy put code there: the latest one covering it.
+            // The copy must still be what is there: the game may have
+            // written other code over it since (unpacking, for example).
+            let still_there = |r: u32, ram: u32| {
+                let (at, from) = (
+                    (addr & 0x1FFF_FFFC) as usize,
+                    (r + (addr & !3) - ram) as usize,
+                );
+                let n = 16.min(ram_now.len().saturating_sub(at));
+                rom.get(from..from + n)
+                    .is_some_and(|b| b == &ram_now[at..at + n])
+            };
             let src = dma
                 .iter()
                 .rev()
-                .find(|(_, ram, len)| addr >= *ram && addr < ram.wrapping_add(*len));
+                .find(|(_, ram, len)| addr >= *ram && addr < ram.wrapping_add(*len))
+                .filter(|(r, ram, _)| still_there(*r, *ram));
             // No copy covers it: code in the boot image reached only
             // through a pointer, written with a zero copy.
-            let (rom, ram, len) = src.copied().unwrap_or((0, 0, 0));
-            if addr == 0 {
-                return Ok(());
+            let mut found = src.copied().unwrap_or((0, 0, 0));
+            if src.is_none() && addr != 0 {
+                if let Some((lo, hi)) = written_code(ram_now, rom, entry, addr) {
+                    let dir = local.join("images");
+                    std::fs::create_dir_all(&dir)?;
+                    let at = |a: u32| (a & 0x1FFF_FFFF) as usize;
+                    std::fs::write(
+                        dir.join(format!("{lo:08x}_{addr:08x}.bin")),
+                        &ram_now[at(lo)..at(hi)],
+                    )?;
+                    found = (u32::MAX, lo, hi - lo);
+                }
             }
-            let entry = format!("{addr:#010x} {rom:#010x} {ram:#010x} {len:#x}");
-            let mut missing: BTreeSet<String> =
-                read("missing.txt").lines().map(str::to_string).collect();
-            missing.insert(entry);
-            let text: String = missing
-                .iter()
-                .filter(|l| !l.is_empty())
-                .map(|l| format!("{l}\n"))
-                .collect();
-            std::fs::write(local.join("missing.txt"), text)?;
+            let (rom, ram, len) = found;
+            // A call to address 0 is a null pointer, not code to translate.
+            if addr != 0 {
+                new_missing.push(format!("{addr:#010x} {rom:#010x} {ram:#010x} {len:#x}"));
+            }
         }
     }
+    // Code run in the interpreter, saved as it was when first run.
+    for (addr, (lo, bytes)) in interp::seen() {
+        if bytes.is_empty() {
+            continue;
+        }
+        let dir = local.join("images");
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join(format!("{lo:08x}_{addr:08x}.bin")), &bytes)?;
+        let (written, len) = (u32::MAX, bytes.len());
+        new_missing.push(format!("{addr:#010x} {written:#010x} {lo:#010x} {len:#x}"));
+    }
+    if !new_missing.is_empty() {
+        let mut missing: BTreeSet<String> =
+            read("missing.txt").lines().map(str::to_string).collect();
+        missing.extend(new_missing);
+        let text: String = missing
+            .iter()
+            .filter(|l| !l.is_empty())
+            .map(|l| format!("{l}\n"))
+            .collect();
+        std::fs::write(local.join("missing.txt"), text)?;
+    }
     Ok(())
+}
+
+/// The extent of code the game wrote into RAM around `addr`, if the bytes
+/// there are not the boot image's: out to the nearest 4 KiB of zero bytes on each
+/// side (padding between functions, and zeros in its data, are shorter), at most 4 MiB.
+fn written_code(ram: &[u8], rom: &[u8], entry: u32, addr: u32) -> Option<(u32, u32)> {
+    const GAP: usize = 4096;
+    const MAX: usize = 4 << 20;
+    let at = (addr & 0x1FFF_FFFF) as usize & !3;
+    let boot = (entry & 0x1FFF_FFFF) as usize;
+    let here = ram.get(at..at + 64)?;
+    let in_boot = at >= boot && rom.get(0x1000 + at - boot..0x1000 + at - boot + 64) == Some(here);
+    if in_boot {
+        return None;
+    }
+    let zero_run = |i: usize| {
+        ram.get(i..i + GAP)
+            .is_some_and(|b| b.iter().all(|&x| x == 0))
+    };
+    let mut lo = at;
+    while lo >= 4 && at - lo < MAX && !zero_run(lo.saturating_sub(GAP)) {
+        lo -= 4;
+    }
+    let mut hi = at;
+    while hi < ram.len() && hi - at < MAX && !zero_run(hi) {
+        hi += 4;
+    }
+    let base = addr & !0x1FFF_FFFF;
+    Some((base | lo as u32, base | hi as u32))
 }
 
 static NAMES: Mutex<BTreeMap<u32, String>> = Mutex::new(BTreeMap::new());
@@ -194,13 +272,16 @@ pub fn crash_report(ctx: &Ctx) -> String {
 
 /// Entry point for a generated game binary:
 /// `game <rom> [--symbols file]... [--config file] [--frames n]
-/// [--capture dir] [--capture-every n] [--capture-scale n] [--wav file] [--input script]
-/// [--window] [--run run.toml]`.
+/// [--capture dir] [--capture-every n] [--capture-scale n] [--capture-wide] [--capture-between] [--wav file] [--input script]
+/// [--save file] [--window] [--run run.toml]`.
 ///
 /// Display lists and audio command lists always go through the graphics
 /// and audio interpreters. With `--capture`, every n-th finished frame (60
 /// by default) is rendered off screen and saved as a PNG in `dir`
-/// (`--capture-scale n` renders at n times the game's resolution); with
+/// (`--capture-scale n` renders at n times the game's resolution,
+/// `--capture-wide` 16:9 as the window's widescreen option draws it,
+/// `--capture-between` also the picture half-way from the frame before, as
+/// a high refresh rate window blends it); with
 /// `--wav`, the sound is recorded to a file; `--input` plays a controller
 /// script against retrace numbers. Nothing is shown or played.
 ///
@@ -208,6 +289,10 @@ pub fn crash_report(ctx: &Ctx) -> String {
 /// keyboard and gamepads, paced at the game's own rate, with no frame limit
 /// unless `--frames` is given. Window, input and pacing settings come from
 /// `--run` (default: `run.toml` in the per-game folder, if present).
+///
+/// Cartridge save memory is kept in `--save file`; window runs default to
+/// `save.sra` in the per-game folder. Headless runs without `--save` start
+/// from blank save memory and keep nothing, so they stay repeatable.
 ///
 /// System routines are replaced by role name. Their addresses come from the
 /// per-game config (`name = 0xADDR` lines, found by us) and from symbol
@@ -232,6 +317,9 @@ pub fn main_with(game: Game, devices: Option<Box<dyn devices::Devices>>) -> Exit
     let mut scale = 1;
     let mut wav = None;
     let mut input = None;
+    let mut save = None;
+    let mut wide = false;
+    let mut between = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let flag = a.as_str();
@@ -241,6 +329,14 @@ pub fn main_with(game: Game, devices: Option<Box<dyn devices::Devices>>) -> Exit
         }
         if flag == "--window" {
             window = true;
+            continue;
+        }
+        if flag == "--capture-wide" {
+            wide = true;
+            continue;
+        }
+        if flag == "--capture-between" {
+            between = true;
             continue;
         }
         let Some(v) = it.next() else {
@@ -254,6 +350,7 @@ pub fn main_with(game: Game, devices: Option<Box<dyn devices::Devices>>) -> Exit
             "--capture" => capture = Some(PathBuf::from(v)),
             "--wav" => wav = Some(PathBuf::from(v)),
             "--input" => input = Some(PathBuf::from(v)),
+            "--save" => save = Some(PathBuf::from(v)),
             "--run" => run_config = Some(PathBuf::from(v)),
             "--frames" | "--capture-every" | "--capture-scale" => {
                 let Some(n) = number() else {
@@ -277,7 +374,7 @@ pub fn main_with(game: Game, devices: Option<Box<dyn devices::Devices>>) -> Exit
     }
     let Some(rom_path) = rom_path else {
         eprintln!(
-            "usage: <game> <rom> [--symbols file]... [--config file] [--frames n] [--local dir] [--capture dir] [--capture-every n] [--capture-scale n] [--wav file] [--input script] [--window] [--run run.toml]"
+            "usage: <game> <rom> [--symbols file]... [--config file] [--frames n] [--local dir] [--capture dir] [--capture-every n] [--capture-scale n] [--capture-wide] [--capture-between] [--wav file] [--input script] [--save file] [--window] [--run run.toml]"
         );
         return ExitCode::from(2);
     };
@@ -322,9 +419,18 @@ pub fn main_with(game: Game, devices: Option<Box<dyn devices::Devices>>) -> Exit
     if default_config.exists() {
         symbols.push(default_config);
     }
+    let save = match save.or_else(|| window.then(|| local.join("save.sra"))) {
+        Some(p) => match save::Save::open(&p) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error: save file {}: {e}", p.display());
+                return ExitCode::from(2);
+            }
+        },
+        None => save::Save::in_memory(),
+    };
     let names = read_names(&symbols);
     let by_name: BTreeMap<String, u32> = names.iter().map(|(a, n)| (n.clone(), *a)).collect();
-    *NAMES.lock().unwrap() = names;
 
     let mut ctx = boot(&rom, &game);
     let rom_bytes: Arc<[u8]> = Arc::from(rom.bytes());
@@ -332,9 +438,16 @@ pub fn main_with(game: Game, devices: Option<Box<dyn devices::Devices>>) -> Exit
         sp_mem: vec![0; 0x2000],
         rom: rom_bytes.clone(),
         regs: Default::default(),
+        flash: Default::default(),
     });
-    let hooked = os::install(&mut ctx, &by_name);
+    let hooked = os::install(&mut ctx, names.iter().map(|(a, n)| (n, a)));
     println!("replaced {} system routines", hooked.len());
+    *NAMES.lock().unwrap() = names;
+    let (snap_rom, snap_entry) = (rom_bytes.clone(), game.entry);
+    interp::install(
+        &mut ctx,
+        Box::new(move |ram, addr| written_code(ram, &snap_rom, snap_entry, addr)),
+    );
 
     panic::set_hook(Box::new(|info| {
         let loc = info
@@ -372,16 +485,19 @@ pub fn main_with(game: Game, devices: Option<Box<dyn devices::Devices>>) -> Exit
     let n_audio = ["n_alSynNew", "n_alAudioFrame"]
         .iter()
         .any(|n| by_name.contains_key(*n));
-    let media = media::Media::new(capture, every, wav, n_audio, script).with_scale(scale);
+    let media = media::Media::new(capture, every, wav, n_audio, script)
+        .with_scale(scale)
+        .with_widescreen(wide)
+        .with_between(between);
     let entry = game.entry;
     if window {
         return live::play(&run_config, media, move |devices| {
-            run_and_report(ctx, entry, rom_bytes, frames, devices, &local)
+            run_and_report(ctx, entry, rom_bytes, frames, devices, save, &local)
         });
     }
     let devices = devices.unwrap_or_else(|| Box::new(media));
     ExitCode::from(run_and_report(
-        ctx, entry, rom_bytes, frames, devices, &local,
+        ctx, entry, rom_bytes, frames, devices, save, &local,
     ))
 }
 
@@ -392,11 +508,13 @@ fn run_and_report(
     rom_bytes: Arc<[u8]>,
     frames: u64,
     devices: Box<dyn devices::Devices>,
+    save: save::Save,
     local: &std::path::Path,
 ) -> u8 {
-    let (outcome, report, frames_run) = os::run(ctx, entry, rom_bytes, frames, devices);
+    let rom = rom_bytes.clone();
+    let (outcome, report, frames_run) = os::run(ctx, entry, rom_bytes, frames, devices, save);
     let (_, dma, threads, device_summary) = os::summary();
-    if let Err(e) = record_run(local, &dma, &outcome) {
+    if let Err(e) = record_run(local, &dma, &outcome, ctx.mem.bytes(), &rom, entry) {
         eprintln!(
             "warning: could not write the run log in {}: {e}",
             local.display()
@@ -408,6 +526,11 @@ fn run_and_report(
         println!("  rom {rom_off:#09x} -> {ram:#010x} len {len:#x}");
     }
     println!("threads:\n{threads}");
+    // The thread that was on the CPU last keeps its registers in `ctx`.
+    println!(
+        "  last on the CPU: call at {:#010x}",
+        (ctx.r[31] as u32).wrapping_sub(8)
+    );
     print!("{device_summary}");
     match outcome {
         os::Outcome::Frames(n) => {
@@ -424,6 +547,13 @@ fn run_and_report(
         }
         os::Outcome::Panic(m) => {
             println!("panic: {m}\n{report}");
+            1
+        }
+        os::Outcome::Hang(d) => {
+            println!(
+                "hang: no retrace for {} s of host time, so a guest loop makes no calls\n{d}",
+                os::HANG_WALL.as_secs()
+            );
             1
         }
     }

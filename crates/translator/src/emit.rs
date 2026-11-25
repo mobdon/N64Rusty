@@ -155,6 +155,7 @@ fn simple(i: &Inst, pc: u32) -> String {
         Cop1 => cop1(i, pc),
         Mfc0 => set(t, &format!("ctx.mfc0({d})")),
         Mtc0 => format!("ctx.mtc0({d}, {});", r(t)),
+        Tlb => format!("ctx.tlb({});", i.word & 0x3F),
         Syscall | Break | Unknown => {
             format!("ctx.unimplemented({pc:#010x}, {:#010x});", i.word)
         }

@@ -10,14 +10,16 @@
 //! tricks) decode wrongly; emulate the layout if a game shows it.
 
 use std::collections::HashMap;
-use std::hash::{DefaultHasher, Hash, Hasher};
+use std::hash::{Hash, Hasher};
 
 use crate::dl::rgba5551;
 use crate::{Texture, Wrap};
 
 const MAX_SIZE: u32 = 1024;
+/// Clamped tiles up to this many texels are decoded exactly (see `bind`).
+const EXACT_TEXELS: u32 = 128 * 128;
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Hash)]
 pub(crate) struct Tile {
     fmt: u32,
     siz: u32,
@@ -54,8 +56,31 @@ pub(crate) struct Tmem {
     image: (u32, u32, u32), // address, width, size code
     /// Decoded tiles still valid for the current frame, by (tile, palette type).
     cache: HashMap<(usize, u32), Bound>,
-    /// Texture index by content hash, for this frame.
+    /// Texture index by source key (see [`Tmem::bind`]), for this frame.
     seen: HashMap<u64, u32>,
+    /// Decoded textures by source key, kept across frames: most textures
+    /// are the same from one frame to the next.
+    decoded: HashMap<u64, Texture>,
+}
+
+/// Decoded textures kept across frames before the cache starts over.
+const DECODED_MAX: usize = 2048;
+
+/// A fast hasher for TMEM contents (multiply and rotate over 8 bytes).
+struct Fx(u64);
+
+impl Hasher for Fx {
+    fn write(&mut self, bytes: &[u8]) {
+        for c in bytes.chunks(8) {
+            let mut w = [0u8; 8];
+            w[..c.len()].copy_from_slice(c);
+            self.0 =
+                (self.0.rotate_left(5) ^ u64::from_le_bytes(w)).wrapping_mul(0x517C_C1B7_2722_0A95);
+        }
+    }
+    fn finish(&self) -> u64 {
+        self.0
+    }
 }
 
 impl Default for Tmem {
@@ -66,6 +91,7 @@ impl Default for Tmem {
             image: (0, 1, 2),
             cache: HashMap::new(),
             seen: HashMap::new(),
+            decoded: HashMap::new(),
         }
     }
 }
@@ -253,9 +279,22 @@ impl Tmem {
         let mut size = [0u32; 2];
         let mut wrap = [Wrap::Repeat; 2];
         let mut scale = [1.0f32; 2];
+        let tile_size = |k: usize| (t.lr[k].saturating_sub(t.ul[k]) >> 2) + 1;
+        // A clamped tile far larger than its mask repeats the masked texels
+        // until the clamp. Small ones are decoded exactly, since the clamp
+        // after the repeats is visible (a mirrored emblem, a face detail).
+        // Big ones would mean hundreds of copies on every draw: decode one
+        // period and let it wrap.
+        // shortcut: on big tiles the clamp at the far edge is lost; decode
+        // it exactly if a game shows a seam there.
+        let big = tile_size(0) * tile_size(1) > EXACT_TEXELS;
         for k in 0..2 {
-            let tile_size = (t.lr[k].saturating_sub(t.ul[k]) >> 2) + 1;
-            let clamp = t.cm[k] & 2 != 0;
+            let tile_size = tile_size(k);
+            let period = 1 << t.mask[k].min(10);
+            // With no mask the hardware cannot wrap, so it clamps whatever
+            // the clamp bit says.
+            let clamp = (t.cm[k] & 2 != 0 || t.mask[k] == 0)
+                && !(big && t.mask[k] != 0 && tile_size > period);
             size[k] = if t.mask[k] != 0 && !clamp {
                 1 << t.mask[k].min(10)
             } else {
@@ -275,28 +314,40 @@ impl Tmem {
                 s => (1 << (16 - s)) as f32,
             };
         }
-        let mut rgba = Vec::with_capacity((size[0] * size[1] * 4) as usize);
-        for y in 0..size[1] {
-            for x in 0..size[0] {
-                let (x, y) = (
-                    wrap_mask(x, t.mask[0], t.cm[0]),
-                    wrap_mask(y, t.mask[1], t.cm[1]),
-                );
-                rgba.extend_from_slice(&self.texel(&t, x, y, tlut));
-            }
-        }
-        let tex = Texture {
-            width: size[0],
-            height: size[1],
-            rgba,
-            wrap,
-        };
-        let mut h = DefaultHasher::new();
-        tex.hash(&mut h);
+        // The texture follows from the tile, the palette type and TMEM.
+        let mut h = Fx(0);
+        (t, tlut).hash(&mut h);
+        h.write(&self.mem[..]);
         let key = h.finish();
         let texture = match self.seen.get(&key) {
-            Some(&i) if textures.get(i as usize) == Some(&tex) => i,
-            _ => {
+            Some(&i) => i,
+            None => {
+                if self.decoded.len() >= DECODED_MAX {
+                    self.decoded.clear();
+                }
+                let tex = match self.decoded.get(&key) {
+                    Some(tex) => tex.clone(),
+                    None => {
+                        let mut rgba = Vec::with_capacity((size[0] * size[1] * 4) as usize);
+                        for y in 0..size[1] {
+                            for x in 0..size[0] {
+                                let (x, y) = (
+                                    wrap_mask(x, t.mask[0], t.cm[0]),
+                                    wrap_mask(y, t.mask[1], t.cm[1]),
+                                );
+                                rgba.extend_from_slice(&self.texel(&t, x, y, tlut));
+                            }
+                        }
+                        let tex = Texture {
+                            width: size[0],
+                            height: size[1],
+                            rgba,
+                            wrap,
+                        };
+                        self.decoded.insert(key, tex.clone());
+                        tex
+                    }
+                };
                 textures.push(tex);
                 let i = textures.len() as u32 - 1;
                 self.seen.insert(key, i);
@@ -381,5 +432,25 @@ mod tests {
                 assert_eq!(got, [1, 2, 3, 4, 5, 6, 7, 8], "siz {siz} load {load:#x}");
             }
         }
+    }
+
+    /// A small clamped tile twice its mask keeps the clamp: mirrored once,
+    /// then the edge texel, not a third copy.
+    #[test]
+    fn small_clamped_tile_decodes_exactly() {
+        let mut m = Tmem::default();
+        m.tiles[0] = Tile {
+            fmt: 0,
+            siz: 2,
+            cm: [3, 3],
+            mask: [3, 3],
+            lr: [15 << 2, 15 << 2],
+            ..Tile::default()
+        };
+        let mut textures = Vec::new();
+        let b = m.bind(0, 0, &mut textures);
+        let tex = &textures[b.texture as usize];
+        assert_eq!((tex.width, tex.height), (16, 16));
+        assert_eq!(tex.wrap, [Wrap::Clamp; 2]);
     }
 }

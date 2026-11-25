@@ -9,13 +9,13 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 mod fpu;
 mod memory;
 
 pub use fpu::{cvt_l, cvt_w, fcmp, Round};
-pub use memory::{Io, Memory};
+pub use memory::{Flash, FlashOp, Io, Memory};
 
 /// Crate version, checked against the version recorded in generated code.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -57,6 +57,15 @@ pub struct Ctx {
     /// Overlays currently in RAM, as indexes into `overlays`, each with the
     /// ranges later copies have overwritten since it was loaded.
     loaded: Vec<(usize, Vec<(u32, u32)>)>,
+    /// Functions of code the game writes into RAM itself (unpacked or
+    /// built, so no cartridge copy shows it), by address: each candidate's
+    /// length in bytes, the [`code_hash`] of its words and the function.
+    images: HashMap<u32, Vec<(u32, u64, GuestFn)>>,
+    /// Image functions whose bytes matched RAM when last called, with their
+    /// length; dropped when a copy or an I-cache invalidation covers them.
+    /// shortcut: code the CPU rewrites with neither keeps running the old
+    /// translation; hash on every call if a game ever does that.
+    verified: BTreeMap<u32, (u32, GuestFn)>,
     /// The most recent call targets, oldest first once full; see
     /// [`Ctx::recent_calls`].
     trace: [u32; TRACE_LEN],
@@ -66,6 +75,9 @@ pub struct Ctx {
     pub depth: u32,
     /// COP0 (system control) registers, as written by MTC0.
     pub cop0: [u32; 32],
+    /// TLB entries as PageMask, EntryHi, EntryLo0, EntryLo1. Stored for
+    /// TLBR and TLBP; addresses are not translated through them.
+    pub tlb: [[u32; 4]; 32],
     /// Virtual time in COP0 Count ticks: advances by [`COUNT_PER_CALL`]
     /// per call, and hosts move it forward when the game waits.
     pub clock: u64,
@@ -75,6 +87,9 @@ pub struct Ctx {
     pub deadline: u64,
     /// See [`Ctx::deadline`].
     pub on_deadline: Option<GuestFn>,
+    /// Runs a call to code with no translation (an interpreter, say), given
+    /// the address; without one such a call panics.
+    pub on_missing: Option<fn(&mut Ctx, u32)>,
 }
 
 struct Overlay {
@@ -105,13 +120,17 @@ impl Ctx {
             overrides: HashMap::new(),
             overlays: Vec::new(),
             loaded: Vec::new(),
+            images: HashMap::new(),
+            verified: BTreeMap::new(),
             trace: [0; TRACE_LEN],
             calls: 0,
             depth: 0,
             cop0: [0; 32],
+            tlb: [[0; 4]; 32],
             clock: 0,
             deadline: u64::MAX,
             on_deadline: None,
+            on_missing: None,
         }
     }
 
@@ -145,12 +164,52 @@ impl Ctx {
         });
     }
 
+    /// Registers a function of code the game writes into RAM itself: it runs
+    /// at `addr` only while the `len` bytes there hash to `hash` (see
+    /// [`code_hash`]), checked at the first call after they may have changed.
+    pub fn register_image_fn(&mut self, addr: u32, len: u32, hash: u64, f: GuestFn) {
+        self.images.entry(addr).or_default().push((len, hash, f));
+    }
+
+    /// The code in `len` bytes at `ram` may have changed (an I-cache
+    /// invalidation, or a copy): image functions there are checked again.
+    pub fn code_written(&mut self, ram: u32, len: u32) {
+        // Image functions are shorter than this, so one starting before
+        // `ram` by more cannot reach it.
+        const LONGEST: u32 = 0x10_0000;
+        let end = ram.wrapping_add(len);
+        let hit: Vec<u32> = self
+            .verified
+            .range(ram.saturating_sub(LONGEST)..end)
+            .filter(|(&a, &(n, _))| a.wrapping_add(n) > ram)
+            .map(|(&a, _)| a)
+            .collect();
+        for a in hit {
+            self.verified.remove(&a);
+        }
+    }
+
+    /// The image function at `addr` whose bytes are in RAM now, if any.
+    fn verify_image(&mut self, addr: u32) -> Option<GuestFn> {
+        let cands = self.images.get(&addr)?;
+        let bytes = self.mem.bytes();
+        let at = (addr & 0x1FFF_FFFF) as usize;
+        let &(len, _, f) = cands.iter().find(|&&(len, hash, _)| {
+            bytes
+                .get(at..at + len as usize)
+                .is_some_and(|b| code_hash(b) == hash)
+        })?;
+        self.verified.insert(addr, (len, f));
+        Some(f)
+    }
+
     /// Records that `len` bytes from ROM offset `rom` were copied to `ram`.
     /// An overlay that starts at exactly this copy is loaded. A copy over
     /// part of a loaded overlay (often data into its own data area) makes
     /// only the functions it covers unavailable; one over all of it
     /// unloads it.
     pub fn overlay_loaded(&mut self, rom: u32, ram: u32, len: u32) {
+        self.code_written(ram, len);
         let (lo, hi) = (ram, ram.wrapping_add(len));
         let ovl = &self.overlays;
         self.loaded.retain_mut(|(i, dead)| {
@@ -162,7 +221,7 @@ impl Ctx {
             if lo <= olo && hi >= ohi {
                 return false;
             }
-            dead.push((lo, hi));
+            add_range(dead, lo, hi);
             true
         });
         for (i, o) in self.overlays.iter().enumerate() {
@@ -214,13 +273,41 @@ impl Ctx {
                 return Some(*f);
             }
         }
+        if let Some(&(_, f)) = self.verified.get(&addr) {
+            return Some(f);
+        }
         self.funcs.get(&addr).copied()
     }
 
     /// Calls the guest function at `addr`. Every call in generated code goes
     /// through here.
     pub fn call(&mut self, addr: u32) {
-        let f = self.lookup(addr);
+        let f = self.lookup(addr).or_else(|| self.verify_image(addr));
+        self.tick(addr);
+        match f {
+            Some(f) => {
+                self.depth += 1;
+                f(self);
+                self.depth -= 1;
+            }
+            None if self.on_missing.is_some() => {
+                let run = self.on_missing.unwrap();
+                self.depth += 1;
+                run(self, addr);
+                self.depth -= 1;
+            }
+            None => panic!(
+                "call to unknown guest function {addr:#010x}{}{}",
+                memory::wild_hint(addr),
+                self.overlays_at(addr)
+            ),
+        }
+    }
+
+    /// What every call costs: it goes in the trace and moves the clock, and
+    /// a due deadline runs its handler. An interpreter calls this for the
+    /// calls it makes itself, so time moves as in translated code.
+    pub fn tick(&mut self, addr: u32) {
         self.trace[(self.calls % TRACE_LEN as u64) as usize] = addr;
         self.calls += 1;
         self.clock = self.clock.wrapping_add(u64::from(COUNT_PER_CALL));
@@ -229,17 +316,6 @@ impl Ctx {
                 self.deadline = u64::MAX;
                 h(self);
             }
-        }
-        match f {
-            Some(f) => {
-                self.depth += 1;
-                f(self);
-                self.depth -= 1;
-            }
-            None => panic!(
-                "call to unknown guest function {addr:#010x}{}",
-                self.overlays_at(addr)
-            ),
         }
     }
 
@@ -255,6 +331,37 @@ impl Ctx {
     /// MTC0. Writes are stored; none of them has a side effect yet.
     pub fn mtc0(&mut self, n: usize, v: u64) {
         self.cop0[n] = v as u32;
+    }
+
+    /// TLBR (1), TLBWI (2), TLBWR (6) and TLBP (8), on COP0 Index (0),
+    /// EntryLo0/1 (2, 3), PageMask (5) and EntryHi (10).
+    pub fn tlb(&mut self, funct: u32) {
+        const REGS: [usize; 4] = [5, 10, 2, 3];
+        let index = (self.cop0[0] & 31) as usize;
+        match funct {
+            1 => {
+                for (k, &n) in REGS.iter().enumerate() {
+                    self.cop0[n] = self.tlb[index][k];
+                }
+            }
+            2 | 6 => {
+                // Random lies between Wired and 31, so slot 31 is always one it could pick.
+                let slot = if funct == 2 { index } else { 31 };
+                for (k, &n) in REGS.iter().enumerate() {
+                    self.tlb[slot][k] = self.cop0[n];
+                }
+            }
+            8 => {
+                let hi = self.cop0[10];
+                let hit = self.tlb.iter().position(|e| {
+                    let mask = !(e[0] | 0x1FFF);
+                    let global = e[2] & e[3] & 1 != 0;
+                    (e[1] ^ hi) & mask == 0 && (global || (e[1] ^ hi) & 0xFF == 0)
+                });
+                self.cop0[0] = hit.map_or(0x8000_0000, |k| k as u32);
+            }
+            _ => self.unimplemented(0, funct),
+        }
     }
 
     /// Whether a function is registered or overridden at `addr`.
@@ -364,6 +471,13 @@ impl Ctx {
     }
 }
 
+/// FNV-1a over code bytes: how image functions are matched against RAM.
+pub fn code_hash(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xCBF2_9CE4_8422_2325, |h, &b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01B3)
+    })
+}
+
 /// Called by generated code when execution reaches an address inside a
 /// function that is not a known block start (for example a jump table target
 /// that was not discovered).
@@ -462,6 +576,33 @@ mod tests {
     }
 
     #[test]
+    fn image_functions_run_only_while_their_bytes_are_in_ram() {
+        fn a(c: &mut Ctx) {
+            c.r[2] = 0xA;
+        }
+        fn b(c: &mut Ctx) {
+            c.r[2] = 0xB;
+        }
+        let mut c = Ctx::new(Memory::new(0x100));
+        let (code_a, code_b) = ([1u8, 2, 3, 4], [5u8, 6, 7, 8]);
+        c.register_image_fn(0x8000_0010, 4, code_hash(&code_a), a);
+        c.register_image_fn(0x8000_0010, 4, code_hash(&code_b), b);
+        c.mem.bytes_mut()[0x10..0x14].copy_from_slice(&code_a);
+        c.call(0x8000_0010);
+        assert_eq!(c.r[2], 0xA);
+        // New code written there is picked up after an invalidation.
+        c.mem.bytes_mut()[0x10..0x14].copy_from_slice(&code_b);
+        c.code_written(0x8000_0000, 0x20);
+        c.call(0x8000_0010);
+        assert_eq!(c.r[2], 0xB);
+        c.mem.bytes_mut()[0x10..0x14].copy_from_slice(&[0; 4]);
+        c.code_written(0x8000_0012, 1);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c.call(0x8000_0010))).is_err()
+        );
+    }
+
+    #[test]
     fn unknown_call_names_the_overlays_there() {
         fn a(_: &mut Ctx) {}
         let mut c = Ctx::new(Memory::new(16));
@@ -495,5 +636,38 @@ mod tests {
         c.clear_override(0x8000_0400);
         c.call(0x8000_0400);
         assert_eq!(c.r[2], 1);
+    }
+}
+
+/// Adds `lo..hi` to the disjoint `ranges`, merging what it touches. Games
+/// copy into the same buffers over and over; unmerged, every call would
+/// look through each of those copies.
+fn add_range(ranges: &mut Vec<(u32, u32)>, lo: u32, hi: u32) {
+    let (mut lo, mut hi) = (lo, hi);
+    ranges.retain(|&(a, b)| {
+        let touches = a <= hi && b >= lo;
+        if touches {
+            lo = lo.min(a);
+            hi = hi.max(b);
+        }
+        !touches
+    });
+    ranges.push((lo, hi));
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::add_range;
+
+    #[test]
+    fn repeated_and_touching_copies_merge() {
+        let mut r = Vec::new();
+        for _ in 0..1000 {
+            add_range(&mut r, 0x100, 0x200);
+        }
+        add_range(&mut r, 0x400, 0x500);
+        assert_eq!(r, [(0x100, 0x200), (0x400, 0x500)]);
+        add_range(&mut r, 0x200, 0x400);
+        assert_eq!(r, [(0x100, 0x500)]);
     }
 }

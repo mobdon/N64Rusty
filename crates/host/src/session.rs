@@ -26,6 +26,10 @@ pub trait Guest {
     /// example with `wgpu::Instance::create_surface(window)`. Never called
     /// in a headless run.
     fn attach_window(&mut self, _window: Arc<Window>) {}
+
+    /// Draw the window again between game frames, at the `refresh` rate of
+    /// the window config. Never called otherwise.
+    fn redraw(&mut self) {}
 }
 
 /// What [`Session::tick`] did.

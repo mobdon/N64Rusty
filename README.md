@@ -50,9 +50,12 @@ function pointers built with `lui`/`addiu` that point at a function prologue.
 `--symbols` adds function addresses from a symbol map (lines like
 `name = 0x80001234;`) read from your own local checkout of a decompilation
 project; it is never copied into this repository. Output goes to the
-git-ignored `local/<sha256>/` folder: `out/` (the generated crate, one file
-per 64 KiB of address space, rewritten only when its contents change),
-`report.txt` and a `config.toml` template.
+git-ignored `local/<sha256>/` folder: `out/` (the generated game: one small
+crate per 64 KiB of address space and per overlay under `out/parts/`, each
+rewritten only when its contents change, so adding a function rebuilds one
+part and relinks; formatting is turned off there), `report.txt` and a
+`config.toml` template. Keep `out/target/`: it is the build cache, and
+cleaning it means a full rebuild.
 
 On Linux, building needs `libudev-dev` (for gamepads) and `libasound2-dev`
 (for sound).
@@ -76,13 +79,29 @@ order, on a virtual clock: retrace and timer interrupts arrive on time
 even while a thread is busy, and when every thread waits, time jumps to the
 next event. The game always runs at its original speed in game time.
 
-A run stops after `--frames` retraces, on a deadlock, or at the first
-panic, and prints the threads, the cartridge copies and the most recent
-calls. It also writes two files next to `out/`:
+A run stops after `--frames` retraces, on a deadlock, at the first
+panic, or on a hang (no retrace for 5 seconds of host time: a guest loop
+that makes no calls, so game time cannot move), and prints the threads,
+the cartridge copies and the most recent calls. Any access past RAM that is
+not through the KSEG0/KSEG1 windows (a wild pointer, or TLB-mapped memory,
+which is not modelled yet) panics there; an address starting `0x27BD` is
+also named as code read as a pointer. It also writes two files next to `out/`:
 
 - `dma.txt`: every cartridge copy seen (ROM offset, RAM address, length).
 - `missing.txt`: each call into code that was never translated, with the
   copy that put it there.
+
+Code the game writes into RAM itself (unpacked from compressed data, so no
+copy shows where it came from) is saved from RAM at the call that missed, to
+`images/` in the same folder. `translate` turns each saved image into
+functions that only run while their own bytes are in RAM: each is checked
+at its first call, and again after a copy or an I-cache invalidation
+covers it.
+
+Code with no translation at all runs in the reference interpreter
+(`n64rusty-refcpu`) instead of stopping the game, and is saved the same way
+for the next `translate`. Calls it makes into translated code and replaced
+system routines go back through the normal dispatch.
 
 Run `translate` again and it adds that code: code copied in at run time
 becomes an overlay (its own module, active while that copy is in RAM; a
@@ -90,6 +109,13 @@ later copy into part of it hides only the functions it covers), boot
 segment code that a later copy overwrites is dropped, and boot code reached
 only through a pointer is added. Repeat until the run reaches its frame
 limit.
+
+`translate` also reads the game's own load tables before any run: a pair
+of ROM offsets (start, end) followed within three words by a RAM address,
+where the code there calls into itself at function starts (or, with no
+such calls, builds addresses inside itself). Each such piece becomes an
+overlay up front, so modes no run has reached yet are already translated.
+A copy seen in a run replaces the guess.
 
 Graphics, audio and input reach the game through
 `n64rusty_runner::devices::Devices` (RSP tasks, audio buffers, frame swaps,
@@ -111,6 +137,14 @@ its command set is used. `--input script.txt` plays a controller script
 (`frame port buttons x y` lines, the format `n64rusty-host` records),
 matched against retrace numbers, so a headless run can press buttons.
 
+Cartridge save memory (battery-backed SRAM, reached with PI DMA) is kept
+in a file: `--save file`, and window runs default to `save.sra` in the
+per-game folder. The file is read at start and rewritten after every write
+the game makes, so closing the window or a crash loses nothing. Headless
+runs without `--save` start from blank save memory and keep nothing, so
+repeated runs stay identical. EEPROM, flash and controller pak saves are
+not done yet.
+
 Guest threads start with the floating-point register mode the system
 library gives them (32-bit registers, doubles in even/odd pairs); the boot
 code keeps the 64-bit mode the boot ROM sets.
@@ -126,19 +160,36 @@ the game slows down. There is no frame limit unless `--frames` is given.
 Window size, frame rate, key layout, gamepad ports and input record/replay
 come from `run.toml` in the per-game folder, or `--run file`.
 
-On Windows (PowerShell), from the repository folder:
+`widescreen = true` under `[window]` in `run.toml` fills a window wider
+than 4:3 instead of drawing black bars. The 3D scene shows more at the
+sides, everything keeps its shape with the 4:3 picture in the middle, and
+full-width backgrounds stretch to the edges. Things the game itself leaves
+out of view (objects it culls past the original edge) stay missing.
+`--capture-wide` saves headless captures in 16:9 the same way.
+
+`refresh = 144` (any rate above the game's) under `[window]` draws the
+window that often. Each picture between two game frames blends where
+every 3D object is, matched by the display list code that drew it, so
+motion is smoother while the game keeps running at its own rate. What you
+see trails the game by one frame, and 2D elements move only on game frames.
+`--capture-between` also saves, with each headless capture, the picture
+half-way from the frame before.
+
+On Windows, one script does it all: it builds the translator, translates
+your ROM, builds the game program, copies it to `local\<sha256>\game.exe` and
+starts it with `--window`. From the repository folder in PowerShell:
 
 ```
-cargo run --release -p n64rusty -- translate C:\path\to\your.z64 --symbols C:\path\to\map.txt
-cd local\<sha256>\out
-cargo build --release
-copy target\release\n64rusty-game-<hash>.exe ..\game.exe
-cd ..
-.\game.exe C:\path\to\your.z64 --symbols C:\path\to\map.txt --local . --window
+powershell -ExecutionPolicy Bypass -File scripts\play.ps1 -Rom C:\path\to\your.z64 -Symbols C:\path\to\map.txt -Files C:\path\to\per-game-files
 ```
 
-Run the copy rather than the file in `target`, so a rebuild never fights a
-running game. Close the window to stop. `record = "take.txt"` in `run.toml`
+`-Rom` can also be the folder that holds the ROM. `-Files` is optional: a
+folder with per-game run files (`config.toml`, `dma.txt`, `missing.txt`,
+`run.toml`) to copy into `local\<sha256>\` before translating. The script
+stops at the first step that fails and says which.
+
+The game runs from a copy, so a rebuild never fights a running game. Close
+the window to stop. `record = "take.txt"` in `run.toml`
 keeps your input; `replay = "take.txt"` plays it back. With `headless = true`
 in the run config nothing is opened and the run goes as fast as it can with
 scripted input, which is how this mode is tested.
@@ -160,8 +211,12 @@ it).
   the stick (left Shift for half tilt), J is A, K is B, Space is Z, Enter is
   Start, Q and E are L and R, T F G H (or numpad 8 4 5 6) are the C buttons
   and 1 to 4 the D-pad. The arrow keys are not used. Keys can be remapped per
-  port. Gamepads: south face button A, west B, left trigger Z, shoulders L and
-  R, right stick the C buttons.
+  port. Gamepads (Xbox layout): A is A, B is B, X and Y are C-down and C-up,
+  LT and RB are Z, LB is L, RT is R, Start is Start, the left stick is the
+  stick, the right stick the C buttons and the d-pad the d-pad. Each port's
+  pad buttons, stick deadzone and sensitivity can be changed in `run.toml`,
+  and controllers can be plugged in while the game runs. Each one is named on
+  the console when found (`controller gamepad0: ...`).
 - **Record and replay.** Input scripts are plain text anchored on frame
   numbers (`frame port buttons x y`, one change per line), so they can be
   written by hand as well as recorded. A recording is written as the run goes,
@@ -304,6 +359,9 @@ Licensed under either of
 
 at your option. Unless you state otherwise, any contribution you submit for
 inclusion is dual licensed as above, without any additional terms.
+
+Only contributors approved by the owner may work on this repository, and AI
+agents need the owner's explicit permission; see [AGENTS.md](AGENTS.md).
 
 Modelled on [N64Recomp](https://github.com/N64Recomp/N64Recomp) (MIT). See
 [CREDITS.md](CREDITS.md) and [NOTICE](NOTICE).

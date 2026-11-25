@@ -158,6 +158,10 @@ impl Dl {
     pub fn num_lights(&mut self, n: u32) -> &mut Self {
         self.c(0xDB << 24 | 0x02 << 16, n * 24)
     }
+    /// `gSPLightColor`: a colour word at `offset` in the light table.
+    pub fn light_color(&mut self, offset: u32, rgba: u32) -> &mut Self {
+        self.c(0xDB << 24 | 0x0A << 16 | offset, rgba)
+    }
     /// Light `n`, counting from 1 (the ambient light is `num_lights + 1`).
     pub fn light(&mut self, addr: u32, n: u32) -> &mut Self {
         self.c(

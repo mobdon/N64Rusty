@@ -1,0 +1,131 @@
+//! Runs calls into code that has no translation (code a game loads to an
+//! address no run saw it at, for example) with the reference interpreter, so
+//! the game goes on instead of stopping. Calls it makes into translated code
+//! or replaced system routines go back through [`Ctx::call`]; calls between
+//! untranslated functions stay in the interpreter but cost the same time.
+//!
+//! Each function run this way is saved like a missed call (see
+//! `record_run`), so the next translate covers it.
+
+use std::collections::BTreeMap;
+use std::sync::Mutex;
+
+use n64rusty_refcpu::Cpu;
+use n64rusty_runtime::Ctx;
+
+/// First-run snapshots of the RAM around each interpreted function: entry
+/// address to (start of the snapshot, bytes).
+static SEEN: Mutex<BTreeMap<u32, (u32, Vec<u8>)>> = Mutex::new(BTreeMap::new());
+
+/// The RAM range to save around a function, given RAM and its address.
+pub(crate) type Snapshot = Box<dyn Fn(&[u8], u32) -> Option<(u32, u32)> + Send>;
+
+static REGION: Mutex<Option<Snapshot>> = Mutex::new(None);
+
+/// Makes `ctx` interpret calls to untranslated code; `region` gives the RAM
+/// range to save for a function it runs.
+pub(crate) fn install(ctx: &mut Ctx, region: Snapshot) {
+    *REGION.lock().unwrap() = Some(region);
+    ctx.on_missing = Some(run);
+}
+
+/// The functions interpreted so far, with their saved RAM.
+pub(crate) fn seen() -> BTreeMap<u32, (u32, Vec<u8>)> {
+    SEEN.lock().unwrap().clone()
+}
+
+fn load(cpu: &mut Cpu, c: &Ctx) {
+    (cpu.r, cpu.hi, cpu.lo, cpu.f, cpu.fcr31, cpu.fr) = (c.r, c.hi, c.lo, c.f, c.fcr31, c.fr);
+}
+
+fn store(cpu: &Cpu, c: &mut Ctx) {
+    (c.r, c.hi, c.lo, c.f, c.fcr31, c.fr) = (cpu.r, cpu.hi, cpu.lo, cpu.f, cpu.fcr31, cpu.fr);
+}
+
+fn run(ctx: &mut Ctx, entry: u32) {
+    SEEN.lock().unwrap().entry(entry).or_insert_with(|| {
+        let region = REGION
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|f| f(ctx.mem.bytes(), entry));
+        let (lo, hi) = region.unwrap_or((entry, entry));
+        let at = |a: u32| (a & 0x1FFF_FFFF) as usize;
+        let bytes = ctx.mem.bytes().get(at(lo)..at(hi)).unwrap_or_default();
+        (lo, bytes.to_vec())
+    });
+    let mut cpu = Cpu::new(Vec::new());
+    load(&mut cpu, ctx);
+    // The function is done when it returns to its caller.
+    let stop = ctx.r[31] as u32;
+    cpu.jump_to(entry);
+    while cpu.pc != stop {
+        let pc = cpu.pc;
+        if pc != entry && ctx.has_function(pc) {
+            // A call (or tail jump) into translated code: run it there, then
+            // carry on at the return address it leaves.
+            store(&cpu, ctx);
+            ctx.call(pc);
+            load(&mut cpu, ctx);
+            cpu.jump_to(ctx.r[31] as u32);
+            continue;
+        }
+        let word = ctx.mem.read_u32(pc);
+        let target = match word >> 26 {
+            3 => Some((pc & 0xF000_0000) | (word & 0x03FF_FFFF) << 2),
+            0 if word & 0x3F == 9 => Some(cpu.r[(word >> 21) as usize & 31] as u32),
+            _ => None,
+        };
+        // Calls into translated code are charged by `Ctx::call`.
+        let calls = target.is_some_and(|t| !ctx.has_function(t));
+        if let Err(e) = cpu.step_on(ctx.mem.bytes_mut()) {
+            panic!("interpreting untranslated code from {entry:#010x}: {e:?}");
+        }
+        if calls {
+            // A call inside untranslated code costs what a translated call
+            // does; the deadline handler may switch threads, so the
+            // registers go through `ctx`.
+            store(&cpu, ctx);
+            ctx.tick(pc);
+            load(&mut cpu, ctx);
+        }
+    }
+    store(&cpu, ctx);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use n64rusty_runtime::{sx32, Memory};
+
+    #[test]
+    fn untranslated_code_runs_and_calls_translated_code() {
+        fn translated(c: &mut Ctx) {
+            c.r[2] = 41;
+        }
+        let mut ctx = Ctx::new(Memory::new(0x10000));
+        // addiu sp,sp,-8; sw ra,0(sp); jal 0x80002000; nop;
+        // lw ra,0(sp); addiu v0,v0,1; jr ra; addiu sp,sp,8
+        let code = [
+            0x27BD_FFF8u32,
+            0xAFBF_0000,
+            0x0C00_0800,
+            0,
+            0x8FBF_0000,
+            0x2442_0001,
+            0x03E0_0008,
+            0x27BD_0008,
+        ];
+        for (k, w) in code.iter().enumerate() {
+            ctx.mem.write_u32(0x8000_1000 + 4 * k as u32, *w);
+        }
+        ctx.register(0x8000_2000, translated);
+        install(&mut ctx, Box::new(|_, a| Some((a, a + 32))));
+        ctx.r[29] = sx32(0x8000_8000);
+        ctx.r[31] = sx32(0x8000_0F00);
+        ctx.call(0x8000_1000);
+        assert_eq!(ctx.r[2], 42);
+        assert_eq!(ctx.r[29], sx32(0x8000_8000));
+        assert_eq!(seen()[&0x8000_1000].1.len(), 32);
+    }
+}

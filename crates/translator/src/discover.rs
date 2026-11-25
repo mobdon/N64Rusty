@@ -63,6 +63,9 @@ struct Explored {
     pointers: Vec<u32>,
     jump_targets: Vec<u32>,
     jump_tables: usize,
+    /// Reached a word no VR4300 decodes, or a jump in a delay slot: data,
+    /// not code (a call into code loaded over these bytes later).
+    bad: bool,
 }
 
 fn explore(img: &Image, s: u32, known: &BTreeSet<u32>) -> Explored {
@@ -74,6 +77,7 @@ fn explore(img: &Image, s: u32, known: &BTreeSet<u32>) -> Explored {
         pointers: Vec::new(),
         jump_targets: Vec::new(),
         jump_tables: 0,
+        bad: false,
     };
     let touch = |a: u32, end: &mut u32| *end = (*end).max(a + 4);
     while let Some(b) = work.pop() {
@@ -86,6 +90,10 @@ fn explore(img: &Image, s: u32, known: &BTreeSet<u32>) -> Explored {
             let Some(w) = img.word(a) else { break };
             touch(a, &mut ex.end);
             let i = Inst::decode(w);
+            // COP0 words the decoder leaves out (ERET) are still code.
+            let cti = |x: u32| Inst::decode(x).flow() != Flow::Next;
+            ex.bad |= (i.op == Op::Unknown && w >> 26 != 0x10)
+                || (cti(w) && img.word(a + 4).is_some_and(cti));
             // Track constants built with lui/addiu/ori, for function
             // pointers and for register jumps to a known address.
             let known_value = match i.op {
@@ -224,13 +232,169 @@ fn looks_like_prologue(w: u32) -> bool {
     i.op == Op::Addiu && i.rs == 29 && i.rt == 29 && i.simm() < 0
 }
 
+/// Whether the code at `a` opens a stack frame in its first four
+/// instructions, with no branch or jump before it: compilers often schedule
+/// a `lui` or load ahead of the `addiu $sp, $sp, -n`.
+fn opens_frame(img: &Image, a: u32) -> bool {
+    let plain = |w: u32| {
+        let i = Inst::decode(w);
+        i.op != Op::Unknown && matches!(i.flow(), Flow::Next)
+    };
+    (0..4)
+        .map_while(|k| img.word(a + 4 * k))
+        .take_while(|&w| looks_like_prologue(w) || plain(w))
+        .any(looks_like_prologue)
+}
+
+/// Whether `a` starts a short function with no stack frame: every word
+/// decodes, and a `jr $ra` comes within 32 words. Data between a return
+/// and the next one rarely does both.
+fn is_leaf(img: &Image, a: u32) -> bool {
+    const JR_RA: u32 = 0x03E0_0008;
+    let words: Vec<u32> = (0..32).map_while(|k| img.word(a + 4 * k)).collect();
+    words.iter().position(|&w| w == JR_RA).is_some_and(|k| {
+        words[..=k]
+            .iter()
+            .all(|&w| Inst::decode(w).op != Op::Unknown)
+    })
+}
+
+/// Places that start a function by their layout: the image's first word,
+/// or the first non-zero word after a `jr $ra` and its delay slot, when it
+/// opens a stack frame (see [`opens_frame`]) or is a leaf (see [`is_leaf`]). For code copied in at run
+/// time, whose functions are mostly reached through pointers set up by code.
+pub fn function_starts(img: &Image) -> Vec<u32> {
+    const JR_RA: u32 = 0x03E0_0008;
+    let end = img.base.wrapping_add(img.bytes.len() as u32 & !3);
+    let mut out = Vec::new();
+    let mut a = img.base;
+    let mut after_return = true;
+    let mut leaves = Vec::new();
+    // Every branch as the span it crosses: code inside one still belongs
+    // to the function before, even past a return.
+    let mut spans = Vec::new();
+    while a < end {
+        let w = img.word(a).unwrap_or(0);
+        if after_return && w != 0 {
+            if opens_frame(img, a) {
+                out.push(a);
+            } else if is_leaf(img, a) {
+                leaves.push(a);
+            }
+            after_return = false;
+        }
+        let i = Inst::decode(w);
+        if matches!(i.flow(), Flow::Branch { link: false, .. }) {
+            let t = i.branch_target(a);
+            spans.push((a.min(t), a.max(t)));
+        }
+        if w == JR_RA {
+            after_return = true;
+            a += 4; // the delay slot
+        }
+        a += 4;
+    }
+    out.extend(
+        leaves
+            .into_iter()
+            .filter(|&l| !spans.iter().any(|&(lo, hi)| lo < l && l <= hi)),
+    );
+    out.sort_unstable();
+    out
+}
+
+/// Code copies a game's own load table describes, found before any run
+/// makes them: `(rom, ram, len)` for each word pair `rom start, rom end`
+/// followed within three words by a RAM address at which that ROM range
+/// reads as code. It reads as code when its calls into itself land where
+/// functions start (after a return and its padding, or at its first word): nine in ten or
+/// more, and at least one; code with no such calls must build two or
+/// more addresses inside itself (`lui`, `addiu`). Build tools lay segment tables out this way
+/// (start, end, then load address), whatever else each entry holds.
+pub fn overlay_table(rom: &[u8]) -> Vec<(u32, u32, u32)> {
+    const JR_RA: u32 = 0x03E0_0008;
+    let words: Vec<u32> = rom
+        .chunks_exact(4)
+        .map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let rom_len = (words.len() * 4) as u32;
+    let mut found: BTreeMap<(u32, u32), Vec<(u32, bool)>> = BTreeMap::new();
+    let mut tried = HashSet::new();
+    for w in words.windows(5) {
+        let (s, e) = (w[0], w[1]);
+        if s < 0x1000 || s % 4 != 0 || e <= s || e > rom_len || e - s > 0x10_0000 {
+            continue;
+        }
+        let code = &words[s as usize / 4..e as usize / 4];
+        for &ram in &w[2..5] {
+            if !(0x8000_0000..0x8080_0000).contains(&ram) || ram % 4 != 0 || !tried.insert((s, ram))
+            {
+                continue;
+            }
+            let at = |k: usize| ram.wrapping_add(4 * k as u32);
+            // The first word after each return and any padding after it.
+            let mut starts = HashSet::from([ram]);
+            let mut k = 0;
+            while k < code.len() {
+                if code[k] == JR_RA {
+                    k += 2;
+                    while k < code.len() && code[k] == 0 {
+                        k += 1;
+                    }
+                    starts.insert(at(k));
+                } else {
+                    k += 1;
+                }
+            }
+            let (mut inside, mut good) = (0, 0);
+            for &c in code.iter().filter(|&&c| c >> 26 == 3) {
+                let t = (ram & 0xF000_0000) | (c & 0x03FF_FFFF) << 2;
+                if t >= ram && t - ram < e - s {
+                    inside += 1;
+                    good += starts.contains(&t) as u32;
+                }
+            }
+            // Code with no calls into itself (leaf functions reached through
+            // pointers) still builds addresses inside itself.
+            let own_pointers = code
+                .windows(2)
+                .filter(|p| p[0] >> 26 == 0x0F && p[1] >> 26 == 0x09)
+                .filter(|p| (p[0] >> 16) & 31 == (p[1] >> 21) & 31)
+                .map(|p| (p[0] << 16).wrapping_add(p[1] as u16 as i16 as u32))
+                .filter(|&v| v >= ram && v - ram < e - s)
+                .count();
+            let by_calls = good > 0 && good * 10 >= inside * 9;
+            if by_calls || (inside == 0 && own_pointers >= 2) {
+                found.entry((s, e)).or_default().push((ram, by_calls));
+                // The load address comes first; later words are often the
+                // same code's section addresses, which would also pass.
+                break;
+            }
+        }
+    }
+    // Every load address that the code's own calls confirm is kept (code
+    // can be loaded in two places). Only when none is confirmed that way
+    // does the first one confirmed by addresses alone count: a wrong
+    // address next to the right one still has addresses landing inside.
+    let mut out = Vec::new();
+    for ((s, e), rams) in found {
+        let mut rams: Vec<u32> = match rams.iter().any(|r| r.1) {
+            true => rams.iter().filter(|r| r.1).map(|r| r.0).collect(),
+            false => vec![rams[0].0],
+        };
+        rams.dedup();
+        out.extend(rams.into_iter().map(|ram| (s, ram, e - s)));
+    }
+    out
+}
+
 /// Words anywhere in the image that point inside it at something that starts
-/// like a function (`addiu $sp, $sp, -n`): function pointers in data tables.
+/// like a function (it opens a stack frame): function pointers in data tables.
 /// Pass them to [`discover`] as hints.
 pub fn data_pointers(img: &Image) -> Vec<u32> {
     let mut out: Vec<u32> = (0..img.bytes.len() / 4)
         .filter_map(|k| img.word(img.base + 4 * k as u32))
-        .filter(|&v| img.word(v).is_some_and(looks_like_prologue))
+        .filter(|&v| img.contains(v) && opens_frame(img, v))
         .collect();
     out.sort_unstable();
     out.dedup();
@@ -242,6 +406,21 @@ pub fn data_pointers(img: &Image) -> Vec<u32> {
 /// addresses must lie below `code_end`, which defaults to the end of the
 /// code reached from the entries.
 pub fn discover(img: &Image, entries: &[u32], hints: &[u32], code_end: Option<u32>) -> Discovery {
+    discover_layout(img, entries, hints, &[], code_end)
+}
+
+/// [`discover`], plus `layout`: places the image's layout suggests a
+/// function starts. Unlike a hint, one is dropped where it lands inside a
+/// function found from an earlier address, and where it decodes as data.
+/// With a layout, a function is not cut short where another starts.
+pub fn discover_layout(
+    img: &Image,
+    entries: &[u32],
+    hints: &[u32],
+    layout: &[u32],
+    code_end: Option<u32>,
+) -> Discovery {
+    let layout: BTreeSet<u32> = layout.iter().copied().collect();
     let mut known: BTreeSet<u32> = BTreeSet::new();
     let mut done: BTreeMap<u32, Explored> = BTreeMap::new();
     let mut queue: Vec<u32> = entries
@@ -252,14 +431,24 @@ pub fn discover(img: &Image, entries: &[u32], hints: &[u32], code_end: Option<u3
     known.extend(&queue);
     let mut text_end = 0;
     let mut first_pass = true;
+    // Past the first pass, calls beyond the code reached from the entries go
+    // to code the game loads there later: the image holds other bytes.
+    let mut call_end = u32::MAX;
     loop {
         while let Some(s) = queue.pop() {
             if done.contains_key(&s) {
                 continue;
             }
+            let inside_done = done.range(..s).next_back().is_some_and(|(_, e)| s < e.end);
+            if layout.contains(&s) && !hints.contains(&s) && inside_done {
+                continue;
+            }
             let ex = explore(img, s, &known);
+            if ex.bad && !entries.contains(&s) {
+                continue;
+            }
             for &c in &ex.calls {
-                if img.contains(c) && known.insert(c) {
+                if c < call_end && img.contains(c) && known.insert(c) {
                     queue.push(c);
                 }
             }
@@ -270,6 +459,7 @@ pub fn discover(img: &Image, entries: &[u32], hints: &[u32], code_end: Option<u3
             first_pass = false;
         }
         let code_end = code_end.unwrap_or(text_end);
+        call_end = code_end;
         // Second pass: hints and pointer pairs inside the code found so far,
         // not inside a function already found.
         let inside_known = |a: u32| {
@@ -286,6 +476,7 @@ pub fn discover(img: &Image, entries: &[u32], hints: &[u32], code_end: Option<u3
             .iter()
             .map(|&a| (a, true))
             .chain(pointers.into_iter().map(|a| (a, false)))
+            .chain(layout.iter().map(|&a| (a, false)))
         {
             if known.contains(&a) || !img.contains(a) {
                 continue;
@@ -295,7 +486,9 @@ pub fn discover(img: &Image, entries: &[u32], hints: &[u32], code_end: Option<u3
             // pair must also start like a function and not land inside one
             // already found.
             let ok = a < code_end
-                && (from_hint || (looks_like_prologue(img.word(a).unwrap()) && !inside_known(a)));
+                && (from_hint
+                    || ((layout.contains(&a) || looks_like_prologue(img.word(a).unwrap()))
+                        && !inside_known(a)));
             if !ok {
                 continue;
             }
@@ -326,6 +519,9 @@ pub fn discover(img: &Image, entries: &[u32], hints: &[u32], code_end: Option<u3
         if fresh.is_empty() {
             break;
         }
+        // Lowest address first, so a layout start inside a function found
+        // in this same round is seen to be inside it.
+        fresh.sort_unstable_by(|a, b| b.cmp(a));
         queue = fresh;
     }
 
@@ -336,7 +532,16 @@ pub fn discover(img: &Image, entries: &[u32], hints: &[u32], code_end: Option<u3
         let ex = &done[&s];
         jump_tables += ex.jump_tables;
         let next = starts.get(n + 1).copied().unwrap_or(u32::MAX);
-        let end = ex.end.min(next).max(s + 4);
+        // A start inside another function usually means the explorer ran
+        // on into the next function. Code saved from RAM also holds stale
+        // code whose calls land mid-function: there each function keeps all
+        // it reaches, and overlapping translations are harmless.
+        let end = if layout.is_empty() {
+            ex.end.min(next)
+        } else {
+            ex.end
+        }
+        .max(s + 4);
         let words = (s..end).step_by(4).map_while(|a| img.word(a)).collect();
         let mut f = Function::new(s, words);
         f.jump_targets = ex
@@ -374,6 +579,59 @@ mod tests {
     const NOP: u32 = 0;
 
     #[test]
+    fn function_starts_follow_returns() {
+        const FRAME: u32 = 0x27BD_FFF8; // addiu $sp,$sp,-8
+                                        // A function, padding, a function, a leaf (no frame), then data
+                                        // after a return that does not open a frame.
+        let words = [
+            FRAME,
+            JR_RA,
+            NOP,
+            NOP,
+            NOP, // 0x00, padding at 0x0c
+            FRAME,
+            JR_RA,
+            0x27BD_0008, // 0x14, delay slot pops the frame
+            0x2402_0001,
+            JR_RA,
+            NOP, // 0x20: leaf
+            0x1234_5678,
+            FRAME, // data, then a frame-like word not after a return
+        ];
+        let bytes = image(&words);
+        let img = Image {
+            base: BASE,
+            bytes: &bytes,
+        };
+        // The leaf counts; the data after it reaches no return.
+        assert_eq!(function_starts(&img), [BASE, BASE + 0x14, BASE + 0x20]);
+        // Code after a return that a branch before it reaches is not a leaf.
+        let words = [0x1080_0003, NOP, JR_RA, NOP, 0x2402_0001, JR_RA, NOP];
+        let bytes = image(&words);
+        let img = Image {
+            base: BASE,
+            bytes: &bytes,
+        };
+        assert_eq!(function_starts(&img), [BASE]);
+        // Nor is code after a return that a later branch loops back over.
+        let words = [JR_RA, NOP, 0x2402_0001, JR_RA, NOP, 0x1000_FFFB, NOP];
+        let bytes = image(&words);
+        let img = Image {
+            base: BASE,
+            bytes: &bytes,
+        };
+        assert_eq!(function_starts(&img), [BASE]);
+        // A frame opened after a scheduled `lui` still starts a function.
+        let words = [JR_RA, NOP, 0x3C0E_800A, FRAME, JR_RA, NOP];
+        let bytes = image(&words);
+        let img = Image {
+            base: BASE,
+            bytes: &bytes,
+        };
+        assert_eq!(function_starts(&img), [BASE, BASE + 8]);
+    }
+
+    #[test]
     fn data_pointers_find_prologues() {
         // 0x1000: addiu $sp,$sp,-8; 0x1004: jr $ra; 0x1008: nop;
         // 0x100c: pointer to 0x1000; 0x1010: pointer to 0x1004 (no prologue).
@@ -384,6 +642,47 @@ mod tests {
             bytes: &bytes,
         };
         assert_eq!(data_pointers(&img), vec![0x1000]);
+    }
+
+    #[test]
+    fn layout_starts_inside_a_function_are_dropped() {
+        // f: beq zero,zero,+2 ; nop ; nop(skipped) ; jr ra ; nop | g: jr ra ; nop
+        let bytes = image(&[0x1000_0002, NOP, NOP, JR_RA, NOP, JR_RA, NOP]);
+        let img = Image {
+            base: BASE,
+            bytes: &bytes,
+        };
+        let d = discover_layout(
+            &img,
+            &[],
+            &[],
+            &[BASE, BASE + 8, BASE + 20],
+            Some(BASE + 28),
+        );
+        let starts: Vec<u32> = d.functions.iter().map(|f| f.addr).collect();
+        assert_eq!(starts, vec![BASE, BASE + 20]);
+    }
+
+    #[test]
+    fn drops_calls_into_data() {
+        // f: jal g ; nop ; jr ra ; nop | g: data (an op no VR4300 has), and
+        // a jal from that data into the middle of f is not followed.
+        let bytes = image(&[
+            jal(BASE + 16),
+            NOP,
+            JR_RA,
+            NOP,
+            0xF140_F23F,
+            jal(BASE + 4),
+            NOP,
+        ]);
+        let img = Image {
+            base: BASE,
+            bytes: &bytes,
+        };
+        let d = discover(&img, &[BASE], &[], None);
+        let starts: Vec<u32> = d.functions.iter().map(|f| f.addr).collect();
+        assert_eq!(starts, vec![BASE]);
     }
 
     #[test]
@@ -444,6 +743,34 @@ mod tests {
         let d = discover(&img, &[BASE], &[], None);
         let starts: Vec<u32> = d.functions.iter().map(|f| f.addr).collect();
         assert_eq!(starts, vec![BASE, BASE + 20]);
+    }
+
+    #[test]
+    fn pointer_found_code_does_not_call_past_the_code() {
+        // f: jr ra ; nop | g (only a hint): jal past ; nop ; jr ra ; nop |
+        // past the code: bytes loaded over later, which here call into g.
+        let past = BASE + 32;
+        let bytes = image(&[
+            JR_RA,
+            NOP,
+            jal(past),
+            NOP,
+            JR_RA,
+            NOP,
+            0,
+            0,
+            jal(BASE + 12),
+            NOP,
+            JR_RA,
+            NOP,
+        ]);
+        let img = Image {
+            base: BASE,
+            bytes: &bytes,
+        };
+        let d = discover(&img, &[BASE], &[BASE + 8], Some(BASE + 24));
+        let starts: Vec<u32> = d.functions.iter().map(|f| f.addr).collect();
+        assert_eq!(starts, vec![BASE, BASE + 8]);
     }
 
     #[test]
@@ -527,5 +854,73 @@ mod tests {
         // The lui/addiu pair alone finds it too, since it has a prologue.
         let d = discover(&img, &[BASE], &[], Some(BASE + 28));
         assert_eq!(d.functions.len(), 2);
+    }
+    #[test]
+    fn overlay_table_finds_code_by_its_own_calls() {
+        // ROM: a table entry at 0x1000 (start 0x2000, end 0x2018, load
+        // address 0x8020_0000), and at 0x2000 two functions, the first
+        // calling the second (jal 0x8020_000c).
+        let mut rom = vec![0u8; 0x3000];
+        let put = |rom: &mut Vec<u8>, at: usize, w: u32| {
+            rom[at..at + 4].copy_from_slice(&w.to_be_bytes())
+        };
+        for (k, w) in [0x2000u32, 0x2018, 0x8020_0000].into_iter().enumerate() {
+            put(&mut rom, 0x1000 + 4 * k, w);
+        }
+        let jal = 0x0C00_0000 | (0x8020_000c & 0x03FF_FFFF) >> 2;
+        for (k, w) in [jal, JR_RA, NOP, 0x2402_0001, JR_RA, NOP]
+            .into_iter()
+            .enumerate()
+        {
+            put(&mut rom, 0x2000 + 4 * k, w);
+        }
+        assert_eq!(overlay_table(&rom), [(0x2000, 0x8020_0000, 0x18)]);
+        // The same code read at the wrong address calls into its middle.
+        put(&mut rom, 0x1008, 0x8020_0004);
+        assert_eq!(overlay_table(&rom), []);
+    }
+    #[test]
+    fn overlay_table_prefers_addresses_its_calls_confirm() {
+        // Two table entries for the code at ROM 0x2000..0x2040: first a wrong
+        // load address 0x8020_0020, then the right one 0x8020_0000. The code
+        // calls 0x8020_000c and builds 0x8020_0030 and 0x8020_0034.
+        let mut rom = vec![0u8; 0x3000];
+        let put = |rom: &mut Vec<u8>, at: usize, w: u32| {
+            rom[at..at + 4].copy_from_slice(&w.to_be_bytes())
+        };
+        for (k, w) in [
+            0x2000u32,
+            0x2040,
+            0x8020_0020,
+            0,
+            0,
+            0x2000,
+            0x2040,
+            0x8020_0000,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            put(&mut rom, 0x1000 + 4 * k, w);
+        }
+        let jal = 0x0C00_0000 | (0x8020_000c & 0x03FF_FFFF) >> 2;
+        let code = [
+            jal,
+            JR_RA,
+            NOP,
+            0x2402_0001,
+            JR_RA,
+            NOP,
+            0x3C04_8020,
+            0x2484_0030,
+            0x3C05_8020,
+            0x24A5_0034,
+            JR_RA,
+            NOP,
+        ];
+        for (k, w) in code.into_iter().enumerate() {
+            put(&mut rom, 0x2000 + 4 * k, w);
+        }
+        assert_eq!(overlay_table(&rom), [(0x2000, 0x8020_0000, 0x40)]);
     }
 }
