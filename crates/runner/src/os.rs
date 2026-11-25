@@ -183,6 +183,71 @@ struct Os {
 
 static OS: OnceLock<Os> = OnceLock::new();
 
+/// A memory write a run makes at each retrace from `from` to `to` (see
+/// `--poke`): a debugging aid, for example to start a game somewhere else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Poke {
+    pub from: u64,
+    pub to: u64,
+    pub addr: u32,
+    pub value: u32,
+    /// 1, 2 or 4.
+    pub bytes: u8,
+}
+
+static POKES: Mutex<Vec<Poke>> = Mutex::new(Vec::new());
+
+/// Sets the memory writes this run makes.
+pub fn set_pokes(pokes: Vec<Poke>) {
+    *POKES.lock().unwrap_or_else(|e| e.into_inner()) = pokes;
+}
+
+/// Parses a poke script: `frame[-last] addr value [bytes]` per line, frame
+/// numbers in decimal (retraces), address and value in hex, bytes 1, 2 or 4
+/// (default 4). `#` starts a comment.
+pub fn parse_pokes(text: &str) -> Result<Vec<Poke>, String> {
+    let hex = |t: &str| u32::from_str_radix(t.trim_start_matches("0x"), 16).ok();
+    let mut out = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let f: Vec<&str> = line.split_whitespace().collect();
+        let bad = || format!("line {}: expected `frame[-last] addr value [bytes]`", n + 1);
+        let (Some(frames), Some(addr), Some(value)) = (f.first(), f.get(1), f.get(2)) else {
+            return Err(bad());
+        };
+        let (from, to) = frames.split_once('-').unwrap_or((frames, frames));
+        let bytes = f.get(3).map_or(Some(4), |b| b.parse().ok());
+        match (from.parse(), to.parse(), hex(addr), hex(value), bytes) {
+            (Ok(from), Ok(to), Some(addr), Some(value), Some(bytes @ (1 | 2 | 4))) => {
+                out.push(Poke {
+                    from,
+                    to,
+                    addr,
+                    value,
+                    bytes,
+                })
+            }
+            _ => return Err(bad()),
+        }
+    }
+    Ok(out)
+}
+
+fn apply_pokes(c: &mut Ctx, frame: u64) {
+    for p in POKES.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        if (p.from..=p.to).contains(&frame) {
+            match p.bytes {
+                1 => c.mem.write_u8(p.addr, p.value as u8),
+                2 => c.mem.write_u16(p.addr, p.value as u16),
+                _ => c.mem.write_u32(p.addr, p.value),
+            }
+        }
+    }
+}
+
 /// Text of the last panic, set by the panic hook.
 pub static PANIC_MESSAGE: Mutex<String> = Mutex::new(String::new());
 
@@ -356,6 +421,7 @@ fn deliver_due(c: &mut Ctx, st: &mut State) {
         flash_ops(c, st);
         st.next_vi += TICKS_PER_FRAME;
         st.frames += 1;
+        apply_pokes(c, st.frames);
         st.devices.retrace(st.frames, st.framebuffer);
         if let Some((mq, msg, every)) = st.vi {
             if every > 0 && st.frames.is_multiple_of(u64::from(every)) {
@@ -1487,6 +1553,33 @@ pub fn install<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn poke_scripts_parse() {
+        let p = parse_pokes("# warp\n100 0x8011AC80 bb\n200-210 80001000 1 1\n").unwrap();
+        assert_eq!(
+            p[0],
+            Poke {
+                from: 100,
+                to: 100,
+                addr: 0x8011_AC80,
+                value: 0xBB,
+                bytes: 4
+            }
+        );
+        assert_eq!(
+            p[1],
+            Poke {
+                from: 200,
+                to: 210,
+                addr: 0x8000_1000,
+                value: 1,
+                bytes: 1
+            }
+        );
+        assert!(parse_pokes("100 8011AC80").is_err());
+        assert!(parse_pokes("100 8011AC80 1 3").is_err());
+    }
 
     #[test]
     fn formats_a_guest_debug_print() {

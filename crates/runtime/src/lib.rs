@@ -177,7 +177,8 @@ impl Ctx {
         // Image functions are shorter than this, so one starting before
         // `ram` by more cannot reach it.
         const LONGEST: u32 = 0x10_0000;
-        let end = ram.wrapping_add(len);
+        // A bogus length must not wrap below `ram`.
+        let end = ram.saturating_add(len);
         let hit: Vec<u32> = self
             .verified
             .range(ram.saturating_sub(LONGEST)..end)

@@ -137,6 +137,16 @@ its command set is used. `--input script.txt` plays a controller script
 (`frame port buttons x y` lines, the format `n64rusty-host` records),
 matched against retrace numbers, so a headless run can press buttons.
 
+Two debugging aids, in headless and window runs alike:
+
+- `--poke script.txt` writes guest memory at chosen retraces. Each line is
+  `frame[-last] addr value [bytes]`: frames in decimal, address and value in
+  hex, `bytes` 1, 2 or 4 (default 4); a range writes on every retrace in it.
+  Use it to turn on a game's leftover debug features or to start somewhere
+  other than the beginning. Keep poke scripts in the per-game folder: they
+  hold game addresses.
+- `--ram-out file` saves guest RAM when the run ends, to read state back.
+
 Cartridge save memory (battery-backed SRAM, reached with PI DMA) is kept
 in a file: `--save file`, and window runs default to `save.sra` in the
 per-game folder. The file is read at start and rewritten after every write
