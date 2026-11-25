@@ -91,6 +91,13 @@ also named as code read as a pointer. It also writes two files next to `out/`:
 - `missing.txt`: each call into code that was never translated, with the
   copy that put it there.
 
+Code the game writes into RAM itself (unpacked from compressed data, so no
+copy shows where it came from) is saved from RAM at the call that missed, to
+`images/` in the same folder. `translate` turns each saved image into
+functions that only run while their own bytes are in RAM: each is checked
+at its first call, and again after a copy or an I-cache invalidation
+covers it.
+
 Run `translate` again and it adds that code: code copied in at run time
 becomes an overlay (its own module, active while that copy is in RAM; a
 later copy into part of it hides only the functions it covers), boot

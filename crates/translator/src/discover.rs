@@ -63,6 +63,9 @@ struct Explored {
     pointers: Vec<u32>,
     jump_targets: Vec<u32>,
     jump_tables: usize,
+    /// Reached a word no VR4300 decodes, or a jump in a delay slot: data,
+    /// not code (a call into code loaded over these bytes later).
+    bad: bool,
 }
 
 fn explore(img: &Image, s: u32, known: &BTreeSet<u32>) -> Explored {
@@ -74,6 +77,7 @@ fn explore(img: &Image, s: u32, known: &BTreeSet<u32>) -> Explored {
         pointers: Vec::new(),
         jump_targets: Vec::new(),
         jump_tables: 0,
+        bad: false,
     };
     let touch = |a: u32, end: &mut u32| *end = (*end).max(a + 4);
     while let Some(b) = work.pop() {
@@ -86,6 +90,10 @@ fn explore(img: &Image, s: u32, known: &BTreeSet<u32>) -> Explored {
             let Some(w) = img.word(a) else { break };
             touch(a, &mut ex.end);
             let i = Inst::decode(w);
+            // COP0 words the decoder leaves out (ERET) are still code.
+            let cti = |x: u32| Inst::decode(x).flow() != Flow::Next;
+            ex.bad |= (i.op == Op::Unknown && w >> 26 != 0x10)
+                || (cti(w) && img.word(a + 4).is_some_and(cti));
             // Track constants built with lui/addiu/ori, for function
             // pointers and for register jumps to a known address.
             let known_value = match i.op {
@@ -380,6 +388,9 @@ pub fn discover(img: &Image, entries: &[u32], hints: &[u32], code_end: Option<u3
                 continue;
             }
             let ex = explore(img, s, &known);
+            if ex.bad && !entries.contains(&s) {
+                continue;
+            }
             for &c in &ex.calls {
                 if c < call_end && img.contains(c) && known.insert(c) {
                     queue.push(c);
@@ -543,6 +554,20 @@ mod tests {
             bytes: &bytes,
         };
         assert_eq!(data_pointers(&img), vec![0x1000]);
+    }
+
+    #[test]
+    fn drops_calls_into_data() {
+        // f: jal g ; nop ; jr ra ; nop | g: data (an op no VR4300 has), and
+        // a jal from that data into the middle of f is not followed.
+        let bytes = image(&[jal(BASE + 16), NOP, JR_RA, NOP, 0xF140_F23F, jal(BASE + 4), NOP]);
+        let img = Image {
+            base: BASE,
+            bytes: &bytes,
+        };
+        let d = discover(&img, &[BASE], &[], None);
+        let starts: Vec<u32> = d.functions.iter().map(|f| f.addr).collect();
+        assert_eq!(starts, vec![BASE]);
     }
 
     #[test]

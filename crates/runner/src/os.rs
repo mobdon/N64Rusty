@@ -1083,6 +1083,13 @@ fn ret_zero(c: &mut Ctx) {
 
 fn nothing(_: &mut Ctx) {}
 
+/// New code is in place: functions of code the game wrote itself are
+/// checked against RAM again at their next call.
+fn os_inval_icache(c: &mut Ctx) {
+    let (ram, len) = (arg(c, 0), arg(c, 1));
+    c.code_written(ram, len);
+}
+
 fn os_set_int_mask(c: &mut Ctx) {
     // Interrupts are not modelled; report all enabled.
     ret(c, 0x003F_FF01);
@@ -1146,7 +1153,7 @@ pub const HOOKS: &[(&str, GuestFn)] = &[
     ("osAiGetLength", ret_zero),
     ("osAiGetStatus", ret_zero),
     ("osInvalDCache", nothing),
-    ("osInvalICache", nothing),
+    ("osInvalICache", os_inval_icache),
     ("osWritebackDCache", nothing),
     ("osWritebackDCacheAll", nothing),
     ("osMapTLB", nothing),
@@ -1154,13 +1161,14 @@ pub const HOOKS: &[(&str, GuestFn)] = &[
 ];
 
 /// Installs the replacements over the routines found in `addrs`
-/// (role name to guest address). Returns the names installed.
-pub fn install(ctx: &mut Ctx, addrs: &BTreeMap<String, u32>) -> Vec<String> {
+/// (role name and guest address). A name may come more than once: a game can
+/// link a library routine into two segments. Returns the names installed.
+pub fn install<'a>(ctx: &mut Ctx, addrs: impl IntoIterator<Item = (&'a String, &'a u32)>) -> Vec<String> {
     let mut done = Vec::new();
-    for (name, f) in HOOKS {
-        if let Some(&a) = addrs.get(*name) {
+    for (name, &a) in addrs {
+        if let Some((_, f)) = HOOKS.iter().find(|(h, _)| h == name) {
             ctx.set_override(a, *f);
-            done.push(name.to_string());
+            done.push(name.clone());
         }
     }
     done

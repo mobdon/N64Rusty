@@ -121,6 +121,8 @@ pub enum Op {
     // COP0 (system control) register moves.
     Mfc0,
     Mtc0,
+    /// TLB read, write indexed, write random or probe: operation in funct.
+    Tlb,
     /// COP1 arithmetic, conversion or compare: format in `rs`, operation in
     /// the funct field.
     Cop1,
@@ -248,6 +250,7 @@ impl Inst {
             0x10 => match rs {
                 0x00 | 0x01 => Op::Mfc0,
                 0x04 | 0x05 => Op::Mtc0,
+                0x10 if matches!(word & 0x3F, 0x01 | 0x02 | 0x06 | 0x08) => Op::Tlb,
                 _ => Op::Unknown,
             },
             0x02 => Op::J,
