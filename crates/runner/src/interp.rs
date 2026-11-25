@@ -43,17 +43,23 @@ fn store(cpu: &Cpu, c: &mut Ctx) {
 }
 
 fn run(ctx: &mut Ctx, entry: u32) {
-    SEEN.lock().unwrap().entry(entry).or_insert_with(|| {
-        let region = REGION
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(|f| f(ctx.mem.bytes(), entry));
-        let (lo, hi) = region.unwrap_or((entry, entry));
-        let at = |a: u32| (a & 0x1FFF_FFFF) as usize;
-        let bytes = ctx.mem.bytes().get(at(lo)..at(hi)).unwrap_or_default();
-        (lo, bytes.to_vec())
-    });
+    // Code `--interpret` sends here may have a translation: nothing to save.
+    let translated = ctx.interpret.is_some() && ctx.has_translation(entry);
+    let mut seen = SEEN.lock().unwrap();
+    if !translated {
+        seen.entry(entry).or_insert_with(|| {
+            let region = REGION
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|f| f(ctx.mem.bytes(), entry));
+            let (lo, hi) = region.unwrap_or((entry, entry));
+            let at = |a: u32| (a & 0x1FFF_FFFF) as usize;
+            let bytes = ctx.mem.bytes().get(at(lo)..at(hi)).unwrap_or_default();
+            (lo, bytes.to_vec())
+        });
+    }
+    drop(seen);
     let mut cpu = Cpu::new(Vec::new());
     load(&mut cpu, ctx);
     // The function is done when it returns to its caller.
@@ -79,8 +85,10 @@ fn run(ctx: &mut Ctx, entry: u32) {
             }
             _ => None,
         };
-        // Calls into translated code are charged by `Ctx::call`.
-        let calls = target.is_some_and(|t| !ctx.has_translation(t));
+        // Calls into translated code are charged by `Ctx::call`, except a
+        // call back to `entry` (recursion under `--interpret`), which stays
+        // here.
+        let calls = target.is_some_and(|t| t == entry || !ctx.has_translation(t));
         if let Err(e) = cpu.step_on(ctx.mem.bytes_mut()) {
             // The reference CPU knows plain RAM only: COP0 and device
             // registers go through the runtime, as translated code does.

@@ -251,6 +251,9 @@ fn written_code(ram: &[u8], rom: &[u8], entry: u32, addr: u32) -> Option<(u32, u
 /// Where `--ram-out` saves RAM at the end of the run.
 static RAM_OUT: Mutex<Option<PathBuf>> = Mutex::new(None);
 
+/// The address range `--interpret` runs in the reference interpreter.
+static INTERPRET: Mutex<Option<(u32, u32)>> = Mutex::new(None);
+
 static NAMES: Mutex<BTreeMap<u32, String>> = Mutex::new(BTreeMap::new());
 
 /// Text describing the state at a panic: recent calls and registers.
@@ -401,6 +404,24 @@ pub fn main_args(
                 }
             }
             "--ram-out" => *RAM_OUT.lock().unwrap() = Some(PathBuf::from(v)),
+            "--hash-out" => match std::fs::File::create(v) {
+                Ok(f) => os::set_hash_out(f),
+                Err(e) => {
+                    eprintln!("error: {v}: {e}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--interpret" => {
+                let range = v.split_once('-').and_then(|(a, b)| {
+                    let hex = |s: &str| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok();
+                    Some((hex(a)?, hex(b)?))
+                });
+                let Some(range) = range.filter(|(a, b)| a < b) else {
+                    eprintln!("error: --interpret needs a hex range like 80000400-80100000");
+                    return ExitCode::from(2);
+                };
+                *INTERPRET.lock().unwrap() = Some(range);
+            }
             "--save" => save = Some(PathBuf::from(v)),
             "--run" => run_config = Some(PathBuf::from(v)),
             "--frames" | "--capture-every" | "--capture-scale" => {
@@ -425,7 +446,7 @@ pub fn main_args(
     }
     let Some(rom_path) = rom_path else {
         eprintln!(
-            "usage: <game> <rom> [--symbols file]... [--config file] [--frames n] [--local dir] [--capture dir] [--capture-every n] [--capture-scale n] [--capture-wide] [--capture-between] [--wav file] [--input script] [--poke script] [--ram-out file] [--expansion] [--save file] [--window] [--run run.toml]"
+            "usage: <game> <rom> [--symbols file]... [--config file] [--frames n] [--local dir] [--capture dir] [--capture-every n] [--capture-scale n] [--capture-wide] [--capture-between] [--wav file] [--input script] [--poke script] [--ram-out file] [--hash-out file] [--interpret lo-hi] [--expansion] [--save file] [--window] [--run run.toml]"
         );
         return ExitCode::from(2);
     };
@@ -495,6 +516,7 @@ pub fn main_args(
     println!("replaced {} system routines", hooked.len());
     *NAMES.lock().unwrap() = names;
     let (snap_rom, snap_entry) = (rom_bytes.clone(), game.entry);
+    ctx.interpret = *INTERPRET.lock().unwrap();
     interp::install(
         &mut ctx,
         Box::new(move |ram, addr| written_code(ram, &snap_rom, snap_entry, addr)),
