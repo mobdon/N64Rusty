@@ -179,6 +179,56 @@ pub struct State {
     report: String,
     /// The page buffer of a flash save chip.
     flash_page: [u8; 128],
+    /// The audio interface's buffers, played on the guest clock.
+    ai: Ai,
+}
+
+/// The audio interface's two-buffer queue, timed by the guest clock, so a
+/// game that sizes its next buffer from what is left to play
+/// (`osAiGetLength`) makes as much sound as the time that passed.
+#[derive(Default)]
+struct Ai {
+    /// Samples per second (`osAiSetFrequency`).
+    rate: u64,
+    /// Queued buffers: when each ends (clock) and its length in bytes.
+    queue: Vec<(u64, u32)>,
+}
+
+impl Ai {
+    /// Queues `len` bytes at clock `now`, after what is already queued.
+    fn push(&mut self, now: u64, len: u32) {
+        self.retire(now);
+        if self.rate == 0 {
+            return;
+        }
+        let start = self.queue.last().map_or(now, |b| b.0.max(now));
+        let ticks = u64::from(len / 4) * COUNT_HZ / self.rate;
+        self.queue.push((start + ticks, len));
+    }
+
+    /// Bytes still to play of the buffer playing at `now`.
+    fn length(&mut self, now: u64) -> u32 {
+        self.retire(now);
+        let Some(&(end, len)) = self.queue.first() else {
+            return 0;
+        };
+        let left = (end - now) * self.rate / COUNT_HZ * 4;
+        (left.min(u64::from(len)) as u32) & !7
+    }
+
+    /// Status register: bit 31 when both buffers are taken, bit 30 busy.
+    fn status(&mut self, now: u64) -> u32 {
+        self.retire(now);
+        match self.queue.len() {
+            0 => 0,
+            1 => 1 << 30,
+            _ => 3 << 30,
+        }
+    }
+
+    fn retire(&mut self, now: u64) {
+        self.queue.retain(|b| b.0 > now);
+    }
 }
 
 struct Os {
@@ -453,8 +503,19 @@ fn post_event(c: &mut Ctx, st: &mut State, e: u32) {
     }
 }
 
+/// Sets the audio interface's length and status registers for games that
+/// read them straight (their own `osAiGetLength`), as of now.
+fn ai_regs(c: &mut Ctx, st: &mut State) {
+    let (len, status) = (st.ai.length(c.clock), st.ai.status(c.clock));
+    if let Some(io) = c.mem.io_mut() {
+        io.regs.insert(0x0450_0004, len);
+        io.regs.insert(0x0450_000C, status);
+    }
+}
+
 /// Delivers retraces and timers that are due by the current clock.
 fn deliver_due(c: &mut Ctx, st: &mut State) {
+    ai_regs(c, st);
     while c.clock >= st.next_vi {
         flash_ops(c, st);
         st.next_vi += TICKS_PER_FRAME;
@@ -696,6 +757,7 @@ pub fn run(
                 pif: [0; 64],
                 report: String::new(),
                 flash_page: [0xFF; 128],
+                ai: Ai::default(),
             }),
             cv: Condvar::new(),
             ctx: AtomicPtr::new(ctx as *mut Ctx),
@@ -1336,13 +1398,28 @@ fn post_event_at(c: &mut Ctx, st: &mut State, e: u32, at: u64, key: u32) {
 
 fn os_ai_set_next_buffer(c: &mut Ctx) {
     let (addr, len) = (arg(c, 0), arg(c, 1));
-    lock().devices.audio(c, addr, len);
+    let mut st = lock();
+    st.ai.push(c.clock, len);
+    ai_regs(c, &mut st);
+    st.devices.audio(c, addr, len);
     ret(c, 0);
+}
+
+fn os_ai_get_length(c: &mut Ctx) {
+    let n = lock().ai.length(c.clock);
+    ret(c, n);
+}
+
+fn os_ai_get_status(c: &mut Ctx) {
+    let n = lock().ai.status(c.clock);
+    ret(c, n);
 }
 
 fn os_ai_set_frequency(c: &mut Ctx) {
     let f = arg(c, 0);
-    lock().devices.audio_rate(f);
+    let mut st = lock();
+    st.ai.rate = u64::from(f);
+    st.devices.audio_rate(f);
     ret(c, f);
 }
 
@@ -1574,8 +1651,8 @@ pub const HOOKS: &[(&str, GuestFn)] = &[
     ("osSpGetStatus", ret_zero),
     ("osAiSetFrequency", os_ai_set_frequency),
     ("osAiSetNextBuffer", os_ai_set_next_buffer),
-    ("osAiGetLength", ret_zero),
-    ("osAiGetStatus", ret_zero),
+    ("osAiGetLength", os_ai_get_length),
+    ("osAiGetStatus", os_ai_get_status),
     ("osInvalDCache", nothing),
     ("osInvalICache", os_inval_icache),
     ("osWritebackDCache", nothing),
@@ -1604,6 +1681,28 @@ pub fn install<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audio_buffers_play_out_on_the_guest_clock() {
+        let mut ai = Ai {
+            rate: 32000,
+            ..Ai::default()
+        };
+        // Two frames of sound (533 samples, 4 bytes each) queued at once.
+        ai.push(0, 2132);
+        ai.push(0, 2132);
+        assert_eq!(ai.status(0), 3 << 30);
+        assert_eq!(ai.length(0), 2128);
+        // Halfway through the first buffer.
+        let half = 533 / 2 * COUNT_HZ / 32000;
+        assert!(ai.length(half).abs_diff(1064) <= 8);
+        // The first has played; the second is playing.
+        let one = 533 * COUNT_HZ / 32000 + 1;
+        assert_eq!(ai.status(one), 1 << 30);
+        assert!(ai.length(one) >= 2120);
+        // All played: empty and idle.
+        assert_eq!((ai.length(3 * one), ai.status(3 * one)), (0, 0));
+    }
 
     #[test]
     fn ram_hash_sees_one_changed_byte() {
