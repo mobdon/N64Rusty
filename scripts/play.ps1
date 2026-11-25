@@ -5,7 +5,8 @@
 # -Rom      your own ROM (any byte order), or a folder holding it.
 # -Symbols  symbol maps (`name = 0xADDR;` lines), passed to translate and to the game.
 # -Files    optional folder with per-game run files (config.toml, dma.txt,
-#           missing.txt, run.toml); each is copied into local\<sha256>\ if not there yet.
+#           missing.txt, run.toml); each is copied into local\<sha256>\ if not
+#           there yet, and new lines of dma.txt and missing.txt are added.
 # Extra arguments after these go to the game (for example -- --frames 3000).
 # Run it from anywhere; it works in the repository it lives in.
 
@@ -48,8 +49,17 @@ New-Item -ItemType Directory -Force $local | Out-Null
 if ($Files) {
     foreach ($n in "config.toml", "dma.txt", "missing.txt", "run.toml") {
         $p = Join-Path $Files $n
-        # Keep a local copy: runs append to dma.txt and missing.txt, and the next translate needs that.
-        if ((Test-Path -LiteralPath $p) -and -not (Test-Path -LiteralPath (Join-Path $local $n))) { Copy-Item -LiteralPath $p $local -Force; Write-Host "copied $n" }
+        $dst = Join-Path $local $n
+        if (-not (Test-Path -LiteralPath $p)) { continue }
+        if (-not (Test-Path -LiteralPath $dst)) { Copy-Item -LiteralPath $p $local -Force; Write-Host "copied $n"; continue }
+        # Runs append what they learn to dma.txt and missing.txt: keep those
+        # lines and add any new ones from the given folder.
+        if ($n -in "dma.txt", "missing.txt") {
+            $have = @{}
+            Get-Content -LiteralPath $dst | ForEach-Object { $have[$_] = $true }
+            $new = @(Get-Content -LiteralPath $p | Where-Object { -not $have.ContainsKey($_) })
+            if ($new.Count) { Add-Content -LiteralPath $dst $new; Write-Host "added $($new.Count) lines to $n" }
+        }
     }
 }
 
