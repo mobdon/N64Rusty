@@ -345,13 +345,22 @@ fn translate(args: &[String]) -> Result<(), String> {
     // length and pieces.
     let mut planned = 0;
     for (r, ram, len) in overlay_table(rom.bytes()) {
-        let in_boot = r.wrapping_sub(boot_rom) < BOOT_SEGMENT_SIZE as u32;
+        // The boot image read in place is already translated; the same
+        // bytes loaded somewhere else are an overlay like any other.
+        let boot_in_place = r.wrapping_sub(boot_rom) < BOOT_SEGMENT_SIZE as u32
+            && r.wrapping_sub(boot_rom) == ram.wrapping_sub(img.base);
         let seen = dma.iter().any(|d| {
             d[2] > 0
                 && r.wrapping_sub(d[0]) < d[2]
                 && r.wrapping_sub(d[0]) == ram.wrapping_sub(d[1])
         });
-        if !in_boot && !seen && !regions.contains_key(&(r, ram, len)) {
+        // The same test copies seen in runs get: laid out like code.
+        let end = (r as usize + len as usize).min(rom.bytes().len());
+        let code = function_starts(&Image {
+            base: ram,
+            bytes: &rom.bytes()[r as usize..end],
+        });
+        if !boot_in_place && !seen && !code.is_empty() && !regions.contains_key(&(r, ram, len)) {
             regions.insert((r, ram, len), Vec::new());
             planned += 1;
         }
@@ -389,6 +398,9 @@ fn translate(args: &[String]) -> Result<(), String> {
         // up, so also start at every function its layout shows.
         let mut entries = entries.clone();
         entries.extend(function_starts(&oimg));
+        // A scene's entry often sits first in its code and is a leaf with
+        // no frame to spot, so the start of the copy is a function too.
+        entries.push(ram);
         let d = discover(
             &oimg,
             &entries,

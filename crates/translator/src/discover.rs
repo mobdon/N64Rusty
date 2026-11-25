@@ -288,17 +288,11 @@ pub fn overlay_table(rom: &[u8]) -> Vec<(u32, u32, u32)> {
         .map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     let rom_len = (words.len() * 4) as u32;
-    let mut out = Vec::new();
+    let mut found: BTreeMap<(u32, u32), Vec<(u32, bool)>> = BTreeMap::new();
     let mut tried = HashSet::new();
-    let mut done = HashSet::new();
     for w in words.windows(5) {
         let (s, e) = (w[0], w[1]);
         if s < 0x1000 || s % 4 != 0 || e <= s || e > rom_len || e - s > 0x10_0000 {
-            continue;
-        }
-        // shortcut: one load address per ROM start (the first table entry
-        // wins), so code copied to two places needs a run to find the second.
-        if done.contains(&s) {
             continue;
         }
         let code = &words[s as usize / 4..e as usize / 4];
@@ -339,14 +333,27 @@ pub fn overlay_table(rom: &[u8]) -> Vec<(u32, u32, u32)> {
                 .map(|p| (p[0] << 16).wrapping_add(p[1] as u16 as i16 as u32))
                 .filter(|&v| v >= ram && v - ram < e - s)
                 .count();
-            if (good > 0 && good * 10 >= inside * 9) || (inside == 0 && own_pointers >= 2) {
+            let by_calls = good > 0 && good * 10 >= inside * 9;
+            if by_calls || (inside == 0 && own_pointers >= 2) {
+                found.entry((s, e)).or_default().push((ram, by_calls));
                 // The load address comes first; later words are often the
                 // same code's section addresses, which would also pass.
-                out.push((s, ram, e - s));
-                done.insert(s);
                 break;
             }
         }
+    }
+    // Every load address that the code's own calls confirm is kept (code
+    // can be loaded in two places). Only when none is confirmed that way
+    // does the first one confirmed by addresses alone count: a wrong
+    // address next to the right one still has addresses landing inside.
+    let mut out = Vec::new();
+    for ((s, e), rams) in found {
+        let mut rams: Vec<u32> = match rams.iter().any(|r| r.1) {
+            true => rams.iter().filter(|r| r.1).map(|r| r.0).collect(),
+            false => vec![rams[0].0],
+        };
+        rams.dedup();
+        out.extend(rams.into_iter().map(|ram| (s, ram, e - s)));
     }
     out
 }
@@ -750,5 +757,49 @@ mod tests {
         // The same code read at the wrong address calls into its middle.
         put(&mut rom, 0x1008, 0x8020_0004);
         assert_eq!(overlay_table(&rom), []);
+    }
+    #[test]
+    fn overlay_table_prefers_addresses_its_calls_confirm() {
+        // Two table entries for the code at ROM 0x2000..0x2040: first a wrong
+        // load address 0x8020_0020, then the right one 0x8020_0000. The code
+        // calls 0x8020_000c and builds 0x8020_0030 and 0x8020_0034.
+        let mut rom = vec![0u8; 0x3000];
+        let put = |rom: &mut Vec<u8>, at: usize, w: u32| {
+            rom[at..at + 4].copy_from_slice(&w.to_be_bytes())
+        };
+        for (k, w) in [
+            0x2000u32,
+            0x2040,
+            0x8020_0020,
+            0,
+            0,
+            0x2000,
+            0x2040,
+            0x8020_0000,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            put(&mut rom, 0x1000 + 4 * k, w);
+        }
+        let jal = 0x0C00_0000 | (0x8020_000c & 0x03FF_FFFF) >> 2;
+        let code = [
+            jal,
+            JR_RA,
+            NOP,
+            0x2402_0001,
+            JR_RA,
+            NOP,
+            0x3C04_8020,
+            0x2484_0030,
+            0x3C05_8020,
+            0x24A5_0034,
+            JR_RA,
+            NOP,
+        ];
+        for (k, w) in code.into_iter().enumerate() {
+            put(&mut rom, 0x2000 + 4 * k, w);
+        }
+        assert_eq!(overlay_table(&rom), [(0x2000, 0x8020_0000, 0x40)]);
     }
 }
