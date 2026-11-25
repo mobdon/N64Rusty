@@ -506,7 +506,14 @@ impl AudioRsp {
     /// last two outputs.
     ///
     /// State: the last 4 output samples.
-    fn pole_filter(&mut self, ram: &mut Memory, flags: u8, gain: u16, (inp, out, count): (u16, u16, u16), state: u32) {
+    fn pole_filter(
+        &mut self,
+        ram: &mut Memory,
+        flags: u8,
+        gain: u16,
+        (inp, out, count): (u16, u16, u16),
+        state: u32,
+    ) {
         let gain = gain as i64;
         let h1: Vec<i64> = self.book[0..8].iter().map(|&c| c as i64).collect();
         let h2: Vec<i64> = self.book[8..16].iter().map(|&c| c as i64).collect();

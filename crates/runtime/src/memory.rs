@@ -18,6 +18,74 @@ pub struct Io {
     pub rom: Arc<[u8]>,
     /// Other registers, by word address.
     pub regs: HashMap<u32, u32>,
+    /// A flash save chip, if the game turns out to have one.
+    pub flash: Flash,
+}
+
+/// Physical address of the flash chip's status (read) on the PI bus.
+const FLASH_STATUS: usize = 0x0800_0000;
+/// Physical address of the flash chip's command register (write).
+const FLASH_COMMAND: usize = 0x0801_0000;
+
+/// The command side of a flash save chip: games write commands to its
+/// register and read its status word. Commands that change the stored
+/// bytes are queued for the host, which keeps the bytes and does the DMA.
+#[derive(Clone, Default, Debug)]
+pub struct Flash {
+    /// Set by the first command: this game's save memory is flash.
+    pub used: bool,
+    /// Top byte of the last mode command: 0xD2 status, 0xE1 id,
+    /// 0xF0 read, 0xB4 fill the page buffer.
+    pub mode: u8,
+    status: u8,
+    erase: (usize, usize),
+    /// Changes to the stored bytes, in order, for the host to apply.
+    pub ops: Vec<FlashOp>,
+}
+
+/// A change to a flash chip's bytes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FlashOp {
+    /// Set `len` bytes from `offset` to 0xFF.
+    Erase { offset: usize, len: usize },
+    /// Write the page buffer (128 bytes) at `offset`.
+    Program { offset: usize },
+}
+
+impl Flash {
+    /// Size of the 1 Mbit chip.
+    pub const SIZE: usize = 0x2_0000;
+    /// Identity read back in id mode: the usual 1 Mbit part.
+    pub const ID: [u8; 8] = [0x11, 0x11, 0x80, 0x01, 0x00, 0xC2, 0x00, 0x1E];
+
+    fn command(&mut self, w: u32) {
+        self.used = true;
+        let page = (w & 0xFFFF) as usize * 128;
+        match w >> 24 {
+            0x4B => self.erase = (page, 128 * 128),
+            0x3C => self.erase = (0, Self::SIZE),
+            0x78 => {
+                let (offset, len) = self.erase;
+                self.ops.push(FlashOp::Erase { offset, len });
+                self.status = 0x08;
+            }
+            0xA5 => {
+                self.ops.push(FlashOp::Program { offset: page });
+                self.status = 0x04;
+            }
+            m => self.mode = m as u8,
+        }
+    }
+
+    /// The word read at the status address: the status, or the id.
+    fn word(&self, k: usize) -> u32 {
+        let w = if self.mode == 0xE1 {
+            Self::ID
+        } else {
+            [0x11, 0x11, 0x80, self.status, 0x11, 0x11, 0x80, self.status]
+        };
+        u32::from_be_bytes(w[k % 2 * 4..k % 2 * 4 + 4].try_into().unwrap())
+    }
 }
 
 /// Guest RAM, stored big-endian as on the console.
@@ -67,6 +135,10 @@ impl Memory {
             let a = p + k;
             *b = match a {
                 0x0400_0000..=0x0400_1FFF => io.sp_mem[a - 0x0400_0000],
+                FLASH_STATUS..=0x0800_0007 if io.flash.used => {
+                    let w = io.flash.word((a - FLASH_STATUS) / 4);
+                    (w >> (8 * (3 - (a & 3)))) as u8
+                }
                 0x1000_0000..=0x1FBF_FFFF => io.rom.get(a - 0x1000_0000).copied().unwrap_or(0),
                 _ => {
                     let w = io.regs.get(&(a as u32 & !3)).copied().unwrap_or(0);
@@ -82,6 +154,15 @@ impl Memory {
         let Some(io) = self.io.as_deref_mut().filter(|_| unmapped_ok(vaddr)) else {
             out_of_range(vaddr)
         };
+        if let Ok(w) = <[u8; 4]>::try_from(data) {
+            let w = u32::from_be_bytes(w);
+            match p {
+                FLASH_COMMAND => io.flash.command(w),
+                // Clearing the status.
+                FLASH_STATUS if io.flash.used => io.flash.status = 0,
+                _ => {}
+            }
+        }
         for (k, &b) in data.iter().enumerate() {
             let a = p + k;
             match a {
@@ -338,6 +419,7 @@ mod tests {
             sp_mem: vec![0; 0x2000],
             rom: Arc::from(vec![]),
             regs: HashMap::new(),
+            flash: Flash::default(),
         });
         m.read_u32(0x27BD_FFE8);
     }
@@ -350,8 +432,45 @@ mod tests {
             sp_mem: vec![0; 0x2000],
             rom: Arc::from(vec![]),
             regs: HashMap::new(),
+            flash: Flash::default(),
         });
         m.write_u32(0xC000_0040, 1);
+    }
+
+    #[test]
+    fn flash_commands_and_status() {
+        let mut m = ram();
+        m.set_io(Io {
+            sp_mem: vec![0; 0x2000],
+            rom: Arc::from(vec![]),
+            regs: HashMap::new(),
+            flash: Flash::default(),
+        });
+        // Before any command the domain is plain registers (SRAM games).
+        assert_eq!(m.read_u32(0xA800_0000), 0);
+        m.write_u32(0xA801_0000, 0xE100_0000);
+        assert_eq!(m.read_u32(0xA800_0000), 0x1111_8001);
+        assert_eq!(m.read_u32(0xA800_0004), 0x00C2_001E);
+        m.write_u32(0xA801_0000, 0x4B00_0080);
+        m.write_u32(0xA801_0000, 0x7800_0000);
+        m.write_u32(0xA801_0000, 0xD200_0000);
+        assert_eq!(m.read_u32(0xA800_0000), 0x1111_8008);
+        m.write_u32(0xA800_0000, 0);
+        assert_eq!(m.read_u32(0xA800_0000), 0x1111_8000);
+        m.write_u32(0xA801_0000, 0xB400_0000);
+        m.write_u32(0xA801_0000, 0xA500_0081);
+        let f = &m.io_mut().unwrap().flash;
+        assert_eq!(f.mode, 0xB4);
+        assert_eq!(
+            f.ops,
+            [
+                FlashOp::Erase {
+                    offset: 0x4000,
+                    len: 0x4000
+                },
+                FlashOp::Program { offset: 0x4080 }
+            ]
+        );
     }
 
     #[test]
@@ -361,6 +480,7 @@ mod tests {
             sp_mem: vec![0; 0x2000],
             rom: Arc::from(vec![1u8, 2, 3, 4]),
             regs: HashMap::new(),
+            flash: Flash::default(),
         });
         m.write_u32(0xA480_0018, 0x1234_5678);
         assert_eq!(m.read_u32(0xA480_0018), 0x1234_5678);

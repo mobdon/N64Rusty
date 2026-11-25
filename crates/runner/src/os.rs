@@ -20,7 +20,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 
-use n64rusty_runtime::{sx32, Ctx, GuestFn};
+use n64rusty_runtime::{sx32, Ctx, Flash, FlashOp, GuestFn};
 
 use crate::devices::{Devices, Pad};
 use crate::save::Save;
@@ -169,6 +169,8 @@ pub struct State {
     pub dma_log: Vec<(u32, u32, u32)>,
     /// Report text for a panic, filled by the panicking thread.
     report: String,
+    /// The page buffer of a flash save chip.
+    flash_page: [u8; 128],
 }
 
 struct Os {
@@ -336,6 +338,7 @@ fn post_event(c: &mut Ctx, st: &mut State, e: u32) {
 /// Delivers retraces and timers that are due by the current clock.
 fn deliver_due(c: &mut Ctx, st: &mut State) {
     while c.clock >= st.next_vi {
+        flash_ops(c, st);
         st.next_vi += TICKS_PER_FRAME;
         st.frames += 1;
         st.devices.retrace(st.frames, st.framebuffer);
@@ -563,6 +566,7 @@ pub fn run(
                 save,
                 dma_log: Vec::new(),
                 report: String::new(),
+                flash_page: [0xFF; 128],
             }),
             cv: Condvar::new(),
             ctx: AtomicPtr::new(ctx as *mut Ctx),
@@ -901,16 +905,48 @@ fn pi_dma(c: &mut Ctx, st: &mut State, dir: u32, dev: u32, ram: u32, len: u32) {
         }
         return;
     };
+    flash_ops(c, st);
     let at = (ram & 0x1FFF_FFFF) as usize;
     let n = len as usize;
-    let bytes = c.mem.bytes_mut();
-    if at + n > bytes.len() {
+    if at + n > c.mem.bytes().len() {
         panic!("save memory DMA at {ram:#010x}+{len:#x} runs past RAM");
     }
-    if dir == 0 {
-        st.save.read(off, &mut bytes[at..at + n]);
-    } else {
-        st.save.write(off, &bytes[at..at + n]);
+    let flash = c
+        .mem
+        .io_mut()
+        .map(|io| io.flash.mode)
+        .filter(|_| flash_used(c));
+    let bytes = c.mem.bytes_mut();
+    match (flash, dir) {
+        (None, 0) => st.save.read(off, &mut bytes[at..at + n]),
+        (None, _) => st.save.write(off, &bytes[at..at + n]),
+        // Flash reads its array at twice the bus offset.
+        (Some(0xF0), 0) => st.save.read(off * 2, &mut bytes[at..at + n]),
+        (Some(0xE1), 0) => {
+            for k in 0..n {
+                bytes[at + k] = Flash::ID[k % 8];
+            }
+        }
+        (Some(0xB4), 1) => {
+            let k = n.min(128);
+            st.flash_page[..k].copy_from_slice(&bytes[at..at + k]);
+        }
+        _ => {}
+    }
+}
+
+fn flash_used(c: &mut Ctx) -> bool {
+    c.mem.io_mut().is_some_and(|io| io.flash.used)
+}
+
+/// Applies the erases and page writes a flash chip was told to do.
+fn flash_ops(c: &mut Ctx, st: &mut State) {
+    let Some(io) = c.mem.io_mut() else { return };
+    for op in std::mem::take(&mut io.flash.ops) {
+        match op {
+            FlashOp::Erase { offset, len } => st.save.write(offset, &vec![0xFF; len]),
+            FlashOp::Program { offset } => st.save.write(offset, &st.flash_page.clone()),
+        }
     }
 }
 

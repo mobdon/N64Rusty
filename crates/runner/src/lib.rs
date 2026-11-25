@@ -362,6 +362,7 @@ pub fn main_with(game: Game, devices: Option<Box<dyn devices::Devices>>) -> Exit
         sp_mem: vec![0; 0x2000],
         rom: rom_bytes.clone(),
         regs: Default::default(),
+        flash: Default::default(),
     });
     let hooked = os::install(&mut ctx, &by_name);
     println!("replaced {} system routines", hooked.len());
