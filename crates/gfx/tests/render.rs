@@ -436,7 +436,10 @@ fn widescreen_stretches_a_row_of_background_tiles() {
             .fill_rect(160, 0, 319, 39)
             // Two pieces with a gap along the bottom, as a line of text.
             .fill_rect(0, 200, 99, 239)
-            .fill_rect(220, 200, 319, 239);
+            .fill_rect(220, 200, 319, 239)
+            // A menu grid row edge to edge but inset from the frame edges.
+            .fill_rect(25, 100, 159, 139)
+            .fill_rect(160, 100, 294, 139);
     });
     let f = frame(&mut ram, &dl);
     r.set_widescreen(true);
@@ -444,6 +447,8 @@ fn widescreen_stretches_a_row_of_background_tiles() {
     const GREEN: [u8; 4] = [0, 255, 0, 255];
     assert_px(&img, 2, 20, GREEN);
     assert_px(&img, 637, 20, GREEN);
-    // The gapped row keeps its 4:3 place.
+    // The gapped row and the inset grid keep their 4:3 place.
     assert_px(&img, 2, 330, BLUE);
+    assert_px(&img, 2, 180, BLUE);
+    assert_px(&img, 120, 180, GREEN);
 }

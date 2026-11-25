@@ -578,7 +578,10 @@ impl Renderer {
             let edge_to_edge = row.windows(2).all(|w| w[1].0 <= w[0].1 + 1.0);
             let x0 = row[0].0;
             let x1 = row.iter().map(|r| r.1).fold(f32::MIN, f32::max);
-            if edge_to_edge && spans_width(x0, x1, frame.width as f32) {
+            // Stricter than one rectangle: a menu grid (portraits from 25 to
+            // 295 of 320) must keep its place under its cursor.
+            let fw = frame.width as f32;
+            if edge_to_edge && x0 <= fw * 0.05 && x1 >= fw * 0.95 {
                 for (_, _, range) in row {
                     stretch[range].fill(Some((x0, x1)));
                 }

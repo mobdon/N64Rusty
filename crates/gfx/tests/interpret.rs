@@ -435,3 +435,20 @@ fn modify_vertex_overwrites_colour_texture_and_screen_position() {
     let d = f.draws().next().unwrap();
     assert_eq!(d.state.scissor, Some([8.0, 16.0, 300.0, 200.0]));
 }
+
+#[test]
+fn insert_matrix_edits_the_combined_matrix() {
+    let mut ram = Ram::default();
+    let verts = ram.vertices(&[v(0, 0, 0, [255; 4]); 3]);
+    let mut dl = Dl::default();
+    setup(&mut ram, &mut dl);
+    // Integer parts of elements 0 and 1 become 2 and 0; fractions stay.
+    dl.0.extend([0xDB00_0000, 0x0002_0000]);
+    dl.vtx(verts, 3, 0).tri(0, 1, 2).end();
+    let addr = ram.dl(&dl);
+    let f = run(&ram, addr);
+    assert!(f.warnings.is_empty(), "{:?}", f.warnings);
+    let t = &f.transforms[f.vertices[0].transform as usize];
+    assert!((t.modelview[0][0] - 2.01).abs() < 1e-3, "{:?}", t.modelview);
+    assert_eq!(t.projection, n64rusty_gfx::IDENTITY);
+}
