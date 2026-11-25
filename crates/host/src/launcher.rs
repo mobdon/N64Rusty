@@ -383,7 +383,7 @@ pub fn message(head: &str, body: &str) -> bool {
         return false;
     };
     let mut app = Screens::new(ui, true);
-    event_loop.run_app(&mut app).is_ok() && app.window.is_some()
+    event_loop.run_app(&mut app).is_ok() && app.surface.is_some()
 }
 
 fn run(ui: Ui) -> Option<PathBuf> {
