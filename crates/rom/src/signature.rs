@@ -81,6 +81,11 @@ pub fn make(
         while len > 0 && code[at + len - 1] == 0 {
             len -= 1;
         }
+        // Up to the first return: a sparse map's next name can be several
+        // routines on, and a prefix still names the routine.
+        if let Some(r) = code[at..at + len].iter().position(|&w| w == 0x03E0_0008) {
+            len = len.min(r + 2);
+        }
         if len < MIN_LEN {
             continue;
         }
