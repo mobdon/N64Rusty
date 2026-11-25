@@ -658,6 +658,24 @@ fn translate(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// The word index just past the target of the branch `w` at index `k`, or 0
+/// if `w` is not a branch: code up to there is still the same routine.
+fn branch_reach(w: u32, k: usize) -> usize {
+    let branch = match w >> 26 {
+        // REGIMM: only BLTZ/BGEZ and their likely and linking forms; the
+        // rest (TGEI and friends) are traps with no target.
+        1 => matches!((w >> 16) & 31, 0..=3 | 0x10..=0x13),
+        4..=7 | 0x14..=0x17 => true,
+        0x11 => (w >> 21) & 31 == 8, // BC1F/BC1T and their likely forms
+        _ => false,
+    };
+    if !branch {
+        return 0;
+    }
+    let target = k as i64 + 1 + i64::from(w as u16 as i16);
+    target.max(0) as usize + 1
+}
+
 /// Finds each reference routine `(addr, name, len in words)` in `target`
 /// (the words of a boot segment loaded at `base`), comparing code with
 /// [`masked`]. A routine found exactly once is named; so is one that a named
@@ -792,12 +810,15 @@ fn match_routines(args: &[String]) -> Result<(), String> {
             .unwrap_or(ref_end);
         let at = ((a - ref_base) / 4) as usize;
         let mut len = ((next - a) / 4) as usize;
-        // Names can be sparse: a routine also ends at the first return
-        // followed by the start of another.
+        // Names can be sparse: a routine also ends at its last return, the
+        // first one followed by the start of another routine that no branch
+        // before it jumps past (early returns are skipped).
+        let mut reach = 0;
         if let Some(k) = (0..len).find(|&k| {
-            // The word after the delay slot must exist to start a routine.
+            reach = reach.max(branch_reach(ref_words[at + k], k));
             at + k + 2 < ref_words.len()
                 && ref_words[at + k] == 0x03E0_0008
+                && k + 2 > reach
                 && starts_function(&ref_words, at + k + 2)
         }) {
             len = len.min(k + 2);
@@ -860,6 +881,29 @@ mod tests {
         // f found twice: neither is named.
         target.extend([0x3C04_8002, jal(B + 32), 0x2484_0020, 0x03E0_0008]);
         assert!(find_routines(&reference, B, &routines, &target, B).is_empty());
+    }
+
+    #[test]
+    fn routine_ends_after_an_early_return() {
+        // beq zero,zero,+3 ; nop ; jr ra ; nop ; jr ra ; nop | next routine
+        let w = [
+            0x1000_0003u32,
+            0,
+            0x03E0_0008,
+            0,
+            0x03E0_0008,
+            0,
+            0x27BD_FFF8,
+        ];
+        let mut reach = 0;
+        let end = (0..w.len()).find(|&k| {
+            reach = reach.max(branch_reach(w[k], k));
+            k + 2 < w.len() && w[k] == 0x03E0_0008 && k + 2 > reach && starts_function(&w, k + 2)
+        });
+        assert_eq!(end, Some(4));
+        // A trap (TEQI) carries no target: it does not reach past a return.
+        assert_eq!(branch_reach(0x048C_0010, 0), 0);
+        assert_eq!(branch_reach(0x0401_0003, 0), 5); // BGEZ +3
     }
 
     #[test]
