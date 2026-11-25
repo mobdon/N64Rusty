@@ -453,3 +453,63 @@ fn insert_matrix_edits_the_combined_matrix() {
     assert!((t.modelview[0][0] - 2.01).abs() < 1e-3, "{:?}", t.modelview);
     assert_eq!(t.projection, n64rusty_gfx::IDENTITY);
 }
+
+/// Hands back one colour for every pixel, and notes what it was asked for.
+struct Solid {
+    asked: Vec<(u32, u32, u32)>,
+}
+
+impl n64rusty_gfx::Readback for Solid {
+    fn read(&mut self, _: &Frame, image: u32, width: u32, height: u32) -> Option<Vec<u8>> {
+        self.asked.push((image, width, height));
+        Some([255, 0, 0, 255].repeat((width * height) as usize))
+    }
+}
+
+#[test]
+fn fills_and_copies_land_in_ram_and_drawn_images_are_read_back() {
+    const CYCLE_COPY: u32 = 2 << 20;
+    let mut ram = Ram::default();
+    // 4x4 RGBA16 texture: every texel opaque green.
+    let tex = ram.put(&[0x07, 0xC1].repeat(16));
+    let small = ram.put(&[0; 8 * 6 * 2]); // an 8-wide 16-bit image
+    let drawn = ram.put(&[0; 8 * 6 * 2]);
+    let mut dl = Dl::default();
+    setup(&mut ram, &mut dl);
+    dl.cimg(small, 8)
+        .other_modes(CYCLE_FILL, 0)
+        .fill_color(0xF801_F801) // red
+        .fill_rect(0, 0, 7, 0)
+        .other_modes(CYCLE_COPY, 0)
+        .timg(0, 2, 1, tex)
+        .tile(0, 2, 0, 0, 7)
+        .load_block(7, 16)
+        .tile(0, 2, 1, 0, 0)
+        .tile_size(0, 4, 4)
+        // Copy mode steps 4 texels per clock: 4 << 10 is one per pixel.
+        .tex_rect(0, [0, 1, 3, 1], [0, 0], [4 << 10, 1 << 10])
+        // A 1-cycle draw goes to the GPU; loading from that image reads it back.
+        .cimg(drawn, 8)
+        .other_modes(CYCLE_1, 0)
+        .tex_rect(0, [0, 0, 8, 6], [0, 0], [1 << 10, 1 << 10])
+        .timg(0, 2, 8, drawn)
+        .load_block(7, 16)
+        .end();
+    let addr = ram.dl(&dl);
+    let mut it = Interpreter::new();
+    let mut rb = Solid { asked: Vec::new() };
+    it.run_readback(&mut ram.bytes, addr, &mut rb).unwrap();
+    let px = |img: u32, i: usize| {
+        u16::from_be_bytes([
+            ram.bytes[img as usize + 2 * i],
+            ram.bytes[img as usize + 2 * i + 1],
+        ])
+    };
+    assert_eq!(px(small, 0), 0xF801);
+    assert_eq!(px(small, 7), 0xF801);
+    assert_eq!(px(small, 8), 0x07C1, "copied texel");
+    assert_eq!(px(small, 11), 0x07C1);
+    assert_eq!(px(small, 12), 0);
+    assert_eq!(rb.asked, [(drawn, 8, 6)]);
+    assert_eq!(px(drawn, 47), 0xF801, "read back red");
+}

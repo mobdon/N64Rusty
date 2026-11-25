@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use n64rusty_audio::{AudioRsp, Wav};
-use n64rusty_gfx::{write_png, Frame, Interpreter, Renderer};
+use n64rusty_gfx::{write_png, Frame, Interpreter, Readback, Renderer};
 use n64rusty_host::script::Player;
 use n64rusty_runtime::Ctx;
 
@@ -196,6 +196,41 @@ impl Media {
     }
 }
 
+/// Draws colour images the game reads back, on the off-screen renderer
+/// (made on first use), at the game's own resolution.
+struct GpuReadback<'a> {
+    renderer: &'a mut Option<Renderer>,
+    failed: &'a mut bool,
+    /// Widescreen setting of saved frames, restored after each read.
+    wide: bool,
+}
+
+impl Readback for GpuReadback<'_> {
+    fn read(&mut self, frame: &Frame, image: u32, width: u32, height: u32) -> Option<Vec<u8>> {
+        if self.renderer.is_none() && !*self.failed {
+            match Renderer::new() {
+                Ok(r) => *self.renderer = Some(r),
+                Err(e) => {
+                    eprintln!(
+                        "warning: no off-screen renderer, drawn images are not read back: {e}"
+                    );
+                    *self.failed = true;
+                }
+            }
+        }
+        let r = self.renderer.as_mut()?;
+        let f = Frame {
+            width,
+            color_image: image,
+            ..frame.clone()
+        };
+        r.set_widescreen(false);
+        let img = r.render(&f, width, height);
+        r.set_widescreen(self.wide);
+        img.ok().map(|i| i.rgba)
+    }
+}
+
 /// The message of a caught panic.
 fn panic_text(p: &(dyn std::any::Any + Send)) -> String {
     p.downcast_ref::<String>()
@@ -234,8 +269,14 @@ impl Devices for Media {
         let dl = ctx.mem.read_u32(task + TASK_DATA_PTR);
         // A panic inside the interpreter counts as an error for that task;
         // the game keeps running.
-        let (gfx, bytes) = (&mut self.gfx, ctx.mem.bytes());
-        let error = match panic::catch_unwind(AssertUnwindSafe(|| gfx.run(bytes, dl))) {
+        let (gfx, bytes) = (&mut self.gfx, ctx.mem.bytes_mut());
+        let mut rb = GpuReadback {
+            renderer: &mut self.renderer,
+            failed: &mut self.renderer_failed,
+            wide: self.wide,
+        };
+        let run = || gfx.run_readback(bytes, dl, &mut rb);
+        let error = match panic::catch_unwind(AssertUnwindSafe(run)) {
             Ok(Ok(())) => None,
             Ok(Err(e)) => Some(e.to_string()),
             Err(p) => Some(format!("interpreter panicked: {}", panic_text(&*p))),

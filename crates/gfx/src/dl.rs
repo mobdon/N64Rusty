@@ -99,6 +99,44 @@ pub struct Interpreter {
     /// switched to with `G_LOAD_UCODE`, whose low opcodes differ.
     ucode_2d: bool,
     frame: Frame,
+    /// Colour images (address, width, size code) drawn on the GPU since
+    /// they were last read back into RAM.
+    drawn: Vec<(u32, u32, u32)>,
+    /// The frame before, for reading back an image drawn there and read
+    /// after the frame was handed over.
+    prev: Frame,
+}
+
+/// Draws what was recorded into one colour image and hands back its
+/// pixels, for games that read what they drew (a texture loaded from the
+/// frame buffer, an image drawn to show inside another).
+pub trait Readback {
+    /// RGBA8 of `image` (`width` x `height`, top row first), drawn from the
+    /// draws in `frame` aimed at it; `None` if it cannot be drawn.
+    fn read(&mut self, frame: &Frame, image: u32, width: u32, height: u32) -> Option<Vec<u8>>;
+}
+
+/// RAM as a display list runs over it: read-only, or writable when
+/// drawing results go back into it.
+enum Ram<'a> {
+    Shared(&'a [u8]),
+    Mut(&'a mut [u8]),
+}
+
+impl Ram<'_> {
+    fn r(&self) -> &[u8] {
+        match self {
+            Ram::Shared(b) => b,
+            Ram::Mut(b) => b,
+        }
+    }
+
+    fn w(&mut self) -> Option<&mut [u8]> {
+        match self {
+            Ram::Shared(_) => None,
+            Ram::Mut(b) => Some(b),
+        }
+    }
 }
 
 impl Default for Interpreter {
@@ -153,6 +191,8 @@ impl Interpreter {
                 width: 320,
                 ..Frame::default()
             },
+            drawn: Vec::new(),
+            prev: Frame::default(),
         }
     }
 
@@ -165,7 +205,11 @@ impl Interpreter {
             color_image: self.frame.color_image,
             ..Frame::default()
         };
-        std::mem::replace(&mut self.frame, next)
+        let f = std::mem::replace(&mut self.frame, next);
+        if !self.drawn.is_empty() {
+            self.prev = f.clone();
+        }
+        f
     }
 
     /// The frame being recorded.
@@ -176,18 +220,40 @@ impl Interpreter {
     /// Follow the display list at `addr` (a segmented or physical address)
     /// in `rdram`, the big-endian guest RAM.
     pub fn run(&mut self, rdram: &[u8], addr: u32) -> Result<(), GfxError> {
+        self.exec(Ram::Shared(rdram), addr, None)
+    }
+
+    /// Like [`Interpreter::run`], and what the RDP would leave in RAM is
+    /// put there: fill and copy rectangles are done in place, and an image
+    /// drawn on the GPU is read back through `rb` before a texture load
+    /// reads it.
+    pub fn run_readback(
+        &mut self,
+        rdram: &mut [u8],
+        addr: u32,
+        rb: &mut dyn Readback,
+    ) -> Result<(), GfxError> {
+        self.exec(Ram::Mut(rdram), addr, Some(rb))
+    }
+
+    fn exec(
+        &mut self,
+        mut ram: Ram,
+        addr: u32,
+        mut rb: Option<&mut dyn Readback>,
+    ) -> Result<(), GfxError> {
         let mut pc = self.phys(addr);
         let mut stack: Vec<u32> = Vec::new();
         // Every task starts on its own (3D) microcode.
         self.ucode_2d = false;
         for _ in 0..MAX_COMMANDS {
-            let w0 = rd32(rdram, pc, pc)?;
-            let w1 = rd32(rdram, pc + 4, pc)?;
+            let w0 = rd32(ram.r(), pc, pc)?;
+            let w1 = rd32(ram.r(), pc + 4, pc)?;
             let at = pc;
             pc += 8;
             if self.ucode_2d && (w0 >> 24 <= 0x0B || matches!(w0 >> 24, 0xDA | 0xDC)) {
                 match w0 >> 24 {
-                    0x0A => self.bg_copy(rdram, w1, at)?,
+                    0x0A => self.bg_copy(ram.r(), w1, at)?,
                     op => self.warn(format!("unknown 2D command {op:#04x} at {at:#010x}")),
                 }
                 continue;
@@ -197,7 +263,7 @@ impl Interpreter {
                 // 2D one and back, so each load toggles; track the loaded
                 // code's address if a game loads a third microcode.
                 0xDD => self.ucode_2d = !self.ucode_2d,
-                0x01 => self.vertices(rdram, w0, w1, at)?,
+                0x01 => self.vertices(ram.r(), w0, w1, at)?,
                 0x02 => self.modify_vertex(w0, w1, at),
                 0xED => {
                     let fixed = |v: u32, sh: u32| ((v >> sh) & 0xFFF) as f32 / 4.0;
@@ -231,9 +297,9 @@ impl Interpreter {
                     self.modelview.truncate(keep);
                 }
                 0xD9 => self.geometry = (self.geometry & (w0 & 0x00FF_FFFF)) | w1,
-                0xDA => self.matrix(rdram, w0, w1, at)?,
+                0xDA => self.matrix(ram.r(), w0, w1, at)?,
                 0xDB => self.moveword(w0, w1, at),
-                0xDC => self.movemem(rdram, w0, w1, at)?,
+                0xDC => self.movemem(ram.r(), w0, w1, at)?,
                 0xDE => {
                     if (w0 >> 16) & 0xFF == 0 {
                         if stack.len() >= DL_STACK {
@@ -261,22 +327,32 @@ impl Interpreter {
                     *m = (*m & !mask) | (w1 & mask);
                 }
                 0xE4 | 0xE5 => {
-                    let h1 = rd32(rdram, pc + 4, at)?;
-                    let h2 = rd32(rdram, pc + 12, at)?;
+                    let h1 = rd32(ram.r(), pc + 4, at)?;
+                    let h2 = rd32(ram.r(), pc + 12, at)?;
                     pc += 16;
-                    self.texture_rect(w0, w1, h1, h2, w0 >> 24 == 0xE5);
+                    self.texture_rect(w0, w1, h1, h2, w0 >> 24 == 0xE5, ram.w());
                 }
                 0xEE => self.prim_depth = ((w1 >> 16) & 0x7FFF) as f32 / 32767.0, // 15-bit depth
                 0xEF => {
                     self.state.other_h = w0 & 0x00FF_FFFF;
                     self.state.other_l = w1;
                 }
-                0xF0 => self.tmem.load_tlut(rdram, w1),
+                0xF0 | 0xF3 | 0xF4 if rb.is_some() => {
+                    if let (Some(rb), Some(m)) = (rb.as_deref_mut(), ram.w()) {
+                        self.read_back(m, rb);
+                    }
+                    match w0 >> 24 {
+                        0xF0 => self.tmem.load_tlut(ram.r(), w1),
+                        0xF3 => self.tmem.load_block(ram.r(), w0, w1),
+                        _ => self.tmem.load_tile(ram.r(), w0, w1),
+                    }
+                }
+                0xF0 => self.tmem.load_tlut(ram.r(), w1),
                 0xF2 => self.tmem.set_tile_size(w0, w1),
-                0xF3 => self.tmem.load_block(rdram, w0, w1),
-                0xF4 => self.tmem.load_tile(rdram, w0, w1),
+                0xF3 => self.tmem.load_block(ram.r(), w0, w1),
+                0xF4 => self.tmem.load_tile(ram.r(), w0, w1),
                 0xF5 => self.tmem.set_tile(w0, w1),
-                0xF6 => self.fill_rect(w0, w1),
+                0xF6 => self.fill_rect(w0, w1, ram.w()),
                 0xF7 => self.fill_color = w1,
                 0xF8 => self.state.fog = rgba(w1),
                 0xF9 => self.state.blend = rgba(w1),
@@ -556,6 +632,9 @@ impl Interpreter {
     }
 
     fn push(&mut self, state: RenderState, verts: &[Vertex]) {
+        if !self.drawn.iter().any(|d| d.0 == self.cimg.0) {
+            self.drawn.push(self.cimg);
+        }
         let first = self.frame.vertices.len() as u32;
         self.frame.vertices.extend_from_slice(verts);
         if let Some(Command::Draw(d)) = self.frame.commands.last_mut() {
@@ -569,6 +648,39 @@ impl Interpreter {
             count: verts.len() as u32,
             state,
         }));
+    }
+
+    /// Reads back a colour image drawn on the GPU that the coming texture
+    /// load starts inside.
+    fn read_back(&mut self, ram: &mut [u8], rb: &mut dyn Readback) {
+        let src = self.tmem.image().0;
+        let Some(k) = self.drawn.iter().position(|&(a, w, siz)| {
+            let len = w * image_height(w) * if siz == 3 { 4 } else { 2 };
+            src >= a && src < a + len
+        }) else {
+            return;
+        };
+        let (a, w, siz) = self.drawn.remove(k);
+        let drew_here = self.frame.draws().any(|d| d.state.color_image == a);
+        let frame = if drew_here { &self.frame } else { &self.prev };
+        let Some(px) = rb.read(frame, a, w, image_height(w)) else {
+            return;
+        };
+        for (i, p) in px.as_chunks::<4>().0.iter().enumerate() {
+            put_pixel(ram, a, siz, i as u32, *p);
+        }
+    }
+
+    /// Pixels (`x0..x1`, `y0..y1`) of the colour image inside the scissor.
+    fn cpu_area(&self, x0: f32, y0: f32, x1: f32, y1: f32) -> (u32, u32, u32, u32) {
+        let [sx0, sy0, sx1, sy1] = self.state.scissor.unwrap_or([0.0, 0.0, f32::MAX, f32::MAX]);
+        let w = self.cimg.1 as f32;
+        (
+            x0.max(sx0).max(0.0) as u32,
+            y0.max(sy0).max(0.0) as u32,
+            x1.min(sx1).min(w).max(0.0) as u32,
+            y1.min(sy1).max(0.0) as u32,
+        )
     }
 
     /// The transform that maps framebuffer pixels straight to the screen.
@@ -621,10 +733,31 @@ impl Interpreter {
         self.push(state, &[a, c, b, b, c, d]);
     }
 
-    fn fill_rect(&mut self, w0: u32, w1: u32) {
+    fn fill_rect(&mut self, w0: u32, w1: u32, ram: Option<&mut [u8]>) {
         let fixed = |v: u32, sh: u32| ((v >> sh) & 0xFFF) as f32 / 4.0;
         let (x1, y1, x0, y0) = (fixed(w0, 12), fixed(w0, 0), fixed(w1, 12), fixed(w1, 0));
         let fill = self.cycle_type() == 3;
+        if let (true, Some(ram)) = (fill, ram) {
+            // The fill colour, as the RDP writes it: two 16-bit pixels or
+            // one 32-bit pixel per word.
+            let (ax, ay, bx, by) = self.cpu_area(x0, y0, x1 + 1.0, y1 + 1.0);
+            let (a, w, siz) = self.cimg;
+            for y in ay..by {
+                for x in ax..bx {
+                    let i = y * w + x;
+                    if siz == 3 {
+                        put_raw(ram, a + 4 * i, &self.fill_color.to_be_bytes());
+                    } else {
+                        let c = if x % 2 == 0 {
+                            self.fill_color >> 16
+                        } else {
+                            self.fill_color
+                        };
+                        put_raw(ram, a + 2 * i, &(c as u16).to_be_bytes());
+                    }
+                }
+            }
+        }
         if fill && self.cimg.0 == self.zimg {
             self.frame.commands.push(Command::ClearDepth);
             return;
@@ -702,7 +835,15 @@ impl Interpreter {
         Ok(())
     }
 
-    fn texture_rect(&mut self, w0: u32, w1: u32, h1: u32, h2: u32, flip: bool) {
+    fn texture_rect(
+        &mut self,
+        w0: u32,
+        w1: u32,
+        h1: u32,
+        h2: u32,
+        flip: bool,
+        ram: Option<&mut [u8]>,
+    ) {
         let fixed = |v: u32, sh: u32| ((v >> sh) & 0xFFF) as f32 / 4.0;
         let (x1, y1, x0, y0) = (fixed(w0, 12), fixed(w0, 0), fixed(w1, 12), fixed(w1, 0));
         let tile = ((w1 >> 24) & 7) as usize;
@@ -716,6 +857,23 @@ impl Interpreter {
             dsdx /= 4.0; // copy mode steps four pixels per clock
         }
         let (x1, y1) = (x1 + extra, y1 + extra);
+        if let (true, false, Some(ram)) = (copy, flip, ram) {
+            // Copy mode moves texels straight into the colour image.
+            let tlut = (self.state.other_h >> 14) & 3;
+            let alpha_test = self.state.other_l & 3 != 0;
+            let (ax, ay, bx, by) = self.cpu_area(x0, y0, x1, y1);
+            let (a, w, siz) = self.cimg;
+            for y in ay..by {
+                for x in ax..bx {
+                    let ss = s + (x as f32 - x0) * dsdx;
+                    let tt = t + (y as f32 - y0) * dtdy;
+                    let c = self.tmem.texel_at(tile, ss, tt, tlut);
+                    if !(alpha_test && c[3] == 0) {
+                        put_pixel(ram, a, siz, y * w + x, c);
+                    }
+                }
+            }
+        }
         let (w, h) = if flip {
             (y1 - y0, x1 - x0)
         } else {
@@ -759,6 +917,31 @@ fn normalize(v: [f32; 3]) -> [f32; 3] {
 
 fn rgba(w: u32) -> [f32; 4] {
     w.to_be_bytes().map(|c| c as f32 / 255.0)
+}
+
+/// Height of a colour image of `width`, which the RDP does not know: the
+/// usual 4:3 shape.
+fn image_height(width: u32) -> u32 {
+    (width * 3 / 4).max(1)
+}
+
+/// Writes `bytes` at physical `at`, if it is in RAM.
+fn put_raw(ram: &mut [u8], at: u32, bytes: &[u8]) {
+    if let Some(d) = ram.get_mut(at as usize..at as usize + bytes.len()) {
+        d.copy_from_slice(bytes);
+    }
+}
+
+/// Writes RGBA8 `c` as pixel `i` of the colour image at `image` with pixel
+/// size code `siz` (3: 32-bit, else 16-bit RGBA5551).
+fn put_pixel(ram: &mut [u8], image: u32, siz: u32, i: u32, c: [u8; 4]) {
+    if siz == 3 {
+        put_raw(ram, image + 4 * i, &c);
+    } else {
+        let ch = |v: u8| u16::from(v >> 3);
+        let p = ch(c[0]) << 11 | ch(c[1]) << 6 | ch(c[2]) << 1 | u16::from(c[3] >= 128);
+        put_raw(ram, image + 2 * i, &p.to_be_bytes());
+    }
 }
 
 pub(crate) fn rgba5551(c: u16) -> [f32; 4] {
