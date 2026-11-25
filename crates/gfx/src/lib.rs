@@ -109,6 +109,9 @@ pub struct RenderState {
     pub textures: [Option<u32>; 2],
     /// Screen-space rectangle (fill or texture rectangle), not a triangle.
     pub rect: bool,
+    /// A texture rectangle stepping one texel per pixel: filtering would
+    /// only ever land on texel corners, so it reads single texels.
+    pub texel_exact: bool,
     /// Address of the colour image this was drawn into.
     pub color_image: u32,
     /// Scissor box in framebuffer pixels (x0, y0, x1, y1), if one was set.

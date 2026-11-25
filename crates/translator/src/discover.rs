@@ -617,7 +617,20 @@ mod tests {
         // f: jr ra ; nop | g (only a hint): jal past ; nop ; jr ra ; nop |
         // past the code: bytes loaded over later, which here call into g.
         let past = BASE + 32;
-        let bytes = image(&[JR_RA, NOP, jal(past), NOP, JR_RA, NOP, 0, 0, jal(BASE + 12), NOP, JR_RA, NOP]);
+        let bytes = image(&[
+            JR_RA,
+            NOP,
+            jal(past),
+            NOP,
+            JR_RA,
+            NOP,
+            0,
+            0,
+            jal(BASE + 12),
+            NOP,
+            JR_RA,
+            NOP,
+        ]);
         let img = Image {
             base: BASE,
             bytes: &bytes,

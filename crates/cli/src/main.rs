@@ -598,7 +598,11 @@ fn find_routines(
         let Some(c) = code(*addr, *len).filter(|_| *len >= 3) else {
             continue;
         };
-        let hits: Vec<usize> = index.get(&c[..3]).into_iter().flatten().copied()
+        let hits: Vec<usize> = index
+            .get(&c[..3])
+            .into_iter()
+            .flatten()
+            .copied()
             .filter(|&i| mtgt.get(i..i + len) == Some(c))
             .collect();
         if let [i] = hits[..] {
@@ -609,14 +613,22 @@ fn find_routines(
     let mut work: Vec<usize> = found.keys().copied().collect();
     while let Some(k) = work.pop() {
         let (addr, _, len) = &routines[k];
-        let (ra, ta) = (((addr - ref_base) / 4) as usize, ((found[&k] - base) / 4) as usize);
+        let (ra, ta) = (
+            ((addr - ref_base) / 4) as usize,
+            ((found[&k] - base) / 4) as usize,
+        );
         for j in 0..*len {
             let (rw, tw) = (reference[ra + j], target.get(ta + j).copied().unwrap_or(0));
             if rw >> 26 != 3 || tw >> 26 != 3 {
                 continue;
             }
-            let (rt, tt) = (0x8000_0000 | (rw & 0x03FF_FFFF) << 2, 0x8000_0000 | (tw & 0x03FF_FFFF) << 2);
-            let Some(&callee) = by_addr.get(&rt) else { continue };
+            let (rt, tt) = (
+                0x8000_0000 | (rw & 0x03FF_FFFF) << 2,
+                0x8000_0000 | (tw & 0x03FF_FFFF) << 2,
+            );
+            let Some(&callee) = by_addr.get(&rt) else {
+                continue;
+            };
             let (_, _, clen) = &routines[callee];
             if found.contains_key(&callee) || *clen == 0 {
                 continue;
@@ -655,7 +667,10 @@ fn match_routines(args: &[String]) -> Result<(), String> {
     };
     let (reference, rom) = (load(ref_path)?, load(path)?);
     let ref_words = words(reference.boot_segment());
-    let (ref_base, ref_end) = (reference.entry(), reference.entry() + 4 * ref_words.len() as u32);
+    let (ref_base, ref_end) = (
+        reference.entry(),
+        reference.entry() + 4 * ref_words.len() as u32,
+    );
     let mut syms = Vec::new();
     for s in &symbols {
         syms.extend(read_symbols(s)?);
@@ -665,7 +680,11 @@ fn match_routines(args: &[String]) -> Result<(), String> {
     // A routine runs to the next named address; padding at its end is not code.
     let mut routines = Vec::new();
     for (i, (a, n)) in syms.iter().enumerate() {
-        let next = syms[i + 1..].iter().map(|s| s.0).find(|&b| b > *a).unwrap_or(ref_end);
+        let next = syms[i + 1..]
+            .iter()
+            .map(|s| s.0)
+            .find(|&b| b > *a)
+            .unwrap_or(ref_end);
         let at = ((a - ref_base) / 4) as usize;
         let mut len = ((next - a) / 4) as usize;
         while len > 0 && ref_words[at + len - 1] == 0 {
@@ -673,8 +692,18 @@ fn match_routines(args: &[String]) -> Result<(), String> {
         }
         routines.push((*a, n.clone(), len.min(0x1000)));
     }
-    let found = find_routines(&ref_words, ref_base, &routines, &words(rom.boot_segment()), rom.entry());
-    eprintln!("{} of {} reference routines found", found.len(), routines.len());
+    let found = find_routines(
+        &ref_words,
+        ref_base,
+        &routines,
+        &words(rom.boot_segment()),
+        rom.entry(),
+    );
+    eprintln!(
+        "{} of {} reference routines found",
+        found.len(),
+        routines.len()
+    );
     for (a, n) in found {
         println!("{n} = {a:#010X};");
     }
@@ -699,7 +728,10 @@ mod tests {
         target.extend([0x3C04_8002, jal(B + 32), 0x2484_0020, 0x03E0_0008]);
         target.extend([0x8C82_0040, 0x03E0_0008, 0]);
         let r = find_routines(&reference, B, &routines, &target, B);
-        assert_eq!(r, vec![(B + 16, "f".to_string()), (B + 32, "g".to_string())]);
+        assert_eq!(
+            r,
+            vec![(B + 16, "f".to_string()), (B + 32, "g".to_string())]
+        );
         // f found twice: neither is named.
         target.extend([0x3C04_8002, jal(B + 32), 0x2484_0020, 0x03E0_0008]);
         assert!(find_routines(&reference, B, &routines, &target, B).is_empty());

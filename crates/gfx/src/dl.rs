@@ -130,6 +130,7 @@ impl Interpreter {
                 fog: [0.0; 4],
                 textures: [None; 2],
                 rect: false,
+                texel_exact: false,
                 color_image: 0,
                 scissor: None,
             },
@@ -624,6 +625,8 @@ impl Interpreter {
         let st = [[s, t], [s + w * dsdx, t + h * dtdy]];
         let mut state = self.state.clone();
         state.rect = true;
+        state.texel_exact = copy
+            || (dsdx.abs() == 1.0 && dtdy.abs() == 1.0 && s.fract() == 0.0 && t.fract() == 0.0);
         state.geometry = 0;
         let tlut = (self.state.other_h >> 14) & 3;
         let b0 = self.tmem.bind(tile, tlut, &mut self.frame.textures);

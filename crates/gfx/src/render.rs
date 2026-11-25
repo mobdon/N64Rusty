@@ -642,7 +642,9 @@ impl Renderer {
         for d in &draws {
             let key = pipe_key(&d.state);
             self.pipeline(key);
-            let linear = (d.state.other_h >> 20) & 3 != 2 && (d.state.other_h >> 12) & 3 != 0;
+            let linear = (d.state.other_h >> 20) & 3 != 2
+                && (d.state.other_h >> 12) & 3 != 0
+                && !d.state.texel_exact;
             let mut entries = Vec::new();
             for (k, slot) in d.state.textures.iter().enumerate() {
                 let (view, wrap) = match slot.and_then(|i| Some((views.get(i as usize)?, i))) {
@@ -1209,6 +1211,7 @@ mod tests {
             fog: [0.0; 4],
             textures: [None; 2],
             rect: false,
+            texel_exact: false,
             color_image: 0,
             scissor: None,
         }
