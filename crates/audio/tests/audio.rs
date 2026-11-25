@@ -346,3 +346,36 @@ fn third_set_loads_mixes_interleaves_and_saves() {
     assert_eq!(ram.read_u16(dst) as i16, 0x3FFF); // left: 0x4000 * 0xFFFF >> 16
     assert_eq!(ram.read_u16(dst + 2) as i16, 0x2000); // right: half
 }
+
+#[test]
+fn third_set_filter_is_an_fir_with_carried_state() {
+    // FILTER setup (16 bytes, table at 0x1000), then FILTER on DMEM 0 with
+    // its state at 0x2000. Both tables hold c0 = 0.5, c1 = 0.25; the state's
+    // last sample is 0x100, so out[0] = 0.5 * in[0] + 0.25 * 0x100.
+    let mut ram = Memory::new(0x10000);
+    let (list, table, state) = (0x8000_0000u32, 0x8000_1000u32, 0x8000_2000u32);
+    for t in [table, state + 0x10] {
+        ram.write_u16(t, 0x4000);
+        ram.write_u16(t + 2, 0x2000);
+    }
+    ram.write_u16(state + 14, 0x100);
+    for i in 0..8 {
+        ram.write_u16(0x8000_3000 + 2 * i, 0x1000);
+    }
+    let cmds: [(u32, u32); 4] = [
+        (0x1410_0000, 0x3000), // 16 bytes to DMEM 0
+        (0x0702_0010, table & 0xFF_FFFF),
+        (0x0700_0000, state & 0xFF_FFFF),
+        (0x1510_0000, 0x4000), // save them back
+    ];
+    for (k, (w0, w1)) in cmds.iter().enumerate() {
+        ram.write_u32(list + 8 * k as u32, *w0);
+        ram.write_u32(list + 8 * k as u32 + 4, *w1);
+    }
+    AudioRsp::new().run(&mut ram, list, 8 * cmds.len() as u32);
+    let out = 0x8000_4000;
+    assert_eq!(ram.read_u16(out) as i16, 0x800 + 0x40);
+    assert_eq!(ram.read_u16(out + 2) as i16, 0x800 + 0x400);
+    // The state now holds the last input samples.
+    assert_eq!(ram.read_u16(state + 14), 0x1000);
+}

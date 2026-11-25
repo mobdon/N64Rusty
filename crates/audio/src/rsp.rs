@@ -52,6 +52,9 @@ pub struct AudioRsp {
     /// steps they move by every 8 samples.
     env: [u16; 3],
     env_step: [u16; 3],
+    /// Third command set: byte count and coefficient table of the next FILTER.
+    filter_count: u16,
+    filter_table: u32,
 }
 
 impl Default for AudioRsp {
@@ -92,6 +95,8 @@ impl AudioRsp {
             book: [0; 256],
             env: [0; 3],
             env_step: [0; 3],
+            filter_count: 0,
+            filter_table: 0,
         }
     }
 
@@ -252,9 +257,8 @@ impl AudioRsp {
                     pos += step;
                 }
             }
-            // shortcut: the effect filter is left out (samples pass
-            // unfiltered); add it if a game's echo sounds wrong.
-            7 => {}
+            7 if flags > 1 => (self.filter_count, self.filter_table) = (lo0, a1),
+            7 => self.fir_filter(ram, lo0, a1),
             8 => (self.inp, self.out, self.count) = (lo0, hi1, lo1),
             9 => {
                 for k in 0..u16::from(flags) {
@@ -290,6 +294,36 @@ impl AudioRsp {
             0x16 => (self.env[0], self.env[1]) = (hi1, lo1),
             0x17 => self.s8_decode(ram, flags, a1, inp, out, count),
             op => panic!("audio command {op:#x} not implemented ({w0:08x} {w1:08x})"),
+        }
+    }
+
+    /// FILTER of the third set: an 8-tap FIR over `filter_count` bytes at
+    /// `buf`, in place. `state` holds the last 8 input samples of the previous
+    /// call, followed by a second coefficient table; the two tables are
+    /// first averaged into each other, as the microcode does.
+    fn fir_filter(&mut self, ram: &mut Memory, buf: u16, state: u32) {
+        let mut c = [0i32; 8];
+        for (k, ck) in c.iter_mut().enumerate() {
+            let (a, b) = (
+                self.filter_table + 2 * k as u32,
+                state + 0x10 + 2 * k as u32,
+            );
+            let v = (i32::from(ram.read_u16(a) as i16) + i32::from(ram.read_u16(b) as i16)) >> 1;
+            ram.write_u16(a, v as u16);
+            ram.write_u16(b, v as u16);
+            *ck = v;
+        }
+        let n = usize::from(self.filter_count.div_ceil(16) * 8);
+        let mut x: Vec<i32> = (0..8)
+            .map(|k| i32::from(ram.read_u16(state + 2 * k) as i16))
+            .collect();
+        x.extend((0..n).map(|i| i32::from(self.ld(buf + 2 * i as u16))));
+        for i in 0..usize::from(self.filter_count / 2) {
+            let v = (0..8).fold(0i32, |s, k| s.wrapping_add(c[k].wrapping_mul(x[8 + i - k])));
+            self.st(buf + 2 * i as u16, (v.wrapping_add(0x4000) >> 15) as i16);
+        }
+        for k in 0..8 {
+            ram.write_u16(state + 2 * k as u32, x[n + k] as u16);
         }
     }
 

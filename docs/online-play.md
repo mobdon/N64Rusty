@@ -181,6 +181,28 @@ games need. Games are described, not named.
   should count retraces, not game frames. Audio runs a task about every
   retrace from its own thread.
 
+### Single-player adventure on a repeating clock (fourth game)
+
+- **Save type.** Not confirmed yet: runs so far have not reached a save.
+  Whatever it is, both peers must start from the same save file.
+- **Players.** One player; the same shared or co-op note as the third game.
+- **Determinism concerns.**
+  - Needs the 8 MB memory expansion (`--expansion`); it does not boot
+    without it. Both peers must run with the same RAM size, since the heap
+    layout follows from it.
+  - Like the third game, almost all code is unpacked at run time and
+    relocated by the heap, so peers need the same build and saved images.
+  - An in-game clock drives the whole world (time of day, events, the end
+    of the cycle). It advances with game frames, so it stays in lockstep as
+    long as frames do.
+- **Input quirks.** Same controller manager behaviour as the third game:
+  report "no pak" to everyone. The map-select debug state still on the
+  cartridge leaves the title screen's game mode set; a tool that jumps
+  straight into an area must set the normal-play mode first, or the area
+  loads without its HUD (the same holds for the third game).
+- **Timing.** 20 frames a second during play over 60 Hz retraces, like the
+  third game. Lockstep should count retraces.
+
 ### Single-player rail shooter with a photo check (second game)
 
 - **Save type.** 128 KB flash chip: commands to its register, status and
