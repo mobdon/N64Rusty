@@ -567,3 +567,40 @@ fn a_texture_of_another_pixel_size_inside_a_drawn_image_is_not_read_back() {
     it.run_readback(&mut ram.bytes, addr, &mut rb).unwrap();
     assert!(rb.asked.is_empty());
 }
+
+/// Notes each read: the image, its size and how many draws it was given.
+struct Counting {
+    asked: Vec<(u32, u32, u32, usize)>,
+}
+
+impl n64rusty_gfx::Readback for Counting {
+    fn read(&mut self, f: &Frame, image: u32, width: u32, height: u32) -> Option<Vec<u8>> {
+        self.asked.push((image, width, height, f.draws().count()));
+        Some([255, 0, 0, 255].repeat((width * height) as usize))
+    }
+}
+
+#[test]
+fn a_narrow_image_at_a_wide_ones_address_reads_back_alone_at_its_scissor_height() {
+    let mut ram = Ram::default();
+    let img = ram.put(&[0; 16 * 12 * 2]);
+    let mut dl = Dl::default();
+    setup(&mut ram, &mut dl);
+    dl.cimg(img, 16)
+        .other_modes(CYCLE_1, 0)
+        .scissor(0, 0, 16, 12)
+        .tex_rect(0, [0, 0, 16, 12], [0, 0], [1 << 10, 1 << 10])
+        // A small picture drawn at the start of the same buffer, taller
+        // than 4:3 of its width.
+        .cimg(img, 4)
+        .scissor(0, 0, 4, 7)
+        .tex_rect(0, [0, 0, 4, 7], [0, 0], [1 << 10, 1 << 10])
+        .timg(0, 2, 4, img)
+        .load_block(7, 16)
+        .end();
+    let addr = ram.dl(&dl);
+    let mut it = Interpreter::new();
+    let mut rb = Counting { asked: Vec::new() };
+    it.run_readback(&mut ram.bytes, addr, &mut rb).unwrap();
+    assert_eq!(rb.asked, [(img, 4, 7, 1)]);
+}
