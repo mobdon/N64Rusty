@@ -664,7 +664,11 @@ fn os_create_thread(c: &mut Ctx) {
             state: TState::Stopped,
             entry,
             arg: a,
-            sp,
+            // The system library starts a thread 16 bytes below the stack
+            // top it is given, so the entry function's argument save area
+            // (above its frame) stays inside the stack. Without it the
+            // first stores land on whatever follows the stack in memory.
+            sp: sp.wrapping_sub(16),
             spawned: false,
             regs: None,
             seq: 0,
