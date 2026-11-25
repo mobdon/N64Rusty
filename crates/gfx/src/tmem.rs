@@ -67,7 +67,7 @@ pub(crate) struct Tmem {
 const DECODED_MAX: usize = 2048;
 
 /// A fast hasher for TMEM contents (multiply and rotate over 8 bytes).
-struct Fx(u64);
+pub(crate) struct Fx(pub u64);
 
 impl Hasher for Fx {
     fn write(&mut self, bytes: &[u8]) {

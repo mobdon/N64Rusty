@@ -8,6 +8,7 @@ use std::io::BufWriter;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use n64rusty_audio::{AudioRsp, Wav};
 use n64rusty_gfx::{write_png, Frame, Interpreter, Readback, Renderer};
@@ -74,6 +75,53 @@ pub struct Media {
     warnings: Vec<String>,
     /// Where each finished frame goes for a live window, if anywhere.
     shown: Option<Arc<Mutex<Option<Frame>>>>,
+    /// With `N64RUSTY_PROFILE=n`, a profile line every n shown frames.
+    profile: Option<Profile>,
+}
+
+/// Host time per part of a run, for the profile line.
+struct Profile {
+    every: u64,
+    start: Instant,
+    frames: u64,
+    dl_us: u64,
+    audio_us: u64,
+    render_us: u64,
+    png_us: u64,
+}
+
+impl Profile {
+    fn from_env() -> Option<Profile> {
+        let every = std::env::var("N64RUSTY_PROFILE")
+            .ok()?
+            .parse()
+            .unwrap_or(120);
+        Some(Profile {
+            every: u64::max(every, 1),
+            start: Instant::now(),
+            frames: 0,
+            dl_us: 0,
+            audio_us: 0,
+            render_us: 0,
+            png_us: 0,
+        })
+    }
+}
+
+/// One line on where a renderer's time went, per picture.
+pub(crate) fn render_line(s: &n64rusty_gfx::Stats) -> String {
+    let n = u64::from(s.frames.max(1));
+    let ms = |us: u64| us as f64 / n as f64 / 1000.0;
+    format!(
+        "render {:.2} ms (record {:.2}, of it textures {:.2}; submit+wait {:.2}), draws {}, textures uploaded {} ({} KB) per picture",
+        ms(s.record_us + s.submit_us),
+        ms(s.record_us),
+        ms(s.upload_us),
+        ms(s.submit_us),
+        s.draws / n,
+        s.textures_new / n,
+        s.texture_bytes / n / 1024,
+    )
 }
 
 impl Media {
@@ -127,6 +175,7 @@ impl Media {
             last: None,
             warnings: Vec::new(),
             shown: None,
+            profile: Profile::from_env(),
         }
     }
 
@@ -193,20 +242,58 @@ impl Media {
         if self.wide {
             w = (h * 16 / 9).max(w);
         }
+        let t0 = Instant::now();
         let img = match prev {
             Some(p) => r.render_between(p, f, 0.5, w, h),
             None => r.render(f, w, h),
         };
+        let t1 = Instant::now();
         let result = img.map_err(|e| e.to_string()).and_then(|img| {
             std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
             let path = dir.join(name);
             write_png(&path, &img).map_err(|e| e.to_string())?;
             Ok(path)
         });
+        if let Some(p) = &mut self.profile {
+            p.render_us += (t1 - t0).as_micros() as u64;
+            p.png_us += t1.elapsed().as_micros() as u64;
+        }
         match result {
             Ok(p) => self.saved.push(p),
             Err(e) => eprintln!("warning: {name} not saved: {e}"),
         }
+    }
+
+    /// Counts a shown frame and prints the profile line when one is due.
+    fn profile_frame(&mut self) {
+        let Some(p) = &mut self.profile else { return };
+        p.frames += 1;
+        if p.frames < p.every {
+            return;
+        }
+        let n = p.frames as f64;
+        let ms = |us: u64| us as f64 / n / 1000.0;
+        let wall = p.start.elapsed().as_micros() as u64;
+        let other = wall.saturating_sub(p.dl_us + p.audio_us + p.render_us + p.png_us);
+        let mut line = format!(
+            "profile at frame {}: {:.2} ms/frame = guest {:.2} + display lists {:.2} + audio {:.2} + capture render {:.2} + png {:.2}",
+            self.swaps,
+            ms(wall),
+            ms(other),
+            ms(p.dl_us),
+            ms(p.audio_us),
+            ms(p.render_us),
+            ms(p.png_us),
+        );
+        if let Some(r) = self.renderer.as_mut() {
+            line.push_str("; ");
+            line.push_str(&render_line(&r.take_stats()));
+        }
+        eprintln!("{line}");
+        *p = Profile {
+            every: p.every,
+            ..Profile::from_env().expect("profiling is on")
+        };
     }
 }
 
@@ -264,8 +351,12 @@ impl Devices for Media {
             let list = ctx.mem.read_u32(task + TASK_DATA_PTR);
             let len = ctx.mem.read_u32(task + TASK_DATA_SIZE);
             let (sound, mem) = (&mut self.sound, &mut ctx.mem);
+            let t0 = Instant::now();
             if let Err(e) = panic::catch_unwind(AssertUnwindSafe(|| sound.run(mem, list, len))) {
                 self.audio_failed = Some(panic_text(&*e));
+            }
+            if let Some(p) = &mut self.profile {
+                p.audio_us += t0.elapsed().as_micros() as u64;
             }
             return;
         }
@@ -290,11 +381,15 @@ impl Devices for Media {
             wide: self.wide,
         };
         let run = || gfx.run_readback(bytes, dl, &mut rb);
+        let t0 = Instant::now();
         let error = match panic::catch_unwind(AssertUnwindSafe(run)) {
             Ok(Ok(())) => None,
             Ok(Err(e)) => Some(e.to_string()),
             Err(p) => Some(format!("interpreter panicked: {}", panic_text(&*p))),
         };
+        if let Some(p) = &mut self.profile {
+            p.dl_us += t0.elapsed().as_micros() as u64;
+        }
         if let Some(e) = error {
             self.errors += 1;
             self.first_error.get_or_insert(e);
@@ -365,6 +460,7 @@ impl Devices for Media {
         if let Some(slot) = &self.shown {
             *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(f);
         }
+        self.profile_frame();
     }
 
     fn summary(&mut self) -> String {

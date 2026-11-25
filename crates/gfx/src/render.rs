@@ -181,6 +181,25 @@ fn gpu() -> Result<(&'static wgpu::Instance, &'static wgpu::Adapter), RenderErro
     }
 }
 
+/// Where the renderer's time went since the last [`Renderer::take_stats`]
+/// (host time in microseconds), for a per-frame profile line.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Stats {
+    /// Pictures drawn.
+    pub frames: u32,
+    /// Draws recorded.
+    pub draws: u64,
+    /// Recording a picture: vertices, uniforms, bindings and uploads.
+    pub record_us: u64,
+    /// Of which uploading textures.
+    pub upload_us: u64,
+    /// Submitting, and waiting for a read-back or a present.
+    pub submit_us: u64,
+    /// Textures uploaded, and their bytes (top level only).
+    pub textures_new: u64,
+    pub texture_bytes: u64,
+}
+
 /// A headless wgpu renderer for [`Frame`]s.
 pub struct Renderer {
     device: wgpu::Device,
@@ -197,7 +216,35 @@ pub struct Renderer {
     sharp: bool,
     /// Colour and depth targets of the last size drawn.
     targets: Option<(u32, u32, wgpu::Texture, wgpu::Texture)>,
+    stats: Stats,
+    /// Uploaded textures by content, kept across pictures: most are the
+    /// same from one frame to the next. Off with
+    /// `N64RUSTY_TEXTURE_CACHE=off`.
+    uploaded: Option<HashMap<u64, Uploaded>>,
+    /// Pictures drawn so far, to know which textures are still in use.
+    pictures: u64,
+    /// Vertex, uniform and read-back buffers kept from the last picture.
+    /// Each draw is submitted before the next one writes them again.
+    vertex_buf: Option<wgpu::Buffer>,
+    uniform_buf: Option<wgpu::Buffer>,
+    readback_buf: Option<wgpu::Buffer>,
+    /// Texture bindings by what they bind, kept with the uploaded textures.
+    bindings: HashMap<BindKey, wgpu::BindGroup>,
 }
+
+/// Content key and wrap of each texture slot, and linear filtering.
+type BindKey = ([Option<(u64, [Wrap; 2])>; 2], bool);
+
+struct Uploaded {
+    view: wgpu::TextureView,
+    bytes: u64,
+    last_used: u64,
+}
+
+/// Uploaded textures kept, by count and by bytes: thousands of small
+/// textures cost a view each even under the byte limit.
+const UPLOADED_MAX: usize = 2048;
+const UPLOADED_MAX_BYTES: u64 = 256 << 20;
 
 impl Renderer {
     /// Open the first GPU or software adapter, with no window.
@@ -273,6 +320,14 @@ impl Renderer {
             widescreen: false,
             sharp: true,
             targets: None,
+            stats: Stats::default(),
+            uploaded: (std::env::var("N64RUSTY_TEXTURE_CACHE").as_deref() != Ok("off"))
+                .then(HashMap::new),
+            pictures: 0,
+            vertex_buf: None,
+            uniform_buf: None,
+            readback_buf: None,
+            bindings: HashMap::new(),
         })
     }
 
@@ -319,6 +374,16 @@ impl Renderer {
     }
 
     /// Name and backend of the adapter in use.
+    /// Time spent since the last [`Renderer::take_stats`].
+    pub fn stats(&self) -> Stats {
+        self.stats
+    }
+
+    /// Time spent since the last call (see [`Stats`]), and start again.
+    pub fn take_stats(&mut self) -> Stats {
+        std::mem::take(&mut self.stats)
+    }
+
     pub fn adapter_name(&self) -> &str {
         &self.adapter_name
     }
@@ -463,7 +528,7 @@ impl Renderer {
 
     /// Submits `encoder` and reads `target` back.
     fn read_back(
-        &self,
+        &mut self,
         mut encoder: wgpu::CommandEncoder,
         target: &wgpu::Texture,
     ) -> Result<Image, RenderError> {
@@ -472,12 +537,16 @@ impl Renderer {
         let row = width * 4;
         let padded =
             row.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("readback"),
-            size: (padded * height) as u64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
+        let need = (padded * height) as u64;
+        let readback = match self.readback_buf.take() {
+            Some(b) if b.size() >= need => b,
+            _ => self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("readback"),
+                size: need,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            }),
+        };
         encoder.copy_texture_to_buffer(
             target.as_image_copy(),
             wgpu::TexelCopyBufferInfo {
@@ -490,6 +559,7 @@ impl Renderer {
             },
             size,
         );
+        let t0 = std::time::Instant::now();
         self.queue.submit([encoder.finish()]);
         let (tx, rx) = std::sync::mpsc::channel();
         readback.map_async(wgpu::MapMode::Read, .., move |r| {
@@ -509,6 +579,10 @@ impl Renderer {
             let start = (y * padded) as usize;
             rgba.extend_from_slice(&data[start..start + row as usize]);
         }
+        drop(data);
+        readback.unmap();
+        self.readback_buf = Some(readback);
+        self.stats.submit_us += t0.elapsed().as_micros() as u64;
         Ok(Image {
             width,
             height,
@@ -525,6 +599,7 @@ impl Renderer {
         width: u32,
         height: u32,
     ) -> (wgpu::Texture, wgpu::CommandEncoder) {
+        let t0 = std::time::Instant::now();
         let size = wgpu::Extent3d {
             width,
             height,
@@ -693,7 +768,13 @@ impl Renderer {
             verts.extend_from_slice(&v.uv[0]);
             verts.extend_from_slice(&v.uv[1]);
         }
-        let vbuf = self.buffer(&floats(&verts), wgpu::BufferUsages::VERTEX);
+        let vbuf = kept_buffer(
+            &self.device,
+            &self.queue,
+            &mut self.vertex_buf,
+            &floats(&verts),
+            wgpu::BufferUsages::VERTEX,
+        );
 
         // Per-draw uniforms.
         let draws: Vec<_> = frame
@@ -710,7 +791,13 @@ impl Renderer {
             let at = i * UNIFORM_STRIDE as usize;
             uniforms[at..at + 64].copy_from_slice(&floats(&vals));
         }
-        let ubuf = self.buffer(&uniforms, wgpu::BufferUsages::UNIFORM);
+        let ubuf = kept_buffer(
+            &self.device,
+            &self.queue,
+            &mut self.uniform_buf,
+            &uniforms,
+            wgpu::BufferUsages::UNIFORM,
+        );
         let ubind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("uniforms"),
             layout: &self.uniform_layout,
@@ -724,11 +811,9 @@ impl Renderer {
             }],
         });
 
-        let views: Vec<_> = frame
-            .textures
-            .iter()
-            .map(|t| upload(&self.device, &self.queue, t.width, t.height, &t.rgba))
-            .collect();
+        let t1 = std::time::Instant::now();
+        let views = self.upload_textures(&frame.textures);
+        self.stats.upload_us += t1.elapsed().as_micros() as u64;
 
         // Prepare pipelines and texture bindings before recording passes.
         let mut prepared = Vec::with_capacity(draws.len());
@@ -740,12 +825,23 @@ impl Renderer {
                 && (d.state.other_h >> 12) & 3 != 0
                 && (self.sharp || !d.state.texel_exact);
             let mut entries = Vec::new();
+            let mut bkey: BindKey = ([None; 2], linear);
+            let mut keyed = true;
             for (k, slot) in d.state.textures.iter().enumerate() {
                 let (view, wrap) = match slot.and_then(|i| Some((views.get(i as usize)?, i))) {
-                    Some((v, i)) => (v.clone(), frame.textures[i as usize].wrap),
+                    Some(((content, v), i)) => {
+                        let wrap = frame.textures[i as usize].wrap;
+                        bkey.0[k] = content.map(|c| (c, wrap));
+                        keyed &= content.is_some();
+                        (v.clone(), wrap)
+                    }
                     None => (self.white.clone(), [Wrap::Repeat; 2]),
                 };
                 entries.push((view, self.sampler(wrap, linear), k as u32 * 2));
+            }
+            if let Some(bind) = self.bindings.get(&bkey).filter(|_| keyed) {
+                prepared.push((key, bind.clone()));
+                continue;
             }
             let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("textures"),
@@ -766,6 +862,12 @@ impl Renderer {
                     })
                     .collect::<Vec<_>>(),
             });
+            if keyed {
+                if self.bindings.len() >= UPLOADED_MAX {
+                    self.bindings.clear();
+                }
+                self.bindings.insert(bkey, bind.clone());
+            }
             prepared.push((key, bind));
         }
 
@@ -839,19 +941,87 @@ impl Renderer {
             }
         }
 
+        self.stats.frames += 1;
+        self.stats.draws += draws.len() as u64;
+        self.stats.record_us += t0.elapsed().as_micros() as u64;
         (target, encoder)
     }
 
-    fn buffer(&self, data: &[u8], usage: wgpu::BufferUsages) -> wgpu::Buffer {
-        let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+    /// A view of each of `textures`, uploading only those not kept from
+    /// an earlier picture.
+    /// With the cache on, each view comes with its content key.
+    fn upload_textures(
+        &mut self,
+        textures: &[crate::Texture],
+    ) -> Vec<(Option<u64>, wgpu::TextureView)> {
+        use std::hash::Hasher;
+        self.pictures += 1;
+        let fresh = |stats: &mut Stats, t: &crate::Texture| {
+            stats.textures_new += 1;
+            stats.texture_bytes += t.rgba.len() as u64;
+            upload(&self.device, &self.queue, t.width, t.height, &t.rgba)
+        };
+        let Some(kept) = self.uploaded.as_mut() else {
+            return textures
+                .iter()
+                .map(|t| (None, fresh(&mut self.stats, t)))
+                .collect();
+        };
+        let views = textures
+            .iter()
+            .map(|t| {
+                let mut h = crate::tmem::Fx(0);
+                h.write_u32(t.width);
+                h.write_u32(t.height);
+                h.write(&t.rgba);
+                let key = h.finish();
+                let k = kept.entry(key).or_insert_with(|| Uploaded {
+                    view: fresh(&mut self.stats, t),
+                    bytes: t.rgba.len() as u64,
+                    last_used: 0,
+                });
+                k.last_used = self.pictures;
+                (Some(key), k.view.clone())
+            })
+            .collect();
+        let bytes: u64 = kept.values().map(|u| u.bytes).sum();
+        if kept.len() > UPLOADED_MAX || bytes > UPLOADED_MAX_BYTES {
+            kept.retain(|_, u| u.last_used == self.pictures);
+            // Bindings hold views of what was dropped.
+            self.bindings.clear();
+        }
+        views
+    }
+}
+
+/// `data` written into the buffer kept in `slot`, made anew (at the next
+/// power of two) only when it has grown too small. Safe because every
+/// picture is submitted before the next one writes the buffer again.
+fn kept_buffer(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    slot: &mut Option<wgpu::Buffer>,
+    data: &[u8],
+    usage: wgpu::BufferUsages,
+) -> wgpu::Buffer {
+    let size = (data.len() as u64).max(64).next_multiple_of(4);
+    let buf = match slot.take() {
+        Some(b)
+            if b.size() >= size
+                && std::env::var_os("N64RUSTY_BUFFER_REUSE").is_none_or(|v| v != "off") =>
+        {
+            b
+        }
+        _ => device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
-            size: (data.len() as u64).max(64).next_multiple_of(4),
+            size: size.next_power_of_two(),
             usage: usage | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
-        });
-        self.queue.write_buffer(&buf, 0, data);
-        buf
-    }
+        }),
+    };
+    queue.write_buffer(&buf, 0, data);
+    *slot = Some(buf.clone());
+    buf
 }
 
 /// Whether pixels `x0..x1` span a frame `fw` wide, give or take the border
@@ -1347,8 +1517,10 @@ impl Renderer {
         let rect = self.place(frame, width, height);
         let (src, mut encoder) = self.draw(frame, transforms, rect.2, rect.3);
         blit.record(&self.device, &mut encoder, &src, &view, rect);
+        let t0 = std::time::Instant::now();
         self.queue.submit([encoder.finish()]);
         self.queue.present(texture);
+        self.stats.submit_us += t0.elapsed().as_micros() as u64;
         Ok(())
     }
 

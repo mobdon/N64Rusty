@@ -200,6 +200,7 @@ impl Guest for Screen {
         if let Err(e) = r {
             eprintln!("warning: frame not shown: {e}");
         }
+        profile_window(renderer);
     }
 
     fn view(&mut self, w: &n64rusty_host::config::WindowConfig, blend: Option<f64>) {
@@ -258,6 +259,25 @@ impl Screen {
         if let Err(e) = renderer.present(&frame, target, size.width, size.height) {
             eprintln!("warning: frame not shown: {e}");
         }
+        profile_window(renderer);
+    }
+}
+
+/// With `N64RUSTY_PROFILE=n`, a line on the window's drawing every n
+/// pictures.
+fn profile_window(renderer: &mut n64rusty_gfx::Renderer) {
+    static EVERY: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    let Some(every) = *EVERY.get_or_init(|| {
+        let v = std::env::var("N64RUSTY_PROFILE").ok()?;
+        Some(v.parse().unwrap_or(120u32).max(1))
+    }) else {
+        return;
+    };
+    if renderer.stats().frames >= every {
+        eprintln!(
+            "window: {}",
+            crate::media::render_line(&renderer.take_stats())
+        );
     }
 }
 
