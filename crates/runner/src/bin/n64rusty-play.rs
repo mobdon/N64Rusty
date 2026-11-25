@@ -20,6 +20,19 @@ use std::process::ExitCode;
 use n64rusty_rom::{signature, Rom};
 use n64rusty_runner::{main_args, os, read_names, routine_list, Game};
 
+/// Files built into the player (see build.rs): fingerprints and routine
+/// lists for games the fingerprints alone cannot set up.
+mod built {
+    include!(concat!(env!("OUT_DIR"), "/player_data.rs"));
+    pub fn get(path: &str) -> Option<&'static str> {
+        FILES.iter().find(|(p, _)| *p == path).map(|(_, t)| *t)
+    }
+}
+
+/// First line of a routine list written from `--symbols`: kept over the
+/// built-in one.
+const FROM_MAP: &str = "// from a symbol map";
+
 fn main() -> ExitCode {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let dir = std::env::current_exe()
@@ -121,7 +134,7 @@ fn routines(args: &[String], dir: &Path, rom: &Rom, local: &Path) -> Result<(), 
         .collect();
     if !maps.is_empty() {
         let names = read_names(&maps);
-        let list = routine_list(&names);
+        let list = format!("{FROM_MAP}\n{}", routine_list(&names));
         std::fs::write(&config, &list).map_err(|e| err(&config, e))?;
         println!("wrote the routine list to {}", config.display());
         let wanted = read_names(std::slice::from_ref(&config))
@@ -141,10 +154,20 @@ fn routines(args: &[String], dir: &Path, rom: &Rom, local: &Path) -> Result<(), 
         std::fs::write(&prints, text).map_err(|e| err(&prints, e))?;
         return Ok(());
     }
-    if config.exists() {
+    let have = std::fs::read_to_string(&config).ok();
+    if let Some(list) = built::get(&format!("games/{}/config.toml", rom.sha256)) {
+        // Also replaces a list an older player found by fingerprint.
+        if !have.is_some_and(|h| h.starts_with(FROM_MAP)) {
+            return std::fs::write(&config, list).map_err(|e| err(&config, e));
+        }
         return Ok(());
     }
-    let known = std::fs::read_to_string(&prints).unwrap_or_default();
+    if have.is_some() {
+        return Ok(());
+    }
+    let known = std::fs::read_to_string(&prints).unwrap_or_default()
+        + "\n"
+        + built::get("routines.txt").unwrap_or_default();
     let found = signature::find(&known, &code, rom.entry());
     let wanted = os::HOOKS.len();
     println!(
