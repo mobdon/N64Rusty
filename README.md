@@ -225,7 +225,10 @@ bar: Game (open another ROM, or pick one of the last ten played), Refresh (match
 165 Hz) and View (widescreen or normal 4:3, crisp or console textures,
 window size, full screen, also F11). Choices are saved to `settings.toml`
 next to the program, or to the game's own `games/<sha256>/run.toml` when
-it has one.
+it has one. On Windows it opens no console window: started from a
+terminal it writes there, otherwise to `n64rusty-play.log` next to the
+program, and a game that cannot start shows the end of that log in a
+message box.
 
 Its files live next to the program: `games/<sha256>/` per game (the
 routine list `config.toml`, `save.sra`, `run.toml`) and `routines.txt`.

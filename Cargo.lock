@@ -1660,6 +1660,7 @@ dependencies = [
  "n64rusty-rom",
  "n64rusty-runtime",
  "rfd",
+ "windows-sys 0.61.2",
  "winit",
 ]
 
