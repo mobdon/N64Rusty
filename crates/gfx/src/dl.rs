@@ -678,10 +678,13 @@ impl Interpreter {
     /// Reads back a colour image drawn on the GPU that the coming texture
     /// load starts inside.
     fn read_back(&mut self, ram: &mut [u8], rb: &mut dyn Readback) {
-        let src = self.tmem.image().0;
+        let (src, _, src_siz) = self.tmem.image();
+        // A load of another pixel size is a texture that only lies inside
+        // the image's guessed extent (its height is a guess from its width),
+        // not the picture read back.
         let Some(k) = self.drawn.iter().position(|&(a, w, siz)| {
             let len = w * image_height(w) * if siz == 3 { 4 } else { 2 };
-            src >= a && src < a + len
+            src >= a && src < a + len && src_siz == siz
         }) else {
             return;
         };
