@@ -10,8 +10,9 @@ use crate::config::WindowConfig;
 pub enum Action {
     /// Start the program again on another ROM file.
     OpenRom(std::path::PathBuf),
-    /// Start the program again on its start screen.
-    GamesList,
+    /// Start the program again on one page of its start screen: `games`,
+    /// `mods` or `settings`.
+    Screen(&'static str),
     /// `Some(0.0)` is the display's rate.
     Refresh(Option<f64>),
     Widescreen(bool),
@@ -161,6 +162,8 @@ mod imp {
         _bar: muda::Menu,
         open: MenuItem,
         list: MenuItem,
+        mods_page: MenuItem,
+        settings_page: MenuItem,
         games: Vec<(MenuItem, std::path::PathBuf)>,
         refresh: Vec<CheckMenuItem>,
         wide: CheckMenuItem,
@@ -188,6 +191,8 @@ mod imp {
                 _bar: muda::Menu::new(),
                 open: MenuItem::new("Open ROM...", true, None),
                 list: MenuItem::new("All games...", true, None),
+                mods_page: MenuItem::new("Mods screen...", true, None),
+                settings_page: MenuItem::new("Settings screen...", true, None),
                 games: recent_roms()
                     .into_iter()
                     .map(|p| {
@@ -239,7 +244,8 @@ mod imp {
             };
             let sep0 = PredefinedMenuItem::separator();
             let mut game: Vec<&dyn muda::IsMenuItem> = vec![&m.open];
-            if super::START_SCREEN.load(std::sync::atomic::Ordering::Relaxed) {
+            let screens = super::START_SCREEN.load(std::sync::atomic::Ordering::Relaxed);
+            if screens {
                 game.insert(0, &m.list);
             }
             if !m.games.is_empty() {
@@ -258,6 +264,10 @@ mod imp {
                 vec![&m.wide, &m.normal, &sep, &m.crisp, &m.console, &sep2];
             view.extend(m.scales.iter().map(|i| i as &dyn muda::IsMenuItem));
             view.push(&m.full);
+            let sep4 = PredefinedMenuItem::separator();
+            if screens {
+                view.extend([&sep4 as &dyn muda::IsMenuItem, &m.settings_page]);
+            }
             let refresh = Submenu::with_items("Refresh", true, &refresh).ok()?;
             let view = Submenu::with_items("View", true, &view).ok()?;
             let sep3 = PredefinedMenuItem::separator();
@@ -276,6 +286,9 @@ mod imp {
                 modm.push(&sep3);
             }
             modm.push(&m.mods_folder);
+            if screens {
+                modm.push(&m.mods_page);
+            }
             let modm = Submenu::with_items("Mods", true, &modm).ok()?;
             m._bar.append_items(&[&game, &refresh, &view, &modm]).ok()?;
             // SAFETY: the window outlives the menu, which the app drops first.
@@ -291,8 +304,14 @@ mod imp {
         /// The next menu choice, if one was made.
         pub fn poll(&self) -> Option<Action> {
             let id = MenuEvent::receiver().try_recv().ok()?.id;
-            if id == *self.list.id() {
-                return Some(Action::GamesList);
+            for (item, page) in [
+                (&self.list, "games"),
+                (&self.mods_page, "mods"),
+                (&self.settings_page, "settings"),
+            ] {
+                if id == *item.id() {
+                    return Some(Action::Screen(page));
+                }
             }
             if id == *self.open.id() {
                 let rom = rfd::FileDialog::new()

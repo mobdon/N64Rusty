@@ -96,9 +96,10 @@ impl<G: Guest> App<G> {
         };
         let w = &mut self.cfg.window;
         match action {
-            Action::OpenRom(_) | Action::GamesList => {
-                let rom = match &action {
-                    Action::OpenRom(rom) => vec![rom.clone()],
+            Action::OpenRom(_) | Action::Screen(_) => {
+                let rom: Vec<std::ffi::OsString> = match &action {
+                    Action::OpenRom(rom) => vec![rom.into()],
+                    Action::Screen(page) => vec!["--screen".into(), page.into()],
                     _ => Vec::new(),
                 };
                 if let Ok(exe) = std::env::current_exe() {

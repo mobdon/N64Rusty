@@ -215,21 +215,24 @@ scripted input, which is how this mode is tested.
 `n64rusty-play` plays a ROM with no translate step and no Rust: every
 function runs in the reference interpreter, with system routines replaced
 as usual. On Windows, double-click `n64rusty-play.exe`: it plays a ROM
-dropped on it, else a start screen of the games played before
-(`recent.txt`; W/S/A/D or the mouse, Enter to play), else the
+dropped on it, else an 8-bit start screen with three pages (Q/E or Tab to switch,
+W/S/A/D or the mouse, Enter to choose): Games (the games played before,
+`recent.txt`), Mods (turn mods and their options on or off, open the mods
+folder) and Settings (picture, refresh, textures, window size, saved for
+every game). `--screen games|mods|settings` opens one page. Else the
 first `.z64`/`.n64`/`.v64` in its own folder, else asks for one in a file
 window. It opens the game with `--window`, and always with `--expansion`
 (8 MB of RAM, as with the Expansion Pak fitted), so games that need it run.
 It needs no settings file: windows default to widescreen, drawing at the
 display's own refresh rate, and crisp textures. On Windows the window has a menu
-bar: Game (all games, open another ROM, or pick one of the last ten played), Refresh (match the display, 60, 120 or
+bar: Game (all games, the Mods and Settings screens, open another ROM, or pick one of the last ten played), Refresh (match the display, 60, 120 or
 165 Hz) and View (widescreen or normal 4:3, crisp or console textures,
 window size, full screen, also F11). Choices are saved to `settings.toml`
 next to the program, or to the game's own `games/<sha256>/run.toml` when
 it has one. On Windows it opens no console window: started from a
 terminal it writes there, otherwise to `n64rusty-play.log` next to the
-program, and a game that cannot start shows the end of that log in a
-message box.
+program, and a game that cannot start shows the end of that log on an
+error screen in the same 8-bit look.
 
 Its files live next to the program: `games/<sha256>/` per game (the
 routine list `config.toml`, `save.sra`, `run.toml`) and `routines.txt`.
