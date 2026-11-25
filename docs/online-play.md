@@ -26,6 +26,8 @@ decides who is in sync.
 - **A determinism check.** Nobody has proven yet that two runs with the same
   inputs match byte for byte, or that Windows and Linux builds match. Needed:
   a RAM hash per frame and a test that compares two runs (and two machines).
+  Earlier graphics debugging already saw headless captures of the same input
+  land on shifted frame numbers between runs, so expect real work here.
 - **A network input source.** Today input comes from a script or the
   keyboard/pad. Netplay needs a source that waits until both players' input
   for frame N has arrived.
