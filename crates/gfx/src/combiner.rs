@@ -84,7 +84,7 @@ pub(crate) const TEXEL0_ONLY: u64 = pass(TEXEL0);
 pub(crate) struct ShaderKey {
     pub combine: u64,
     pub two_cycle: bool,
-    /// 0 none, 1 against the blend colour's alpha, 2 at one half.
+    /// 0 none, 1 against the blend colour's alpha, 2 at one half, 3 both.
     pub alpha_test: u8,
     pub flat: bool,
 }
@@ -185,6 +185,7 @@ fn fs(v: VOut) -> @location(0) vec4f {{
     match key.alpha_test {
         1 => s.push_str("    if (comb.a < u.blend.a) { discard; }\n"),
         2 => s.push_str("    if (comb.a < 0.5) { discard; }\n"),
+        3 => s.push_str("    if (comb.a < max(u.blend.a, 0.5)) { discard; }\n"),
         _ => {}
     }
     s.push_str("    return comb;\n}\n");

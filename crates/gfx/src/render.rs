@@ -82,15 +82,15 @@ fn pipe_key(s: &RenderState) -> PipeKey {
     let cycle = (s.other_h >> 20) & 3;
     let two_cycle = cycle == 1;
     let copy_or_fill = cycle >= 2;
-    let alpha_test = if cycle == 3 {
-        0
-    } else if s.other_l & 3 == 1 {
-        1
-    } else if s.other_l & 0x3000 == 0x3000 {
-        // Coverage times alpha ("texture edge" modes) behaves like a test.
-        2
-    } else {
-        0
+    // Coverage times alpha ("texture edge" modes) behaves like a test at
+    // one half. With alpha compare also on, both apply: a compare against a
+    // zero blend alpha alone would draw the texture's clear parts solid.
+    let alpha_test = match (cycle == 3, s.other_l & 3 == 1, s.other_l & 0x3000 == 0x3000) {
+        (true, _, _) => 0,
+        (_, true, true) => 3,
+        (_, true, false) => 1,
+        (_, false, true) => 2,
+        _ => 0,
     };
     // In two-cycle mode the second blender cycle writes the pixel.
     let sh = if two_cycle { 16 } else { 18 };
@@ -1161,5 +1161,36 @@ impl Renderer {
             rect,
         );
         self.read_back(encoder, &dst)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state(other_l: u32) -> RenderState {
+        RenderState {
+            combine: 0,
+            other_h: 0,
+            other_l,
+            geometry: 0,
+            prim: [1.0; 4],
+            prim_lod: 0.0,
+            env: [1.0; 4],
+            blend: [0.0; 4],
+            fog: [0.0; 4],
+            textures: [None; 2],
+            rect: false,
+            color_image: 0,
+            scissor: None,
+        }
+    }
+
+    #[test]
+    fn alpha_compare_keeps_texture_edge_test() {
+        // Alpha compare on its own, texture edge on its own, then both.
+        assert_eq!(pipe_key(&state(0x0001)).shader.alpha_test, 1);
+        assert_eq!(pipe_key(&state(0x3000)).shader.alpha_test, 2);
+        assert_eq!(pipe_key(&state(0x3049)).shader.alpha_test, 3);
     }
 }
