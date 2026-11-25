@@ -69,6 +69,8 @@ pub struct Ctx {
     /// The most recent call targets, oldest first once full; see
     /// [`Ctx::recent_calls`].
     trace: [u32; TRACE_LEN],
+    /// The function being entered: what [`Ctx::last_call`] reports.
+    entering: u32,
     /// Number of calls made through [`Ctx::call`].
     pub calls: u64,
     /// Current call depth.
@@ -127,6 +129,7 @@ impl Ctx {
             images: HashMap::new(),
             verified: BTreeMap::new(),
             trace: [0; TRACE_LEN],
+            entering: 0,
             calls: 0,
             depth: 0,
             cop0: [0; 32],
@@ -315,6 +318,8 @@ impl Ctx {
             self.lookup_game(addr).or_else(|| self.verify_image(addr))
         };
         self.tick(addr);
+        // Set after the tick: a deadline handler it runs makes calls too.
+        self.entering = addr;
         match f {
             Some(f) => {
                 self.depth += 1;
@@ -341,7 +346,7 @@ impl Ctx {
     /// The address of the call being made (the last one [`Ctx::tick`]
     /// counted): lets one override serve many addresses.
     pub fn last_call(&self) -> u32 {
-        self.trace[((self.calls + TRACE_LEN as u64 - 1) % TRACE_LEN as u64) as usize]
+        self.entering
     }
 
     pub fn tick(&mut self, addr: u32) {
@@ -697,6 +702,24 @@ mod tests {
         c.clear_override(0x8000_0400);
         c.call(0x8000_0400);
         assert_eq!(c.r[2], 1);
+    }
+
+    #[test]
+    fn last_call_names_the_function_entered_past_a_deadline() {
+        fn other(_: &mut Ctx) {}
+        fn handler(c: &mut Ctx) {
+            c.call(0x8000_0500);
+        }
+        fn hook(c: &mut Ctx) {
+            c.r[2] = u64::from(c.last_call());
+        }
+        let mut c = Ctx::new(Memory::new(16));
+        c.register(0x8000_0500, other);
+        c.set_override(0x8000_0400, hook);
+        c.on_deadline = Some(handler);
+        c.deadline = 0;
+        c.call(0x8000_0400);
+        assert_eq!(c.r[2], 0x8000_0400);
     }
 }
 
