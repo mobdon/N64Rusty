@@ -1633,6 +1633,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "n64rusty-mod-api"
+version = "0.0.0"
+
+[[package]]
 name = "n64rusty-refcpu"
 version = "0.0.0"
 
@@ -1647,9 +1651,11 @@ dependencies = [
 name = "n64rusty-runner"
 version = "0.0.0"
 dependencies = [
+ "libloading",
  "n64rusty-audio",
  "n64rusty-gfx",
  "n64rusty-host",
+ "n64rusty-mod-api",
  "n64rusty-refcpu",
  "n64rusty-rom",
  "n64rusty-runtime",

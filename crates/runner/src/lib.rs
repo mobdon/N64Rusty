@@ -15,22 +15,12 @@ pub mod media;
 pub mod os;
 pub mod save;
 
-/// Mods built in from the `N64RUSTY_MODS` folder (see build.rs); none in a
-/// normal build. Each mod file has
-/// `pub fn install(ctx: &mut Ctx, rom: &mut Vec<u8>, sha256: &str)`, run
-/// once before the game starts: it checks the ROM hash itself, may set
-/// overrides on the context (wrapping a game function with
-/// [`Ctx::call_original`]) and may change the cartridge bytes the game
-/// reads. With any mod built in, RAM has [`MOD_RAM`] more bytes above what
-/// the game is told it has, for the mods' own data.
-mod mods {
-    use n64rusty_runtime::Ctx;
-    include!(concat!(env!("OUT_DIR"), "/mods.rs"));
-}
+pub mod mods;
 
-/// Bytes of RAM above the game's own for mods' data, when any are built in:
-/// the last `MOD_RAM` bytes of `ctx.mem`.
+/// Bytes of RAM above the game's own for mods' data, when a mod is on.
 pub const MOD_RAM: usize = 0x40_0000;
+/// Whether this run has mods on (and so [`MOD_RAM`]).
+static WITH_MODS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 use std::collections::BTreeMap;
 use std::panic;
@@ -66,7 +56,13 @@ pub fn boot(rom: &Rom, game: &Game) -> Ctx {
     } else {
         RAM_SIZE
     };
-    let mut mem = Memory::new(size + if mods::ANY { MOD_RAM } else { 0 });
+    let mut mem = Memory::new(
+        size + if WITH_MODS.load(std::sync::atomic::Ordering::Relaxed) {
+            MOD_RAM
+        } else {
+            0
+        },
+    );
     let seg = rom.boot_segment();
     let at = (rom.entry() & 0x1FFF_FFFF) as usize;
     let n = seg.len().min(size - at);
@@ -555,9 +551,11 @@ pub fn main_args(
     let names = read_names(&symbols);
     let by_name: BTreeMap<String, u32> = names.iter().map(|(a, n)| (n.clone(), *a)).collect();
 
+    let libs = mods::load();
+    WITH_MODS.store(!libs.is_empty(), std::sync::atomic::Ordering::Relaxed);
     let mut ctx = boot(&rom, &game);
     let mut cart = rom.bytes().to_vec();
-    mods::install(&mut ctx, &mut cart, game.sha256);
+    mods::install(libs, &mut ctx, &mut cart, game.sha256);
     let rom_bytes: Arc<[u8]> = Arc::from(cart);
     ctx.mem.set_io(Io {
         sp_mem: vec![0; 0x2000],

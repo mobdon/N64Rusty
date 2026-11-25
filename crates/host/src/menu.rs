@@ -17,6 +17,46 @@ pub enum Action {
     /// Window size as a multiple of 320x240, leaving full screen.
     Scale(u32),
     Fullscreen,
+    /// Turn the mod file on or off and start the program again.
+    ToggleMod(std::path::PathBuf),
+    OpenModsFolder,
+}
+
+/// The `mods` folder next to the program.
+pub fn mods_dir() -> Option<std::path::PathBuf> {
+    Some(std::env::current_exe().ok()?.parent()?.join("mods"))
+}
+
+/// Mod files in [`mods_dir`] with whether each is on (a name ending in
+/// `.off` is off), sorted by name.
+pub fn mods() -> Vec<(std::path::PathBuf, bool)> {
+    let Some(Ok(dir)) = mods_dir().map(std::fs::read_dir) else {
+        return Vec::new();
+    };
+    let lib = |n: &str| [".dll", ".so", ".dylib"].iter().any(|x| n.ends_with(x));
+    let mut v: Vec<_> = dir
+        .flatten()
+        .map(|e| e.path())
+        .filter_map(|p| {
+            let n = p.file_name()?.to_string_lossy().into_owned();
+            match n.strip_suffix(".off") {
+                Some(base) if lib(base) => Some((p, false)),
+                _ if lib(&n) => Some((p, true)),
+                _ => None,
+            }
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+/// The file name that turns the mod at `path` on or off.
+pub fn toggled(path: &std::path::Path) -> std::path::PathBuf {
+    let n = path.file_name().unwrap_or_default().to_string_lossy();
+    match n.strip_suffix(".off") {
+        Some(base) => path.with_file_name(base),
+        None => path.with_file_name(format!("{n}.off")),
+    }
 }
 
 /// Refresh choices: label and setting.
@@ -83,6 +123,8 @@ mod imp {
         console: CheckMenuItem,
         scales: Vec<MenuItem>,
         full: MenuItem,
+        mods: Vec<(CheckMenuItem, std::path::PathBuf)>,
+        mods_folder: MenuItem,
     }
 
     fn check(label: &str) -> CheckMenuItem {
@@ -119,6 +161,21 @@ mod imp {
                     .map(|s| MenuItem::new(format!("{}x{}", 320 * s, 240 * s), true, None))
                     .collect(),
                 full: MenuItem::new("Full screen (F11)", true, None),
+                mods: mods()
+                    .into_iter()
+                    .map(|(p, on)| {
+                        let n = p.file_name().unwrap_or_default().to_string_lossy();
+                        let name = n
+                            .trim_end_matches(".off")
+                            .rsplit_once('.')
+                            .map_or(&*n, |(a, _)| a);
+                        (
+                            CheckMenuItem::new(name.replace('&', "&&"), true, on, None),
+                            p,
+                        )
+                    })
+                    .collect(),
+                mods_folder: MenuItem::new("Open mods folder", true, None),
             };
             let sep0 = PredefinedMenuItem::separator();
             let mut game: Vec<&dyn muda::IsMenuItem> = vec![&m.open];
@@ -140,7 +197,18 @@ mod imp {
             view.push(&m.full);
             let refresh = Submenu::with_items("Refresh", true, &refresh).ok()?;
             let view = Submenu::with_items("View", true, &view).ok()?;
-            m._bar.append_items(&[&game, &refresh, &view]).ok()?;
+            let sep3 = PredefinedMenuItem::separator();
+            let mut modm: Vec<&dyn muda::IsMenuItem> = m
+                .mods
+                .iter()
+                .map(|(i, _)| i as &dyn muda::IsMenuItem)
+                .collect();
+            if !m.mods.is_empty() {
+                modm.push(&sep3);
+            }
+            modm.push(&m.mods_folder);
+            let modm = Submenu::with_items("Mods", true, &modm).ok()?;
+            m._bar.append_items(&[&game, &refresh, &view, &modm]).ok()?;
             // SAFETY: the window outlives the menu, which the app drops first.
             unsafe { m._bar.init_for_hwnd(h.hwnd.get()) }.ok()?;
             m.show(cfg);
@@ -160,6 +228,9 @@ mod imp {
             if let Some((_, rom)) = self.games.iter().find(|(i, _)| *i.id() == id) {
                 return Some(Action::OpenRom(rom.clone()));
             }
+            if let Some((_, p)) = self.mods.iter().find(|(i, _)| *i.id() == id) {
+                return Some(Action::ToggleMod(p.clone()));
+            }
             if let Some(k) = self.refresh.iter().position(|i| *i.id() == id) {
                 return Some(Action::Refresh(REFRESH[k].1));
             }
@@ -172,6 +243,7 @@ mod imp {
                 _ if id == *self.crisp.id() => Action::ConsoleFilter(false),
                 _ if id == *self.console.id() => Action::ConsoleFilter(true),
                 _ if id == *self.full.id() => Action::Fullscreen,
+                _ if id == *self.mods_folder.id() => Action::OpenModsFolder,
                 _ => return None,
             })
         }
@@ -186,5 +258,23 @@ mod imp {
             self.crisp.set_checked(!cfg.console_filter);
             self.console.set_checked(cfg.console_filter);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::toggled;
+    use std::path::Path;
+
+    #[test]
+    fn toggling_a_mod_adds_or_drops_off() {
+        assert_eq!(
+            toggled(Path::new("mods/a.dll")),
+            Path::new("mods/a.dll.off")
+        );
+        assert_eq!(
+            toggled(Path::new("mods/a.dll.off")),
+            Path::new("mods/a.dll")
+        );
     }
 }

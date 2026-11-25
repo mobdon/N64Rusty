@@ -105,6 +105,31 @@ impl<G: Guest> App<G> {
                 }
                 return;
             }
+            Action::ToggleMod(path) => {
+                // Mods install at start, so the program starts again.
+                let restart = std::fs::rename(&path, crate::menu::toggled(&path))
+                    .map_err(|e| e.to_string())
+                    .and_then(|_| std::env::current_exe().map_err(|e| e.to_string()))
+                    .and_then(|exe| {
+                        let args = std::env::args_os().skip(1);
+                        std::process::Command::new(exe)
+                            .args(args)
+                            .spawn()
+                            .map_err(|e| e.to_string())
+                    });
+                match restart {
+                    Ok(_) => event_loop.exit(),
+                    Err(e) => eprintln!("warning: turning mod {} on or off: {e}", path.display()),
+                }
+                return;
+            }
+            Action::OpenModsFolder => {
+                if let Some(dir) = crate::menu::mods_dir() {
+                    let _ = std::fs::create_dir_all(&dir);
+                    let _ = std::process::Command::new("explorer").arg(dir).spawn();
+                }
+                return;
+            }
             Action::Refresh(r) => w.refresh = r,
             Action::Widescreen(on) => w.widescreen = on,
             Action::ConsoleFilter(on) => w.console_filter = on,

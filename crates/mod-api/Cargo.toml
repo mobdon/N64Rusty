@@ -1,0 +1,10 @@
+[package]
+name = "n64rusty-mod-api"
+description = "What a player mod (a shared library in the mods folder) gets from the player"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
