@@ -116,6 +116,9 @@ pub struct RenderState {
     pub picture: bool,
     /// Address of the colour image this was drawn into.
     pub color_image: u32,
+    /// Width of that image: one address can hold images of other widths
+    /// (a small picture drawn at the start of the frame buffer).
+    pub color_width: u32,
     /// Scissor box in framebuffer pixels (x0, y0, x1, y1), if one was set.
     pub scissor: Option<[f32; 4]>,
 }
@@ -157,11 +160,17 @@ pub struct Frame {
     /// screen-space triangle (flat, no perspective) wholly inside one moves
     /// out to that side's edge of a wider target.
     pub hud: Vec<[f32; 5]>,
+    /// Height of the colour image when known (an image read back); 0
+    /// means the usual 4:3 shape.
+    pub image_height: u32,
 }
 
 impl Frame {
-    /// The N64 framebuffer height, assuming the usual 4:3 shape.
+    /// The N64 framebuffer height: the known one, else the usual 4:3 shape.
     pub fn height(&self) -> u32 {
+        if self.image_height != 0 {
+            return self.image_height;
+        }
         (self.width * 3 / 4).max(1)
     }
 

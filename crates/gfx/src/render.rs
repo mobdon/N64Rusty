@@ -262,6 +262,9 @@ impl Renderer {
                 // All the adapter offers: the lowest limits cap textures at
                 // 2048 pixels, smaller than a full-screen window.
                 required_limits: adapter.limits(),
+                // Depth clamped, not clipped, as the game's microcode does
+                // not clip at the near plane (a HUD piece behind it shows).
+                required_features: adapter.features() & wgpu::Features::DEPTH_CLIP_CONTROL,
                 ..Default::default()
             })
             .await
@@ -448,6 +451,9 @@ impl Renderer {
                         2 => Some(wgpu::Face::Back),
                         _ => None,
                     },
+                    unclipped_depth: device
+                        .features()
+                        .contains(wgpu::Features::DEPTH_CLIP_CONTROL),
                     ..Default::default()
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
@@ -1599,6 +1605,7 @@ mod tests {
             texel_exact: false,
             picture: false,
             color_image: 0,
+            color_width: 0,
             scissor: None,
         }
     }

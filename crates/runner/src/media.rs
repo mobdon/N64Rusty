@@ -323,6 +323,7 @@ impl Readback for GpuReadback<'_> {
         let f = Frame {
             width,
             color_image: image,
+            image_height: height,
             ..frame.clone()
         };
         r.set_widescreen(false);

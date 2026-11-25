@@ -103,12 +103,28 @@ pub struct Interpreter {
     /// switched to with `G_LOAD_UCODE`, whose low opcodes differ.
     ucode_2d: bool,
     frame: Frame,
-    /// Colour images (address, width, size code) drawn on the GPU since
-    /// they were last read back into RAM.
-    drawn: Vec<(u32, u32, u32)>,
-    /// The frame before, for reading back an image drawn there and read
-    /// after the frame was handed over.
-    prev: Frame,
+    /// Colour images drawn on the GPU since they were last read back into
+    /// RAM, newest last.
+    drawn: Vec<Drawn>,
+}
+
+/// A colour image drawn on the GPU and not yet read back.
+#[derive(Clone, Debug)]
+struct Drawn {
+    image: u32,
+    width: u32,
+    /// Pixel size code (3: 32-bit, else 16-bit).
+    siz: u32,
+    height: u32,
+    /// The handed-over frame that last drew into it, for an image read in
+    /// a later frame (a picture drawn once, shown for many frames).
+    frame: Option<std::sync::Arc<Frame>>,
+}
+
+impl Drawn {
+    fn drawn_by(&self, d: &Draw) -> bool {
+        d.state.color_image == self.image && d.state.color_width == self.width
+    }
 }
 
 /// Draws what was recorded into one colour image and hands back its
@@ -183,6 +199,7 @@ impl Interpreter {
                 texel_exact: false,
                 picture: false,
                 color_image: 0,
+                color_width: 320,
                 scissor: None,
             },
             fill_color: 0,
@@ -198,7 +215,6 @@ impl Interpreter {
                 ..Frame::default()
             },
             drawn: Vec::new(),
-            prev: Frame::default(),
         }
     }
 
@@ -212,8 +228,14 @@ impl Interpreter {
             ..Frame::default()
         };
         let f = std::mem::replace(&mut self.frame, next);
-        if !self.drawn.is_empty() {
-            self.prev = f.clone();
+        let mut snap = None;
+        for d in &mut self.drawn {
+            if f.draws().any(|x| d.drawn_by(x)) {
+                d.frame = Some(
+                    snap.get_or_insert_with(|| std::sync::Arc::new(f.clone()))
+                        .clone(),
+                );
+            }
         }
         f
     }
@@ -373,6 +395,7 @@ impl Interpreter {
                 0xFF => {
                     self.cimg = (self.phys(w1), (w0 & 0xFFF) + 1, (w0 >> 19) & 3);
                     self.state.color_image = self.cimg.0;
+                    self.state.color_width = self.cimg.1;
                     self.frame.color_image = self.cimg.0;
                     if self.frame.width != self.cimg.1 {
                         self.frame.width = self.cimg.1;
@@ -657,8 +680,30 @@ impl Interpreter {
     }
 
     fn push(&mut self, state: RenderState, verts: &[Vertex]) {
-        if !self.drawn.iter().any(|d| d.0 == self.cimg.0) {
-            self.drawn.push(self.cimg);
+        // The image's height is the scissor's bottom (the game draws inside
+        // it), else a guess from its width.
+        let (image, width, siz) = self.cimg;
+        let h = self
+            .state
+            .scissor
+            .map_or(image_height(width), |s| s[3].ceil().max(1.0) as u32);
+        match self
+            .drawn
+            .iter()
+            .position(|d| d.image == image && d.width == width)
+        {
+            Some(k) => {
+                let mut d = self.drawn.remove(k);
+                d.height = d.height.max(h);
+                self.drawn.push(d);
+            }
+            None => self.drawn.push(Drawn {
+                image,
+                width,
+                siz,
+                height: h,
+                frame: None,
+            }),
         }
         let first = self.frame.vertices.len() as u32;
         self.frame.vertices.extend_from_slice(verts);
@@ -682,16 +727,33 @@ impl Interpreter {
         // A load of another pixel size is a texture that only lies inside
         // the image's guessed extent (its height is a guess from its width),
         // not the picture read back.
-        let Some(k) = self.drawn.iter().position(|&(a, w, siz)| {
-            let len = w * image_height(w) * if siz == 3 { 4 } else { 2 };
-            src >= a && src < a + len && src_siz == siz
+        let Some(k) = self.drawn.iter().rposition(|d| {
+            let len = d.width * d.height * if d.siz == 3 { 4 } else { 2 };
+            src >= d.image && src < d.image + len && src_siz == d.siz
         }) else {
             return;
         };
-        let (a, w, siz) = self.drawn.remove(k);
-        let drew_here = self.frame.draws().any(|d| d.state.color_image == a);
-        let frame = if drew_here { &self.frame } else { &self.prev };
-        let Some(px) = rb.read(frame, a, w, image_height(w)) else {
+        let d = self.drawn.remove(k);
+        let here = self.frame.draws().any(|x| d.drawn_by(x));
+        let Some(from) = (if here {
+            Some(&self.frame)
+        } else {
+            d.frame.as_deref()
+        }) else {
+            return;
+        };
+        // Only the draws into this image: others may share its address.
+        let frame = Frame {
+            commands: from
+                .commands
+                .iter()
+                .filter(|c| !matches!(c, Command::Draw(x) if !d.drawn_by(x)))
+                .cloned()
+                .collect(),
+            ..from.clone()
+        };
+        let (a, siz) = (d.image, d.siz);
+        let Some(px) = rb.read(&frame, a, d.width, d.height) else {
             return;
         };
         for (i, p) in px.as_chunks::<4>().0.iter().enumerate() {
