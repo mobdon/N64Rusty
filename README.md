@@ -348,8 +348,8 @@ Licensed under either of
 at your option. Unless you state otherwise, any contribution you submit for
 inclusion is dual licensed as above, without any additional terms.
 
-AI agents must not work on this repository without the owner's explicit
-permission; see [AGENTS.md](AGENTS.md).
+Only contributors approved by the owner may work on this repository, and AI
+agents need the owner's explicit permission; see [AGENTS.md](AGENTS.md).
 
 Modelled on [N64Recomp](https://github.com/N64Recomp/N64Recomp) (MIT). See
 [CREDITS.md](CREDITS.md) and [NOTICE](NOTICE).
