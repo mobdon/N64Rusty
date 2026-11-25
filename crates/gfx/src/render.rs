@@ -594,15 +594,22 @@ impl Renderer {
         };
         // A backdrop drawn first (a sky made for the original view's width)
         // ends at the 4:3 edges: stretch it like a background. It is the
-        // leading run of 3D draws that each cover nine tenths of the width.
+        // leading run of 3D draws, after nothing but fills, that each cover
+        // nine tenths of the width.
         let mut backdrop = vec![false; frame.vertices.len()];
         if wide > 1.0 {
             for d in frame
                 .draws()
                 .filter(|d| d.state.color_image == frame.color_image)
             {
+                // Fills (a clear) come before a backdrop; any other
+                // rectangle (a background picture) is the backdrop itself,
+                // and 3D after it is the scene.
                 if d.state.rect {
-                    continue;
+                    if (d.state.other_h >> 20) & 3 == 3 {
+                        continue;
+                    }
+                    break;
                 }
                 let range = d.first as usize..(d.first + d.count) as usize;
                 let (mut x0, mut x1) = (1.0f32, -1.0f32);
