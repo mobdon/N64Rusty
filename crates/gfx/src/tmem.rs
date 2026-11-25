@@ -255,7 +255,13 @@ impl Tmem {
         let mut scale = [1.0f32; 2];
         for k in 0..2 {
             let tile_size = (t.lr[k].saturating_sub(t.ul[k]) >> 2) + 1;
-            let clamp = t.cm[k] & 2 != 0;
+            let period = 1 << t.mask[k].min(10);
+            // A clamped tile far larger than its mask repeats the masked
+            // texels until the clamp: decode one period and let it wrap,
+            // not hundreds of copies on every draw.
+            // shortcut: the clamp at the tile's far edge is lost; texture
+            // coordinates rarely reach it. Decode it exactly if a game shows a seam.
+            let clamp = t.cm[k] & 2 != 0 && !(t.mask[k] != 0 && tile_size > period);
             size[k] = if t.mask[k] != 0 && !clamp {
                 1 << t.mask[k].min(10)
             } else {
