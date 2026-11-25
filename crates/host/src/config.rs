@@ -233,6 +233,14 @@ impl RunConfig {
                 ));
             }
         }
+        // The game's RAM is read as a 32-bit word there each frame.
+        if let Some([a, _]) = cfg.window.hud_when {
+            if a % 4 != 0 {
+                return Err(format!(
+                    "window hud_when address {a:#x} is not a multiple of 4"
+                ));
+            }
+        }
         if !(1..=16).contains(&cfg.window.scale) {
             return Err(format!("window scale {} is not 1 to 16", cfg.window.scale));
         }
@@ -317,6 +325,12 @@ mod tests {
             RunConfig::parse("", Path::new("")).unwrap(),
             RunConfig::default()
         );
+    }
+
+    #[test]
+    fn hud_when_must_be_word_aligned() {
+        let text = "[window]\nhud_when = [0x80001236, 0]";
+        assert!(RunConfig::parse(text, Path::new("")).is_err());
     }
 
     #[test]
