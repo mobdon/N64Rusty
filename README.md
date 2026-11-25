@@ -216,6 +216,9 @@ dropped on it, else the one picked last time (`last-rom.txt`), else the
 first `.z64`/`.n64`/`.v64` in its own folder, else asks for one in a file
 window. It opens the game with `--window`, and always with `--expansion`
 (8 MB of RAM, as with the Expansion Pak fitted), so games that need it run.
+Window settings come from the game's own `games/<sha256>/run.toml`, else
+from `run.toml` next to the program, which it writes the first time with
+widescreen on.
 
 Its files live next to the program: `games/<sha256>/` per game (the
 routine list `config.toml`, `save.sra`, `run.toml`) and `routines.txt`.

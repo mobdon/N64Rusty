@@ -4,7 +4,8 @@
 //! Double-click it and it plays the ROM given (dropped on it), else the one
 //! picked last time, else one in its own folder, else asks for one. Files
 //! live next to the program: `games/<sha256>/` per game (routine list,
-//! saves, run.toml), `last-rom.txt`, and `routines.txt`, the fingerprints
+//! saves, run.toml), `run.toml` for games without their own (widescreen
+//! on by default), `last-rom.txt`, and `routines.txt`, the fingerprints
 //! that find a game's system routines when it has no routine list yet.
 //! With more arguments than the ROM, they work as for a generated game
 //! program (`--frames`, `--capture`, `--window`, ...); `--symbols map.txt`
@@ -17,6 +18,16 @@ use std::process::ExitCode;
 
 use n64rusty_rom::{signature, Rom};
 use n64rusty_runner::{main_args, os, read_names, routine_list, Game};
+
+/// Window settings for games with no run.toml of their own.
+const DEFAULT_RUN: &str = "\
+# Window settings for every game without its own games/<sha256>/run.toml.
+# See run.example.toml in the N64Rusty repository for all keys.
+[window]
+widescreen = true
+# refresh = 144        # your monitor's rate: smoother motion
+# console_filter = true # the console's softer texture look
+";
 
 fn main() -> ExitCode {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
@@ -75,6 +86,15 @@ fn play(args: &mut Vec<String>, dir: &Path, plain: bool) -> ExitCode {
     }
     if plain {
         args.push("--window".into());
+    }
+    // A game with no run.toml of its own uses the player's, made with the
+    // player's defaults the first time.
+    if !local.join("run.toml").exists() && !args.iter().any(|a| a == "--run") {
+        let run = dir.join("run.toml");
+        if !run.exists() {
+            let _ = std::fs::write(&run, DEFAULT_RUN);
+        }
+        args.extend(["--run".into(), run.display().to_string()]);
     }
     // Like a console with the Expansion Pak: games that need it run, and
     // the others only see more free memory.
