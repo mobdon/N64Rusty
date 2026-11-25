@@ -152,6 +152,11 @@ pub struct Frame {
     pub commands: Vec<Command>,
     /// Commands that were skipped, with their address.
     pub warnings: Vec<String>,
+    /// HUD areas for widescreen, set by the caller from a per-game table:
+    /// `[x0, y0, x1, y1, side]` in the frame's pixels, side -1 or 1. A
+    /// screen-space triangle (flat, no perspective) wholly inside one moves
+    /// out to that side's edge of a wider target.
+    pub hud: Vec<[f32; 5]>,
 }
 
 impl Frame {

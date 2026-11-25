@@ -672,14 +672,21 @@ impl Renderer {
                 }
             }
         }
+        let shift = hud_shift(frame, transforms, &clip, wide);
         let mut verts = Vec::with_capacity(frame.vertices.len() * VERTEX_FLOATS);
-        for ((v, stretch), backdrop) in frame.vertices.iter().zip(stretch).zip(backdrop) {
+        for (((v, stretch), backdrop), shift) in frame
+            .vertices
+            .iter()
+            .zip(stretch)
+            .zip(backdrop)
+            .zip(shift.iter().copied())
+        {
             let mut p = at(v);
             match stretch {
                 // Rectangles are in pixels with w = 1.
                 Some((x0, x1)) => p[0] = 2.0 * (v.pos[0] - x0) / (x1 - x0) - 1.0,
                 None if backdrop => {}
-                None => p[0] /= wide,
+                None => p[0] = p[0] / wide + shift * p[3],
             }
             verts.extend_from_slice(&p);
             verts.extend_from_slice(&v.color);
@@ -814,7 +821,13 @@ impl Renderer {
                 let i = next;
                 next += 1;
                 let (key, bind) = &prepared[i];
-                let [x, y, w, h] = scissor(d.state.scissor, frame, width, height, wide);
+                let [mut x, y, w, h] = scissor(d.state.scissor, frame, width, height, wide);
+                // A HUD piece moved to the edge takes its own scissor box along.
+                let moved = shift.get(d.first as usize).copied().unwrap_or(0.0);
+                if moved != 0.0 && w < width {
+                    let px = (moved * width as f32 / 2.0).round() as i64;
+                    x = (x as i64 + px).clamp(0, (width - w) as i64) as u32;
+                }
                 if w == 0 || h == 0 {
                     continue;
                 }
@@ -969,6 +982,86 @@ fn clip_matrices(frame: &Frame, transforms: &[crate::Transform]) -> Vec<crate::M
             mat_mul(&mat_mul(&t.modelview, &t.projection), &vp)
         })
         .collect()
+}
+
+/// Clip-space x shift of each vertex for the frame's HUD areas (see
+/// [`Frame::hud`]): `side * (1 - 1 / wide)` for the triangles moved.
+///
+/// A 3D piece drawn in a small viewport of its own (a spinning button)
+/// counts by its viewport. Pieces on a panel stay: a flat quad at least
+/// 100 pixels wide that no area holds (a dialog box) keeps the text drawn
+/// on it together, even where the text runs into an area.
+fn hud_shift(
+    frame: &Frame,
+    transforms: &[crate::Transform],
+    clip: &[crate::Mat4],
+    wide: f32,
+) -> Vec<f32> {
+    let mut shift = vec![0.0f32; frame.vertices.len()];
+    if wide <= 1.0 || frame.hud.is_empty() {
+        return shift;
+    }
+    let (fw, fh) = (frame.width as f32, frame.height() as f32);
+    // Flat (screen-space) triangles with their pixel bounds.
+    let mut tris = Vec::new();
+    for d in frame
+        .draws()
+        .filter(|d| d.state.color_image == frame.color_image)
+    {
+        let end = (d.first + d.count) as usize;
+        'tri: for tri in (d.first as usize..end).step_by(3) {
+            let range = tri..(tri + 3).min(end);
+            let mut b = [f32::MAX, f32::MAX, f32::MIN, f32::MIN];
+            for v in &frame.vertices[range.clone()] {
+                let (Some(m), Some(t)) = (
+                    clip.get(v.transform as usize),
+                    transforms.get(v.transform as usize),
+                ) else {
+                    continue 'tri;
+                };
+                if m[0][3] != 0.0 || m[1][3] != 0.0 || m[2][3] != 0.0 {
+                    let ([sx, sy], [tx, ty]) = (t.viewport.scale, t.viewport.trans);
+                    if sx.abs() * 2.0 >= fw * 0.5 {
+                        continue 'tri; // the 3D scene
+                    }
+                    let vb = [tx - sx.abs(), ty - sy.abs(), tx + sx.abs(), ty + sy.abs()];
+                    b = [
+                        b[0].min(vb[0]),
+                        b[1].min(vb[1]),
+                        b[2].max(vb[2]),
+                        b[3].max(vb[3]),
+                    ];
+                    continue;
+                }
+                let p = transform(m, v.pos);
+                let (x, y) = (
+                    (p[0] / p[3] + 1.0) / 2.0 * fw,
+                    (1.0 - p[1] / p[3]) / 2.0 * fh,
+                );
+                b = [b[0].min(x), b[1].min(y), b[2].max(x), b[3].max(y)];
+            }
+            tris.push((range, b));
+        }
+    }
+    let within = |b: &[f32; 4], r: &[f32; 4]| {
+        b[0] >= r[0] - 0.5 && b[1] >= r[1] - 0.5 && b[2] <= r[2] + 0.5 && b[3] <= r[3] + 0.5
+    };
+    let area = |r: &[f32; 5]| [r[0], r[1], r[2], r[3]];
+    let panels: Vec<[f32; 4]> = tris
+        .iter()
+        .map(|t| t.1)
+        .filter(|b| b[2] - b[0] >= 100.0 && b[2] - b[0] < fw * 0.9)
+        .filter(|b| !frame.hud.iter().any(|r| within(b, &area(r))))
+        .collect();
+    for (range, b) in tris {
+        if panels.iter().any(|p| within(&b, p)) {
+            continue;
+        }
+        if let Some(r) = frame.hud.iter().find(|r| within(&b, &area(r))) {
+            shift[range].fill(r[4] * (1.0 - 1.0 / wide));
+        }
+    }
+    shift
 }
 
 fn transform(m: &crate::Mat4, p: [f32; 3]) -> [f32; 4] {

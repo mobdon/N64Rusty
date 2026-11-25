@@ -57,6 +57,10 @@ pub struct Media {
     /// Also save the picture half-way from the frame before each saved one,
     /// as a high refresh rate window would show it.
     between: bool,
+    /// Per-game HUD areas for widescreen and the RAM word (address, value)
+    /// that must match for them to apply (see `WindowConfig::hud`).
+    hud: Vec<[f32; 5]>,
+    hud_when: Option<[u32; 2]>,
     /// The frame before the next one to save, kept when `between` is set.
     prev: Option<Frame>,
     renderer: Option<Renderer>,
@@ -110,6 +114,8 @@ impl Media {
             scale: 1,
             wide: false,
             between: false,
+            hud: Vec::new(),
+            hud_when: None,
             prev: None,
             renderer: None,
             renderer_failed: false,
@@ -139,6 +145,14 @@ impl Media {
     /// Also saves `frame_<n>_half.png`: half-way from frame n-1 to frame n.
     pub fn with_between(mut self, on: bool) -> Self {
         self.between = on;
+        self
+    }
+
+    /// HUD areas kept at the edges in widescreen, used while the RAM word
+    /// in `when` (address, value) matches, or always without one.
+    pub fn with_hud(mut self, hud: Vec<[f32; 5]>, when: Option<[u32; 2]>) -> Self {
+        self.hud = hud;
+        self.hud_when = when;
         self
     }
 
@@ -330,8 +344,11 @@ impl Devices for Media {
         })
     }
 
-    fn swap_buffer(&mut self, _ctx: &Ctx, frame: u64, _framebuffer: u32) {
-        let f = self.gfx.take_frame();
+    fn swap_buffer(&mut self, ctx: &Ctx, frame: u64, _framebuffer: u32) {
+        let mut f = self.gfx.take_frame();
+        if self.hud_when.is_none_or(|[a, v]| ctx.mem.read_u32(a) == v) {
+            f.hud = self.hud.clone();
+        }
         self.swaps += 1;
         self.last = Some((frame, f.draws().count(), f.textures.len()));
         for w in &f.warnings {

@@ -523,10 +523,8 @@ pub fn main_args(
         return ExitCode::from(2);
     }
     // The per-game config sits next to the generated crate by default.
-    // The run config only matters to window runs.
-    let run_config = run_config
-        .or_else(|| Some(local.join("run.toml")).filter(|p| p.exists()))
-        .filter(|_| window);
+    // Headless runs take only its widescreen HUD areas, for captures.
+    let run_config = run_config.or_else(|| Some(local.join("run.toml")).filter(|p| p.exists()));
     let mut run_config = match run_config.map(|p| n64rusty_host::RunConfig::load(&p)) {
         Some(Err(e)) => {
             eprintln!("error: run config {e}");
@@ -538,7 +536,7 @@ pub fn main_args(
     // The game, not the window, ends a run at its frame limit, so the run
     // report is still printed.
     let frames = frames
-        .or(run_config.frames.take())
+        .or(run_config.frames.take().filter(|_| window))
         .unwrap_or(if window { u64::MAX } else { 600 });
     let default_config = local.join("config.toml");
     if default_config.exists() {
@@ -614,7 +612,8 @@ pub fn main_args(
     let media = media::Media::new(capture, every, wav, n_audio, script)
         .with_scale(scale)
         .with_widescreen(wide)
-        .with_between(between);
+        .with_between(between)
+        .with_hud(run_config.window.hud.clone(), run_config.window.hud_when);
     let entry = game.entry;
     if window {
         return live::play(&run_config, media, move |devices| {

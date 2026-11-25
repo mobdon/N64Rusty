@@ -13,6 +13,10 @@ scale = 2                       # 320x240 times this
 # widescreen = false            # on by default: fills a wide window, showing more at the sides
 # refresh = 144                 # default 0: the display's rate; draw this often, blending between game
 #                               # frames; the game still runs at frame_rate
+# hud = [[0, 0, 150, 60, -1], [155, 0, 320, 70, 1]]  # per game: HUD areas (4:3
+#                               # pixels, side -1 left / 1 right) kept at the
+#                               # window's edges in widescreen
+# hud_when = [0x80001234, 0]    # only while this RAM word holds this value
 
 # Ports 1 to 4, in order. Sources: "keyboard", "gamepad0", "gamepad1", ...
 [[port]]
