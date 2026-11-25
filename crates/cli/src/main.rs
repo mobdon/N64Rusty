@@ -676,7 +676,10 @@ fn masked(w: u32) -> u32 {
 /// if `w` is not a branch: code up to there is still the same routine.
 fn branch_reach(w: u32, k: usize) -> usize {
     let branch = match w >> 26 {
-        1 | 4..=7 | 0x14..=0x17 => true,
+        // REGIMM: only BLTZ/BGEZ and their likely and linking forms; the
+        // rest (TGEI and friends) are traps with no target.
+        1 => matches!((w >> 16) & 31, 0..=3 | 0x10..=0x13),
+        4..=7 | 0x14..=0x17 => true,
         0x11 => (w >> 21) & 31 == 8, // BC1F/BC1T and their likely forms
         _ => false,
     };
@@ -932,6 +935,9 @@ mod tests {
             k + 2 < w.len() && w[k] == 0x03E0_0008 && k + 2 > reach && starts_function(&w, k + 2)
         });
         assert_eq!(end, Some(4));
+        // A trap (TEQI) carries no target: it does not reach past a return.
+        assert_eq!(branch_reach(0x048C_0010, 0), 0);
+        assert_eq!(branch_reach(0x0401_0003, 0), 5); // BGEZ +3
     }
 
     #[test]
