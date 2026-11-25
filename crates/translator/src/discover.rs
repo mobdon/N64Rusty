@@ -251,6 +251,84 @@ pub fn function_starts(img: &Image) -> Vec<u32> {
     out
 }
 
+/// Code copies a game's own load table describes, found before any run
+/// makes them: `(rom, ram, len)` for each word pair `rom start, rom end`
+/// followed within three words by a RAM address at which that ROM range
+/// reads as code. It reads as code when its calls into itself land where
+/// functions start (after a return and its padding, or at its first word): nine in ten or
+/// more, and at least one; code with no such calls must build two or
+/// more addresses inside itself (`lui`, `addiu`). Build tools lay segment tables out this way
+/// (start, end, then load address), whatever else each entry holds.
+pub fn overlay_table(rom: &[u8]) -> Vec<(u32, u32, u32)> {
+    const JR_RA: u32 = 0x03E0_0008;
+    let words: Vec<u32> = rom
+        .chunks_exact(4)
+        .map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let rom_len = (words.len() * 4) as u32;
+    let mut out = Vec::new();
+    let mut tried = HashSet::new();
+    let mut done = HashSet::new();
+    for w in words.windows(5) {
+        let (s, e) = (w[0], w[1]);
+        if s < 0x1000 || s % 4 != 0 || e <= s || e > rom_len || e - s > 0x10_0000 {
+            continue;
+        }
+        // shortcut: one load address per ROM start (the first table entry
+        // wins), so code copied to two places needs a run to find the second.
+        if done.contains(&s) {
+            continue;
+        }
+        let code = &words[s as usize / 4..e as usize / 4];
+        for &ram in &w[2..5] {
+            if !(0x8000_0000..0x8080_0000).contains(&ram) || ram % 4 != 0 || !tried.insert((s, ram))
+            {
+                continue;
+            }
+            let at = |k: usize| ram.wrapping_add(4 * k as u32);
+            // The first word after each return and any padding after it.
+            let mut starts = HashSet::from([ram]);
+            let mut k = 0;
+            while k < code.len() {
+                if code[k] == JR_RA {
+                    k += 2;
+                    while k < code.len() && code[k] == 0 {
+                        k += 1;
+                    }
+                    starts.insert(at(k));
+                } else {
+                    k += 1;
+                }
+            }
+            let (mut inside, mut good) = (0, 0);
+            for &c in code.iter().filter(|&&c| c >> 26 == 3) {
+                let t = (ram & 0xF000_0000) | (c & 0x03FF_FFFF) << 2;
+                if t >= ram && t - ram < e - s {
+                    inside += 1;
+                    good += starts.contains(&t) as u32;
+                }
+            }
+            // Code with no calls into itself (leaf functions reached through
+            // pointers) still builds addresses inside itself.
+            let own_pointers = code
+                .windows(2)
+                .filter(|p| p[0] >> 26 == 0x0F && p[1] >> 26 == 0x09)
+                .filter(|p| (p[0] >> 16) & 31 == (p[1] >> 21) & 31)
+                .map(|p| (p[0] << 16).wrapping_add(p[1] as u16 as i16 as u32))
+                .filter(|&v| v >= ram && v - ram < e - s)
+                .count();
+            if (good > 0 && good * 10 >= inside * 9) || (inside == 0 && own_pointers >= 2) {
+                // The load address comes first; later words are often the
+                // same code's section addresses, which would also pass.
+                out.push((s, ram, e - s));
+                done.insert(s);
+                break;
+            }
+        }
+    }
+    out
+}
+
 /// Words anywhere in the image that point inside it at something that starts
 /// like a function (`addiu $sp, $sp, -n`): function pointers in data tables.
 /// Pass them to [`discover`] as hints.
@@ -582,5 +660,29 @@ mod tests {
         // The lui/addiu pair alone finds it too, since it has a prologue.
         let d = discover(&img, &[BASE], &[], Some(BASE + 28));
         assert_eq!(d.functions.len(), 2);
+    }
+    #[test]
+    fn overlay_table_finds_code_by_its_own_calls() {
+        // ROM: a table entry at 0x1000 (start 0x2000, end 0x2018, load
+        // address 0x8020_0000), and at 0x2000 two functions, the first
+        // calling the second (jal 0x8020_000c).
+        let mut rom = vec![0u8; 0x3000];
+        let put = |rom: &mut Vec<u8>, at: usize, w: u32| {
+            rom[at..at + 4].copy_from_slice(&w.to_be_bytes())
+        };
+        for (k, w) in [0x2000u32, 0x2018, 0x8020_0000].into_iter().enumerate() {
+            put(&mut rom, 0x1000 + 4 * k, w);
+        }
+        let jal = 0x0C00_0000 | (0x8020_000c & 0x03FF_FFFF) >> 2;
+        for (k, w) in [jal, JR_RA, NOP, 0x2402_0001, JR_RA, NOP]
+            .into_iter()
+            .enumerate()
+        {
+            put(&mut rom, 0x2000 + 4 * k, w);
+        }
+        assert_eq!(overlay_table(&rom), [(0x2000, 0x8020_0000, 0x18)]);
+        // The same code read at the wrong address calls into its middle.
+        put(&mut rom, 0x1008, 0x8020_0004);
+        assert_eq!(overlay_table(&rom), []);
     }
 }
