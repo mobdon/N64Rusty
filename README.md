@@ -204,6 +204,40 @@ keeps your input; `replay = "take.txt"` plays it back. With `headless = true`
 in the run config nothing is opened and the run goes as fast as it can with
 scripted input, which is how this mode is tested.
 
+## Playing with nothing to build
+
+`n64rusty-play` plays a ROM with no translate step and no Rust: every
+function runs in the reference interpreter, with system routines replaced
+as usual. On Windows, double-click `n64rusty-play.exe`: it plays a ROM
+dropped on it, else the one picked last time (`last-rom.txt`), else the
+first `.z64`/`.n64`/`.v64` in its own folder, else asks for one in a file
+window. It opens the game with `--window`.
+
+Its files live next to the program: `games/<sha256>/` per game (the
+routine list `config.toml`, `save.sra`, `run.toml`) and `routines.txt`.
+A game with no routine list gets one found in its ROM by `routines.txt`:
+fingerprints of the system routines (each routine's length and a hash of
+its code with addresses taken out, and the same for code that calls a
+routine too short to fingerprint). Fingerprints hold no code, but they come
+from symbol maps, so like the maps they stay local and are never committed.
+Make them with a game whose routines are known:
+
+```
+n64rusty-play your.z64 --symbols local-map.txt --frames 1
+```
+
+writes that game's routine list and adds its fingerprints to
+`routines.txt`. With fingerprints from one game, another game using the same
+library version gets most of its routines found and plays. Games built with
+another library version need fingerprints from a game with that version.
+To share the program, give the folder with `n64rusty-play.exe` and
+`routines.txt`; each person uses their own ROM. Never share the `games`
+folder's saved images or a ROM. Any other arguments work as for a generated
+game program (`--frames`, `--capture`, `--window`, and so on).
+
+CI builds `n64rusty-play.exe` on each push to `main` and keeps it as the
+`n64rusty-play-windows` artifact of the run.
+
 ## Window and input
 
 `crates/host` runs the frame loop around a game. A game plugs in through the

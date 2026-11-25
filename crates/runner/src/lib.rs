@@ -90,6 +90,19 @@ pub fn read_names(paths: &[PathBuf]) -> BTreeMap<u32, String> {
     out
 }
 
+/// The lines of a per-game `config.toml` that keep, from symbol maps, only
+/// the routines the runner replaces or looks for: `name = 0xADDR`.
+pub fn routine_list(names: &BTreeMap<u32, String>) -> String {
+    names
+        .iter()
+        .filter(|(_, n)| N_AUDIO.contains(&n.as_str()) || os::HOOKS.iter().any(|(h, _)| h == n))
+        .map(|(a, n)| format!("{n} = {a:#010x}\n"))
+        .collect()
+}
+
+/// Routines that tell the alternative audio library is in use.
+const N_AUDIO: [&str; 2] = ["n_alSynNew", "n_alAudioFrame"];
+
 fn label(names: &BTreeMap<u32, String>, a: u32) -> String {
     match names.get(&a) {
         Some(n) => format!("{a:#010x} {n}"),
@@ -307,7 +320,15 @@ pub fn main(game: Game) -> ExitCode {
 /// Like [`main`], with the given devices for graphics, audio and input
 /// (`None` for the default interpreter and capture).
 pub fn main_with(game: Game, devices: Option<Box<dyn devices::Devices>>) -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    main_args(game, devices, std::env::args().skip(1).collect())
+}
+
+/// Like [`main_with`], with the given command-line arguments.
+pub fn main_args(
+    game: Game,
+    devices: Option<Box<dyn devices::Devices>>,
+    args: Vec<String>,
+) -> ExitCode {
     let mut rom_path = None;
     let mut symbols = Vec::new();
     let mut frames = None;
@@ -498,9 +519,7 @@ pub fn main_with(game: Game, devices: Option<Box<dyn devices::Devices>>) -> Exit
     };
     // The alternative audio library has its own command set; tell them
     // apart by the library's routine names in the local symbol map.
-    let n_audio = ["n_alSynNew", "n_alAudioFrame"]
-        .iter()
-        .any(|n| by_name.contains_key(*n));
+    let n_audio = N_AUDIO.iter().any(|n| by_name.contains_key(*n));
     let media = media::Media::new(capture, every, wav, n_audio, script)
         .with_scale(scale)
         .with_widescreen(wide)
@@ -577,5 +596,33 @@ fn run_and_report(
             );
             1
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn routine_list_keeps_replaced_and_audio_routines() {
+        let names: BTreeMap<u32, String> = [
+            (0x8000_1000, "osCreateThread"),
+            (0x8000_2000, "some_game_function"),
+            (0x8000_3000, "n_alSynNew"),
+        ]
+        .into_iter()
+        .map(|(a, n)| (a, n.to_string()))
+        .collect();
+        let list = routine_list(&names);
+        assert_eq!(
+            list,
+            "osCreateThread = 0x80001000\nn_alSynNew = 0x80003000\n"
+        );
+        let path = std::env::temp_dir().join(format!("routines-{}.toml", std::process::id()));
+        std::fs::write(&path, &list).unwrap();
+        let back = read_names(std::slice::from_ref(&path));
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(back.len(), 2);
+        assert_eq!(back[&0x8000_1000], "osCreateThread");
     }
 }
