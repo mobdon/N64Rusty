@@ -137,6 +137,9 @@ its command set is used. `--input script.txt` plays a controller script
 (`frame port buttons x y` lines, the format `n64rusty-host` records),
 matched against retrace numbers, so a headless run can press buttons.
 
+`--expansion` runs with the Expansion Pak: 8 MB of RAM instead of 4 MB, as
+games that need it check.
+
 Cartridge save memory (battery-backed SRAM, reached with PI DMA) is kept
 in a file: `--save file`, and window runs default to `save.sra` in the
 per-game folder. The file is read at start and rewritten after every write
