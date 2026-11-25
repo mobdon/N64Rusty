@@ -96,6 +96,22 @@ fn dispatch(c: &mut Ctx) {
     }
 }
 
+fn hooked() -> Vec<u32> {
+    HOOKS
+        .lock()
+        .unwrap()
+        .iter()
+        .flat_map(|h| h.keys().copied())
+        .collect()
+}
+
+/// Drops hooks set since `before` was taken.
+fn drop_hooks_since(before: &[u32]) {
+    if let Some(h) = HOOKS.lock().unwrap().as_mut() {
+        h.retain(|a, _| before.contains(a));
+    }
+}
+
 /// Runs each mod's install; keeps the active ones loaded for the run.
 pub fn install(
     libs: Vec<(String, libloading::Library)>,
@@ -126,18 +142,32 @@ pub fn install(
             eprintln!("warning: mod {name} has no install function");
             continue;
         };
+        let before = hooked();
         if f(api) {
             println!("mod {name}: on");
             std::mem::forget(lib);
+        } else {
+            // Its library unloads below: hooks it set must not outlive it.
+            drop_hooks_since(&before);
         }
     }
-    let hooks: Vec<u32> = HOOKS
-        .lock()
-        .unwrap()
-        .iter()
-        .flat_map(|h| h.keys().copied())
-        .collect();
-    for a in hooks {
+    for a in hooked() {
         c.set_override(a, dispatch);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    extern "C" fn hook(_: *mut c_void) {}
+
+    #[test]
+    fn a_declined_mod_leaves_no_hooks() {
+        set_override(0x8000_1000, hook);
+        let before = hooked();
+        set_override(0x8000_2000, hook);
+        drop_hooks_since(&before);
+        assert_eq!(hooked(), vec![0x8000_1000]);
     }
 }
