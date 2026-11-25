@@ -1,8 +1,9 @@
 //! Plays any N64 ROM with nothing built for it: every function runs in the
 //! reference interpreter, and system routines are replaced as usual.
 //!
-//! Double-click it and it plays the ROM given (dropped on it), else the one
-//! picked last time, else one in its own folder, else asks for one. Files
+//! Double-click it and it plays the ROM given (dropped on it), else shows a
+//! start screen of the ROMs played before, else plays one in its own folder,
+//! else asks for one. Files
 //! live next to the program: `games/<sha256>/` per game (routine list,
 //! saves, an optional run.toml), `settings.toml` (window choices made in
 //! the menu, for games without their own run.toml), `recent.txt` (the ROMs played, newest first, for the Game menu), and
@@ -19,7 +20,7 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 
 use n64rusty_rom::{signature, Rom};
 use n64rusty_runner::{main_args, os, read_names, routine_list, Game};
@@ -101,9 +102,28 @@ fn error_box(text: &str) {
 fn error_box(_text: &str) {}
 
 fn play(args: &mut Vec<String>, dir: &Path, plain: bool) -> ExitCode {
+    // Its Game menu can go back to the start screen.
+    n64rusty_host::menu::START_SCREEN.store(true, std::sync::atomic::Ordering::Relaxed);
     let recent = dir.join("recent.txt");
     if args.first().is_none_or(|a| a.starts_with("--")) {
-        let remembered = n64rusty_host::menu::recent_roms().into_iter().next();
+        let recent = n64rusty_host::menu::recent_roms();
+        if args.is_empty() && !recent.is_empty() {
+            // The start screen has its own window, and a program gets one
+            // window loop: the game plays in a fresh start of the program.
+            let Some(rom) = n64rusty_host::launcher::pick(&recent) else {
+                return ExitCode::SUCCESS;
+            };
+            let started =
+                std::env::current_exe().and_then(|exe| Command::new(exe).arg(&rom).spawn());
+            return match started {
+                Ok(_) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("error: starting {}: {e}", rom.display());
+                    ExitCode::from(2)
+                }
+            };
+        }
+        let remembered = recent.into_iter().next();
         let Some(rom) = remembered.or_else(|| find_rom(dir)).or_else(pick_rom) else {
             eprintln!(
                 "No ROM given. Drop your .z64, .n64 or .v64 file on this program, or put it in {}",

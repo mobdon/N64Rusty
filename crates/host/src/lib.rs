@@ -7,6 +7,7 @@
 
 pub mod config;
 pub mod debug;
+pub mod launcher;
 pub mod mapping;
 pub mod menu;
 pub mod pad;
