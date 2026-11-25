@@ -166,6 +166,11 @@ impl RunConfig {
             }
             cfg.frame_rate = rate;
         }
+        if let Some(r) = cfg.window.refresh {
+            if !(r.is_finite() && (1.0..=1000.0).contains(&r)) {
+                return Err(format!("window refresh {r} is not between 1 and 1000"));
+            }
+        }
         if !(1..=16).contains(&cfg.window.scale) {
             return Err(format!("window scale {} is not 1 to 16", cfg.window.scale));
         }
@@ -316,6 +321,8 @@ mod tests {
             ("frmaes = 3", "unknown field"),
             ("debug_port = \"0.0.0.0:6464\"", "loopback"),
             ("frame_rate = 0", "between"),
+            ("[window]\nrefresh = inf", "between"),
+            ("[window]\nrefresh = 0", "between"),
             ("[[port]]\nsources = [\"mouse\"]", "unknown source"),
             (
                 "[[port]]\nsources = [\"keyboard\"]\ndeadzone = 0.1",
