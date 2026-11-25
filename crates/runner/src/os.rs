@@ -157,6 +157,9 @@ pub struct State {
     vi: Option<(u32, u32, u32)>,
     timers: BTreeMap<u32, Timer>,
     next_vi: u64,
+    /// What `osSetTime` added to the clock for `osGetTime`. The clock
+    /// itself (Count, retraces, timers) never goes back.
+    time_offset: u64,
     /// Video retraces so far.
     pub frames: u64,
     frame_limit: u64,
@@ -638,6 +641,7 @@ pub fn run(
                 vi: None,
                 timers: BTreeMap::new(),
                 next_vi: TICKS_PER_FRAME,
+                time_offset: 0,
                 frames: 0,
                 frame_limit,
                 done: None,
@@ -940,12 +944,15 @@ fn os_vi_get_framebuffer(c: &mut Ctx) {
 }
 
 fn os_get_time(c: &mut Ctx) {
-    let t = c.clock;
+    let t = c.clock.wrapping_add(lock().time_offset);
     ret64(c, t);
 }
 
+/// Sets only what `osGetTime` reads, as the library does: rewinding the
+/// clock itself would stop retraces and timers until it caught up again.
 fn os_set_time(c: &mut Ctx) {
-    c.clock = arg64(c, 0);
+    let offset = arg64(c, 0).wrapping_sub(c.clock);
+    lock().time_offset = offset;
 }
 
 fn os_get_count(c: &mut Ctx) {
