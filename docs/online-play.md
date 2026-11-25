@@ -89,7 +89,11 @@ once, since it never runs the game.
 
 **ROMs: the plain rule.** The server must never hold, send or receive ROM bytes.
 Each player supplies their own dump of their own cartridge; the client only
-sends its sha256 so the server can pair matching copies. This is also why the
+sends its sha256 so the server can pair matching copies.
+A bare hash proves nothing (known hashes are public), so at connect time the
+server also asks for the hash of a random byte range of the ROM, a new range
+each time; only a client that has the file can answer. The rule is simple:
+you can play as long as you have the ROM. This is also why the
 "server runs the game" option is ruled out: it would mean a ROM stored on the
 server and a game played by someone who did not supply it, which looks like
 distribution. This is a legal risk worth checking with someone qualified
