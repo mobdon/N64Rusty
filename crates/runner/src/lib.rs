@@ -15,6 +15,23 @@ pub mod media;
 pub mod os;
 pub mod save;
 
+/// Mods built in from the `N64RUSTY_MODS` folder (see build.rs); none in a
+/// normal build. Each mod file has
+/// `pub fn install(ctx: &mut Ctx, rom: &mut Vec<u8>, sha256: &str)`, run
+/// once before the game starts: it checks the ROM hash itself, may set
+/// overrides on the context (wrapping a game function with
+/// [`Ctx::call_original`]) and may change the cartridge bytes the game
+/// reads. With any mod built in, RAM has [`MOD_RAM`] more bytes above what
+/// the game is told it has, for the mods' own data.
+mod mods {
+    use n64rusty_runtime::Ctx;
+    include!(concat!(env!("OUT_DIR"), "/mods.rs"));
+}
+
+/// Bytes of RAM above the game's own for mods' data, when any are built in:
+/// the last `MOD_RAM` bytes of `ctx.mem`.
+pub const MOD_RAM: usize = 0x40_0000;
+
 use std::collections::BTreeMap;
 use std::panic;
 use std::path::PathBuf;
@@ -49,7 +66,7 @@ pub fn boot(rom: &Rom, game: &Game) -> Ctx {
     } else {
         RAM_SIZE
     };
-    let mut mem = Memory::new(size);
+    let mut mem = Memory::new(size + if mods::ANY { MOD_RAM } else { 0 });
     let seg = rom.boot_segment();
     let at = (rom.entry() & 0x1FFF_FFFF) as usize;
     let n = seg.len().min(size - at);
@@ -255,6 +272,41 @@ static RAM_OUT: Mutex<Option<PathBuf>> = Mutex::new(None);
 static INTERPRET: Mutex<Option<(u32, u32)>> = Mutex::new(None);
 
 static NAMES: Mutex<BTreeMap<u32, String>> = Mutex::new(BTreeMap::new());
+/// The ROM file this run plays, for [`find_rom`].
+static ROM_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// Another ROM the player owns, by the SHA-256 of its big-endian bytes, in
+/// big-endian order: for mods that use a second game's data. Looks in the
+/// played ROM's folder, the folders beside it and the current folder; reads
+/// only files of a cartridge's size.
+pub fn find_rom(sha256: &str) -> Option<Vec<u8>> {
+    let played = ROM_PATH.lock().unwrap().clone()?;
+    let here = played.parent()?.to_path_buf();
+    let mut dirs = vec![here.clone(), PathBuf::from(".")];
+    if let Some(Ok(sibs)) = here.parent().map(std::fs::read_dir) {
+        dirs.extend(sibs.flatten().map(|e| e.path()).filter(|p| p.is_dir()));
+    }
+    let n64 = |p: &PathBuf| {
+        p.extension().is_some_and(|x| {
+            ["z64", "n64", "v64"].contains(&x.to_string_lossy().to_lowercase().as_str())
+        })
+    };
+    for d in dirs {
+        let Ok(files) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for p in files.flatten().map(|e| e.path()).filter(n64) {
+            let fits = std::fs::metadata(&p).is_ok_and(|m| m.len() <= 0x400_0000);
+            let rom = fits.then(|| std::fs::read(&p).ok()).flatten();
+            if let Some(Ok(r)) = rom.map(Rom::from_bytes) {
+                if r.sha256 == sha256 {
+                    return Some(r.bytes().to_vec());
+                }
+            }
+        }
+    }
+    None
+}
 
 /// Text describing the state at a panic: recent calls and registers.
 pub fn crash_report(ctx: &Ctx) -> String {
@@ -460,6 +512,7 @@ pub fn main_args(
             return ExitCode::from(2);
         }
     };
+    *ROM_PATH.lock().unwrap() = Some(rom_path.clone());
     if rom.sha256 != game.sha256 {
         eprintln!(
             "error: this build was generated from ROM {}, but {} is {}",
@@ -505,7 +558,9 @@ pub fn main_args(
     let by_name: BTreeMap<String, u32> = names.iter().map(|(a, n)| (n.clone(), *a)).collect();
 
     let mut ctx = boot(&rom, &game);
-    let rom_bytes: Arc<[u8]> = Arc::from(rom.bytes());
+    let mut cart = rom.bytes().to_vec();
+    mods::install(&mut ctx, &mut cart, game.sha256);
+    let rom_bytes: Arc<[u8]> = Arc::from(cart);
     ctx.mem.set_io(Io {
         sp_mem: vec![0; 0x2000],
         rom: rom_bytes.clone(),

@@ -50,6 +50,8 @@ const MAX_WARNINGS: usize = 64;
 const G_CULL_FRONT: u32 = 0x0200;
 const G_CULL_BACK: u32 = 0x0400;
 const G_LIGHTING: u32 = 0x0002_0000;
+const G_TEXTURE_GEN: u32 = 0x0004_0000;
+const G_TEXTURE_GEN_LINEAR: u32 = 0x0008_0000;
 
 /// A loaded vertex, after the vertex stage.
 #[derive(Clone, Copy, Default)]
@@ -84,6 +86,8 @@ pub struct Interpreter {
     geometry: u32,
     lights: [Light; 8],
     num_lights: usize,
+    /// Look-at directions (x, then y) for texture generation.
+    lookat: [[f32; 3]; 2],
     tex_scale: [f32; 2],
     tex_tile: usize,
     tex_on: bool,
@@ -160,6 +164,7 @@ impl Interpreter {
             geometry: 0,
             lights: [Light::default(); 8],
             num_lights: 0,
+            lookat: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
             tex_scale: [1.0; 2],
             tex_tile: 0,
             tex_on: false,
@@ -482,10 +487,12 @@ impl Interpreter {
             }
             10 => {
                 // Lights start after the two look-at entries.
-                let Some(n) = (offset / 24).checked_sub(2) else {
-                    return Ok(()); // look-at, only used by texture generation
-                };
                 let b = |k: u32| rd8(rdram, a + k, at);
+                let Some(n) = (offset / 24).checked_sub(2) else {
+                    self.lookat[(offset / 24) as usize] =
+                        normalize([b(8)? as i8 as f32, b(9)? as i8 as f32, b(10)? as i8 as f32]);
+                    return Ok(());
+                };
                 let light = Light {
                     color: [
                         b(0)? as f32 / 255.0,
@@ -524,29 +531,41 @@ impl Interpreter {
         let transform = self.frame.transforms.len() as u32 - 1;
         let a = self.phys(w1);
         let lit = self.geometry & G_LIGHTING != 0;
+        let gen = lit && self.geometry & G_TEXTURE_GEN != 0;
+        let linear = self.geometry & G_TEXTURE_GEN_LINEAR != 0;
         for i in 0..n {
             let v = a + i as u32 * 16;
             let h = |k: u32| -> Result<i16, GfxError> { Ok(rd16(rdram, v + k, at)? as i16) };
             let b = |k: u32| rd8(rdram, v + k, at);
+            let normal = [
+                b(12)? as i8 as f32,
+                b(13)? as i8 as f32,
+                b(14)? as i8 as f32,
+            ];
             let color = if lit {
-                let n = [
-                    b(12)? as i8 as f32,
-                    b(13)? as i8 as f32,
-                    b(14)? as i8 as f32,
-                ];
-                let lc = self.light(&lights_mv, n);
+                let lc = self.light(&lights_mv, normal);
                 [lc[0], lc[1], lc[2], b(15)? as f32 / 255.0]
             } else {
                 [b(12)?, b(13)?, b(14)?, b(15)?].map(|c| c as f32 / 255.0)
+            };
+            let st = if gen {
+                texgen(
+                    eye_normal(&lights_mv, normal),
+                    self.lookat,
+                    self.tex_scale,
+                    linear,
+                )
+            } else {
+                [
+                    h(8)? as f32 / 32.0 * self.tex_scale[0],
+                    h(10)? as f32 / 32.0 * self.tex_scale[1],
+                ]
             };
             self.vtx[end - n + i] = Loaded {
                 pos: [h(0)? as f32, h(2)? as f32, h(4)? as f32],
                 transform,
                 color,
-                st: [
-                    h(8)? as f32 / 32.0 * self.tex_scale[0],
-                    h(10)? as f32 / 32.0 * self.tex_scale[1],
-                ],
+                st,
             };
         }
         Ok(())
@@ -584,7 +603,7 @@ impl Interpreter {
 
     /// Directional lights plus ambient (the light after the last one).
     fn light(&self, mv: &Mat4, n: [f32; 3]) -> [f32; 3] {
-        let n = normalize([0, 1, 2].map(|j| (0..3).map(|k| n[k] * mv[k][j]).sum::<f32>()));
+        let n = eye_normal(mv, n);
         let mut c = self.lights[self.num_lights].color;
         for l in &self.lights[..self.num_lights] {
             let d = (n[0] * l.dir[0] + n[1] * l.dir[1] + n[2] * l.dir[2]).max(0.0);
@@ -909,6 +928,29 @@ impl Interpreter {
     }
 }
 
+/// A vertex normal turned into eye space, unit length.
+fn eye_normal(mv: &Mat4, n: [f32; 3]) -> [f32; 3] {
+    normalize([0, 1, 2].map(|j| (0..3).map(|k| n[k] * mv[k][j]).sum::<f32>()))
+}
+
+/// Texture coordinate in texels from an eye-space normal (`G_TEXTURE_GEN`):
+/// the normal against the look-at axes, from -1..1 to 0..1024 (or the arc
+/// of it with `G_TEXTURE_GEN_LINEAR`), times the `G_TEXTURE` scale.
+fn texgen(n: [f32; 3], lookat: [[f32; 3]; 2], scale: [f32; 2], linear: bool) -> [f32; 2] {
+    [0, 1].map(|i| {
+        let d = (0..3)
+            .map(|k| n[k] * lookat[i][k])
+            .sum::<f32>()
+            .clamp(-1.0, 1.0);
+        let raw = if linear {
+            (-d).acos() * (1024.0 / std::f32::consts::PI)
+        } else {
+            (d + 1.0) * 512.0
+        };
+        raw * scale[i]
+    })
+}
+
 fn normalize(v: [f32; 3]) -> [f32; 3] {
     let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
     if l == 0.0 {
@@ -969,4 +1011,22 @@ fn rd32(ram: &[u8], a: u32, at: u32) -> Result<u32, GfxError> {
         rd8(ram, a + 2, at)?,
         rd8(ram, a + 3, at)?,
     ]))
+}
+
+#[cfg(test)]
+mod texgen_tests {
+    use super::texgen;
+
+    #[test]
+    fn normals_spread_over_the_scaled_texture() {
+        let look = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        // A 16-texel texture's usual scale: (16 - 1) * 64 / 65536.
+        let s = 960.0 / 65536.0;
+        let at = |n| texgen(n, look, [s, s], false);
+        assert_eq!(at([0.0, 0.0, 1.0]), [7.5, 7.5]);
+        assert_eq!(at([1.0, 0.0, 0.0]), [15.0, 7.5]);
+        assert_eq!(at([0.0, -1.0, 0.0]), [7.5, 0.0]);
+        let lin = texgen([1.0, 0.0, 0.0], look, [s, s], true);
+        assert!((lin[0] - 15.0).abs() < 1e-3 && (lin[1] - 7.5).abs() < 1e-3);
+    }
 }
