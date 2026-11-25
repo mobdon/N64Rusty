@@ -62,6 +62,9 @@ pub struct WindowConfig {
     /// between game frames; the game itself keeps `frame_rate`. None (the
     /// default) draws once per game frame.
     pub refresh: Option<f64>,
+    /// Textures as the console filters them, soft when stretched to the
+    /// window. Off (the default) keeps magnified texels crisp.
+    pub console_filter: bool,
 }
 
 impl Default for WindowConfig {
@@ -71,6 +74,7 @@ impl Default for WindowConfig {
             scale: 2,
             widescreen: false,
             refresh: None,
+            console_filter: false,
         }
     }
 }
