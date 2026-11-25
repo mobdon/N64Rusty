@@ -13,6 +13,10 @@
 //! writes the game's routine list from a symbol map and adds its routines'
 //! fingerprints to `routines.txt`.
 
+// No console window on Windows: messages go to the console it was started
+// from, else to n64rusty-play.log next to the program.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -41,14 +45,60 @@ fn main() -> ExitCode {
         .unwrap_or_default();
     // Only a ROM (or nothing): a friend's double-click or drop.
     let plain = args.len() <= 1;
+    let log = console(&dir);
     let code = play(&mut args, &dir, plain);
-    if plain && code != ExitCode::SUCCESS {
-        // Keep the console open so the message can be read.
-        eprintln!("Press Enter to close.");
-        let _ = std::io::stdin().read_line(&mut String::new());
+    if code != ExitCode::SUCCESS {
+        if let Some(log) = log {
+            let text = std::fs::read_to_string(&log).unwrap_or_default();
+            let tail: Vec<&str> = text.lines().rev().take(8).collect();
+            let tail: Vec<&str> = tail.into_iter().rev().collect();
+            error_box(&format!(
+                "{}\n\nFull log: {}",
+                tail.join("\n"),
+                log.display()
+            ));
+        }
     }
     code
 }
+
+/// Sends output to the console the program was started from, or to a log
+/// file next to it when there is none (a double-click). Returns the log.
+#[cfg(windows)]
+fn console(dir: &Path) -> Option<PathBuf> {
+    use std::os::windows::io::IntoRawHandle;
+    use windows_sys::Win32::System::Console::{
+        AttachConsole, SetStdHandle, ATTACH_PARENT_PROCESS, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
+    };
+    // SAFETY: plain Win32 calls with a handle this process owns from here on.
+    unsafe {
+        if AttachConsole(ATTACH_PARENT_PROCESS) != 0 {
+            return None;
+        }
+        let log = dir.join("n64rusty-play.log");
+        let h = std::fs::File::create(&log).ok()?.into_raw_handle();
+        SetStdHandle(STD_OUTPUT_HANDLE, h as _);
+        SetStdHandle(STD_ERROR_HANDLE, h as _);
+        Some(log)
+    }
+}
+
+#[cfg(not(windows))]
+fn console(_dir: &Path) -> Option<PathBuf> {
+    None
+}
+
+#[cfg(windows)]
+fn error_box(text: &str) {
+    rfd::MessageDialog::new()
+        .set_title("n64rusty-play could not start the game")
+        .set_description(text)
+        .set_level(rfd::MessageLevel::Error)
+        .show();
+}
+
+#[cfg(not(windows))]
+fn error_box(_text: &str) {}
 
 fn play(args: &mut Vec<String>, dir: &Path, plain: bool) -> ExitCode {
     let recent = dir.join("recent.txt");
