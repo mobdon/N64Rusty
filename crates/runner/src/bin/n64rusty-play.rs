@@ -5,7 +5,7 @@
 //! picked last time, else one in its own folder, else asks for one. Files
 //! live next to the program: `games/<sha256>/` per game (routine list,
 //! saves, an optional run.toml), `settings.toml` (window choices made in
-//! the menu, for games without their own run.toml), `last-rom.txt`, and
+//! the menu, for games without their own run.toml), `recent.txt` (the ROMs played, newest first, for the Game menu), and
 //! `routines.txt`, the fingerprints
 //! that find a game's system routines when it has no routine list yet.
 //! With more arguments than the ROM, they work as for a generated game
@@ -38,12 +38,9 @@ fn main() -> ExitCode {
 }
 
 fn play(args: &mut Vec<String>, dir: &Path, plain: bool) -> ExitCode {
-    let last = dir.join("last-rom.txt");
+    let recent = dir.join("recent.txt");
     if args.first().is_none_or(|a| a.starts_with("--")) {
-        let remembered = std::fs::read_to_string(&last)
-            .ok()
-            .map(|t| PathBuf::from(t.trim()))
-            .filter(|p| p.is_file());
+        let remembered = n64rusty_host::menu::recent_roms().into_iter().next();
         let Some(rom) = remembered.or_else(|| find_rom(dir)).or_else(pick_rom) else {
             eprintln!(
                 "No ROM given. Drop your .z64, .n64 or .v64 file on this program, or put it in {}",
@@ -70,7 +67,9 @@ fn play(args: &mut Vec<String>, dir: &Path, plain: bool) -> ExitCode {
     }
     // Remembered once it is known to be a ROM the player can set up.
     if plain {
-        let _ = std::fs::write(&last, &args[0]);
+        let rom = std::path::absolute(&args[0]).unwrap_or_else(|_| PathBuf::from(&args[0]));
+        let list = std::fs::read_to_string(&recent).unwrap_or_default();
+        let _ = std::fs::write(&recent, remember(&rom.display().to_string(), &list));
     }
     if !args.iter().any(|a| a == "--local") {
         args.extend(["--local".into(), local.display().to_string()]);
@@ -166,6 +165,21 @@ fn routines(args: &[String], dir: &Path, rom: &Rom, local: &Path) -> Result<(), 
         .map(|(a, n)| format!("{n} = {a:#010x}\n"))
         .collect();
     std::fs::write(&config, list).map_err(|e| err(&config, e))
+}
+
+/// The recent list with `rom` moved to the top, at most ten entries.
+fn remember(rom: &str, list: &str) -> String {
+    std::iter::once(rom)
+        .chain(list.lines().filter(|l| *l != rom && !l.is_empty()))
+        .take(10)
+        .map(|l| format!("{l}\n"))
+        .collect()
+}
+
+#[test]
+fn recent_list_moves_a_rom_to_the_top() {
+    assert_eq!(remember("b", "a\nb\nc\n"), "b\na\nc\n");
+    assert_eq!(remember("x", ""), "x\n");
 }
 
 /// The first ROM file in `dir`, by name.
