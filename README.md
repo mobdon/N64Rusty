@@ -134,6 +134,13 @@ the game slows down. There is no frame limit unless `--frames` is given.
 Window size, frame rate, key layout, gamepad ports and input record/replay
 come from `run.toml` in the per-game folder, or `--run file`.
 
+`widescreen = true` under `[window]` in `run.toml` fills a window wider
+than 4:3 instead of drawing black bars. The 3D scene shows more at the
+sides, everything keeps its shape with the 4:3 picture in the middle, and
+full-width backgrounds stretch to the edges. Things the game itself leaves
+out of view (objects it culls past the original edge) stay missing.
+`--capture-wide` saves headless captures in 16:9 the same way.
+
 On Windows, one script does it all: it builds the translator, translates
 your ROM, builds the game program, copies it to `local\<sha256>\game.exe` and
 starts it with `--window`. From the repository folder in PowerShell:

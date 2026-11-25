@@ -332,3 +332,52 @@ fn window_path_draws_at_full_screen_sizes() {
     assert_px(&img, 100, 1080, [0, 0, 0, 255]);
     assert_px(&img, 1920, 1080, BLUE);
 }
+
+#[test]
+fn widescreen_shows_the_sides_and_keeps_shapes() {
+    let Some(mut r) = renderer() else { return };
+    let mut ram = Ram::default();
+    // A triangle just past the right edge of the 4:3 view.
+    let verts = ram.vertices(&[
+        v(105, -20, 0, [255; 4]),
+        v(130, -20, 0, [255; 4]),
+        v(130, 20, 0, [255; 4]),
+    ]);
+    let dl = scene(&mut ram, |_, dl| {
+        dl.other_modes(CYCLE_1, 0)
+            .combine(pass(PRIM))
+            .prim(0xFF00_00FF)
+            .vtx(verts, 3, 0)
+            .tri(0, 1, 2)
+            // A small centred rectangle, as a HUD element: 20 pixels wide.
+            .other_modes(CYCLE_FILL, 0)
+            .fill_color(0x07C1_07C1)
+            .fill_rect(150, 110, 169, 129);
+    });
+    let f = frame(&mut ram, &dl);
+    const GREEN: [u8; 4] = [0, 255, 0, 255];
+    const BLACK: [u8; 4] = [0, 0, 0, 255];
+
+    // Off: black bars, the triangle is outside the picture.
+    let img = r.render_letterboxed(&f, 640, 360).unwrap();
+    assert_px(&img, 5, 180, BLACK);
+    assert_px(&img, 615, 180, BLACK);
+
+    r.set_widescreen(true);
+    let img = r.render_letterboxed(&f, 640, 360).unwrap();
+    // The full-width background reaches both edges.
+    assert_px(&img, 2, 180, BLUE);
+    assert_px(&img, 637, 180, BLUE);
+    // The 4:3 picture keeps its shape in the middle (1.5 times larger),
+    // so the triangle shows in the extra width at the side.
+    assert_px(&img, 615, 180, RED);
+    // The rectangle is 30 pixels wide, not stretched to 40.
+    assert_px(&img, 320, 180, GREEN);
+    assert_px(&img, 338, 180, BLUE);
+    assert_px(&img, 302, 180, BLUE);
+
+    // A 4:3 target is the same as without widescreen.
+    let a = r.render(&f, 320, 240).unwrap();
+    r.set_widescreen(false);
+    assert_eq!(a.rgba, r.render(&f, 320, 240).unwrap().rgba);
+}
