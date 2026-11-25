@@ -146,6 +146,8 @@ Two debugging aids, in headless and window runs alike:
   other than the beginning. Keep poke scripts in the per-game folder: they
   hold game addresses.
 - `--ram-out file` saves guest RAM when the run ends, to read state back.
+- `--hash-out file` writes `frame hash` of guest RAM at every retrace. Two runs with the same input script should give the same lines; the first line that differs is where they part.
+- `--interpret lo-hi` (hex addresses) runs calls into that range in the reference interpreter even where a translation exists. With `--hash-out`, this checks translated code against the interpreter.
 
 `--expansion` runs with the Expansion Pak: 8 MB of RAM instead of 4 MB, as
 games that need it check.

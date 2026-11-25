@@ -23,11 +23,15 @@ decides who is in sync.
 
 ## What is missing
 
-- **A determinism check.** Nobody has proven yet that two runs with the same
-  inputs match byte for byte, or that Windows and Linux builds match. Needed:
-  a RAM hash per frame and a test that compares two runs (and two machines).
-  Earlier graphics debugging already saw headless captures of the same input
-  land on shifted frame numbers between runs, so expect real work here.
+- **A determinism check across machines.** `--hash-out file` writes one RAM
+  hash per retrace. First result (Linux, first game, 3000 frames from boot
+  through a four-player match with a scripted input file): two runs gave
+  identical hashes on every frame. A run with all game code sent to the
+  reference interpreter (`--interpret 80000400-80800000`) also matched the
+  translated run on every frame, so the translated code computes what the
+  console's CPU would. Still to do: the same comparison between a Windows
+  and a Linux build, and in the live window, where input arrives from the
+  keyboard and the host clock paces frames.
 - **A network input source.** Today input comes from a script or the
   keyboard/pad. Netplay needs a source that waits until both players' input
   for frame N has arrived.
@@ -108,7 +112,7 @@ sent to the guest for the match only and thrown away after.
 
 | # | Step | General or game-specific |
 |---|---|---|
-| 1 | Per-frame RAM hash in the headless runner, and a test: same input script twice gives identical hashes | General |
+| 1 | Per-frame RAM hash in the headless runner, and a test: same input script twice gives identical hashes (done: `--hash-out`; matches run to run and against the interpreter) | General |
 | 2 | Same test across Windows and Linux builds (CI plus mob's PC) | General |
 | 3 | Fix whatever step 1-2 finds (host-dependent ordering, float differences, uninitialised memory) | General |
 | 4 | Network input source in `runner`: waits for both pads for frame N, with a delay buffer | General |
@@ -135,6 +139,17 @@ catch nondeterminism bugs that show up as rare crashes.
 
 Short notes from each game brought up, so the plan keeps up with what real
 games need. Games are described, not named.
+
+### Four-player fighting game (first game)
+
+- **Determinism.** Same input script twice: identical RAM hash on all 3000
+  frames, through a four-player match. Translated against interpreted: also
+  identical. No host-dependent state found so far.
+- **Players.** Up to four pads, so lockstep has to carry four pad states per
+  frame, with bots filling empty ports exactly as offline.
+- **Timing.** One scene sets the console clock back (`osSetTime`); the
+  runner now keeps that as an offset for `osGetTime` only, so retraces and
+  timers stay on virtual time for both peers.
 
 ### Single-player adventure with compressed files (third game)
 

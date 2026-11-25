@@ -79,8 +79,10 @@ fn run(ctx: &mut Ctx, entry: u32) {
             }
             _ => None,
         };
-        // Calls into translated code are charged by `Ctx::call`.
-        let calls = target.is_some_and(|t| !ctx.has_translation(t));
+        // Calls into translated code are charged by `Ctx::call`, except a
+        // call back to `entry` (recursion under `--interpret`), which stays
+        // here.
+        let calls = target.is_some_and(|t| t == entry || !ctx.has_translation(t));
         if let Err(e) = cpu.step_on(ctx.mem.bytes_mut()) {
             // The reference CPU knows plain RAM only: COP0 and device
             // registers go through the runtime, as translated code does.

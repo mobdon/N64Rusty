@@ -90,6 +90,10 @@ pub struct Ctx {
     /// Runs a call to code with no translation (an interpreter, say), given
     /// the address; without one such a call panics.
     pub on_missing: Option<fn(&mut Ctx, u32)>,
+    /// Calls to addresses in this range go to `on_missing` even when a
+    /// translation exists (except replaced routines): a debugging aid to
+    /// compare translated code with an interpreter.
+    pub interpret: Option<(u32, u32)>,
 }
 
 struct Overlay {
@@ -131,6 +135,7 @@ impl Ctx {
             deadline: u64::MAX,
             on_deadline: None,
             on_missing: None,
+            interpret: None,
         }
     }
 
@@ -283,7 +288,14 @@ impl Ctx {
     /// Calls the guest function at `addr`. Every call in generated code goes
     /// through here.
     pub fn call(&mut self, addr: u32) {
-        let f = self.lookup(addr).or_else(|| self.verify_image(addr));
+        let forced = self.interpret.is_some_and(|(lo, hi)| {
+            (lo..hi).contains(&addr) && !self.overrides.contains_key(&addr)
+        });
+        let f = if forced {
+            None
+        } else {
+            self.lookup(addr).or_else(|| self.verify_image(addr))
+        };
         self.tick(addr);
         match f {
             Some(f) => {
@@ -677,5 +689,31 @@ mod range_tests {
         assert_eq!(r, [(0x100, 0x200), (0x400, 0x500)]);
         add_range(&mut r, 0x200, 0x400);
         assert_eq!(r, [(0x100, 0x500)]);
+    }
+}
+
+#[cfg(test)]
+mod interpret_tests {
+    use super::{Ctx, Memory};
+
+    fn translated(c: &mut Ctx) {
+        c.r[2] = 1;
+    }
+
+    fn interpreter(c: &mut Ctx, _: u32) {
+        c.r[2] = 2;
+    }
+
+    #[test]
+    fn interpret_range_sends_translated_calls_to_the_interpreter() {
+        let mut c = Ctx::new(Memory::new(0x1000));
+        c.register(0x8000_0100, translated);
+        c.register(0x8000_0200, translated);
+        c.on_missing = Some(interpreter);
+        c.interpret = Some((0x8000_0100, 0x8000_0200));
+        c.call(0x8000_0100);
+        assert_eq!(c.r[2], 2);
+        c.call(0x8000_0200);
+        assert_eq!(c.r[2], 1, "the range's end is outside it");
     }
 }

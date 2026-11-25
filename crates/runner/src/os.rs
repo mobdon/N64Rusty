@@ -203,6 +203,34 @@ pub struct Poke {
 
 static POKES: Mutex<Vec<Poke>> = Mutex::new(Vec::new());
 
+/// Where `--hash-out` writes one RAM hash per retrace.
+static HASH_OUT: Mutex<Option<std::io::BufWriter<std::fs::File>>> = Mutex::new(None);
+
+/// Makes the run write `frame hash` for RAM at every retrace, to compare
+/// two runs (determinism, or translated code against the interpreter).
+pub fn set_hash_out(file: std::fs::File) {
+    *HASH_OUT.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::io::BufWriter::new(file));
+}
+
+/// A fast hash of RAM, 8 bytes at a time.
+pub fn ram_hash(ram: &[u8]) -> u64 {
+    ram.chunks(8).fold(0xCBF2_9CE4_8422_2325, |h, w| {
+        let mut b = [0; 8];
+        b[..w.len()].copy_from_slice(w);
+        (h ^ u64::from_le_bytes(b))
+            .wrapping_mul(0x0100_0000_01B3)
+            .rotate_left(29)
+    })
+}
+
+fn write_hash(c: &Ctx, frame: u64) {
+    use std::io::Write;
+    if let Some(out) = HASH_OUT.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        let _ = writeln!(out, "{frame} {:016x}", ram_hash(c.mem.bytes()));
+        let _ = out.flush();
+    }
+}
+
 /// Sets the memory writes this run makes.
 pub fn set_pokes(pokes: Vec<Poke>) {
     *POKES.lock().unwrap_or_else(|e| e.into_inner()) = pokes;
@@ -428,6 +456,7 @@ fn deliver_due(c: &mut Ctx, st: &mut State) {
         st.next_vi += TICKS_PER_FRAME;
         st.frames += 1;
         apply_pokes(c, st.frames);
+        write_hash(c, st.frames);
         st.devices.retrace(st.frames, st.framebuffer);
         if let Some((mq, msg, every)) = st.vi {
             if every > 0 && st.frames.is_multiple_of(u64::from(every)) {
@@ -1571,6 +1600,15 @@ pub fn install<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ram_hash_sees_one_changed_byte() {
+        let mut ram = vec![0u8; 0x1001];
+        let h = ram_hash(&ram);
+        assert_eq!(h, ram_hash(&ram));
+        ram[0x1000] = 1;
+        assert_ne!(h, ram_hash(&ram), "a short last chunk counts");
+    }
 
     #[test]
     fn poke_scripts_parse() {
