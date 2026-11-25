@@ -96,9 +96,13 @@ impl<G: Guest> App<G> {
         };
         let w = &mut self.cfg.window;
         match action {
-            Action::OpenRom(rom) => {
+            Action::OpenRom(_) | Action::GamesList => {
+                let rom = match &action {
+                    Action::OpenRom(rom) => vec![rom.clone()],
+                    _ => Vec::new(),
+                };
                 if let Ok(exe) = std::env::current_exe() {
-                    match std::process::Command::new(exe).arg(rom).spawn() {
+                    match std::process::Command::new(exe).args(rom).spawn() {
                         Ok(_) => event_loop.exit(),
                         Err(e) => eprintln!("warning: starting the other ROM: {e}"),
                     }
@@ -187,6 +191,8 @@ impl<G: Guest> ApplicationHandler for App<G> {
         let scale = self.cfg.window.scale as f64;
         let attrs = Window::default_attributes()
             .with_title(self.cfg.window.title.clone())
+            .with_theme(Some(winit::window::Theme::Dark))
+            .with_window_icon(crate::launcher::icon())
             .with_inner_size(LogicalSize::new(320.0 * scale, 240.0 * scale));
         match event_loop.create_window(attrs) {
             Ok(window) => {

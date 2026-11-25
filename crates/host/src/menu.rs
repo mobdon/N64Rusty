@@ -10,6 +10,8 @@ use crate::config::WindowConfig;
 pub enum Action {
     /// Start the program again on another ROM file.
     OpenRom(std::path::PathBuf),
+    /// Start the program again on its start screen.
+    GamesList,
     /// `Some(0.0)` is the display's rate.
     Refresh(Option<f64>),
     Widescreen(bool),
@@ -115,6 +117,7 @@ mod imp {
     pub struct Menu {
         _bar: muda::Menu,
         open: MenuItem,
+        list: MenuItem,
         games: Vec<(MenuItem, std::path::PathBuf)>,
         refresh: Vec<CheckMenuItem>,
         wide: CheckMenuItem,
@@ -139,6 +142,7 @@ mod imp {
             let m = Menu {
                 _bar: muda::Menu::new(),
                 open: MenuItem::new("Open ROM...", true, None),
+                list: MenuItem::new("All games...", true, None),
                 games: recent_roms()
                     .into_iter()
                     .map(|p| {
@@ -178,7 +182,7 @@ mod imp {
                 mods_folder: MenuItem::new("Open mods folder", true, None),
             };
             let sep0 = PredefinedMenuItem::separator();
-            let mut game: Vec<&dyn muda::IsMenuItem> = vec![&m.open];
+            let mut game: Vec<&dyn muda::IsMenuItem> = vec![&m.list, &m.open];
             if !m.games.is_empty() {
                 game.push(&sep0);
             }
@@ -210,7 +214,11 @@ mod imp {
             let modm = Submenu::with_items("Mods", true, &modm).ok()?;
             m._bar.append_items(&[&game, &refresh, &view, &modm]).ok()?;
             // SAFETY: the window outlives the menu, which the app drops first.
-            unsafe { m._bar.init_for_hwnd(h.hwnd.get()) }.ok()?;
+            unsafe {
+                m._bar
+                    .init_for_hwnd_with_theme(h.hwnd.get(), muda::MenuTheme::Dark)
+            }
+            .ok()?;
             m.show(cfg);
             Some(m)
         }
@@ -218,6 +226,9 @@ mod imp {
         /// The next menu choice, if one was made.
         pub fn poll(&self) -> Option<Action> {
             let id = MenuEvent::receiver().try_recv().ok()?.id;
+            if id == *self.list.id() {
+                return Some(Action::GamesList);
+            }
             if id == *self.open.id() {
                 let rom = rfd::FileDialog::new()
                     .set_title("Pick your N64 ROM")
