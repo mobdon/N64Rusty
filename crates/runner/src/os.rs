@@ -1730,6 +1730,12 @@ fn ret_zero(c: &mut Ctx) {
 
 fn nothing(_: &mut Ctx) {}
 
+/// SP_STATUS with HALT set: every task is done at once here, so the RSP is
+/// always idle, and a game that waits for HALT goes on.
+fn os_sp_get_status(c: &mut Ctx) {
+    ret(c, 1);
+}
+
 /// New code is in place: functions of code the game wrote itself are
 /// checked against RAM again at their next call.
 fn os_inval_icache(c: &mut Ctx) {
@@ -1823,7 +1829,7 @@ pub const HOOKS: &[(&str, GuestFn)] = &[
     ("osSpTaskYielded", ret_zero),
     ("osDpSetStatus", nothing),
     ("osDpGetStatus", ret_zero),
-    ("osSpGetStatus", ret_zero),
+    ("osSpGetStatus", os_sp_get_status),
     ("osAiSetFrequency", os_ai_set_frequency),
     ("osAiSetNextBuffer", os_ai_set_next_buffer),
     ("osAiGetLength", os_ai_get_length),
