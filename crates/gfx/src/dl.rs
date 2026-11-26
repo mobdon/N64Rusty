@@ -67,6 +67,9 @@ struct Loaded {
 struct Light {
     color: [f32; 3],
     dir: [f32; 3],
+    /// A point light of the microcode variant: its position (camera space)
+    /// and strength (see [`Interpreter::light_variant`]).
+    point: Option<([f32; 3], f32)>,
 }
 
 /// Follows display lists and records what they draw.
@@ -111,6 +114,10 @@ pub struct Interpreter {
     /// shortcut: one game, one 3D layout; tell them apart by their code if
     /// a game mixes the variant with the standard microcode.
     variant_game: bool,
+    /// That variant's light space (move-word 0x10): twelve words, the
+    /// per-axis scale's whole parts, its fractions and the offsets, each
+    /// pair of words twice (see [`Interpreter::light_space_of`]).
+    light_space: [u32; 12],
     /// That variant's normal table: two bytes per vertex buffer place.
     normals: u32,
     /// The data of the microcode a task starts on, if the host named it.
@@ -235,6 +242,7 @@ impl Interpreter {
             normals_apart: false,
             variant_game: false,
             normals: 0,
+            light_space: [0; 12],
             start_data: None,
             frame: Frame {
                 width: 320,
@@ -557,6 +565,7 @@ impl Interpreter {
         match index {
             0x02 => self.num_lights = (w1 / self.light_size()).min(7) as usize,
             0x06 => self.segments[(offset / 4) as usize & 0xF] = w1 & 0x00FF_FFFF,
+            0x10 if self.normals_apart => self.light_space[(offset / 4) as usize % 12] = w1,
             // Fog: multiplier and offset of the fog factor.
             0x08 => {
                 self.state.fog_factor = [(w1 >> 16) as i16 as f32, w1 as i16 as f32];
@@ -621,6 +630,19 @@ impl Interpreter {
                     self.look_at[place as usize] = normalize(dir);
                     return Ok(());
                 };
+                // The variant's 48-byte places: a strength byte at 12 (whole
+                // and sixteenths in its two nibbles; 0: not a point light)
+                // and the position at 32.
+                let point = if self.normals_apart && b(12)? != 0 {
+                    let s = b(12)?;
+                    let h = |k: u32| -> Result<f32, GfxError> {
+                        Ok(rd16(rdram, a + 32 + 2 * k, at)? as i16 as f32)
+                    };
+                    let strength = f32::from(s >> 4) + f32::from(s & 15) / 16.0;
+                    Some(([h(0)?, h(1)?, h(2)?], strength))
+                } else {
+                    None
+                };
                 let light = Light {
                     color: [
                         b(0)? as f32 / 255.0,
@@ -628,6 +650,7 @@ impl Interpreter {
                         b(2)? as f32 / 255.0,
                     ],
                     dir: normalize([b(8)? as i8 as f32, b(9)? as i8 as f32, b(10)? as i8 as f32]),
+                    point,
                 };
                 if let Some(l) = self.lights.get_mut(n as usize) {
                     *l = light;
@@ -692,7 +715,8 @@ impl Interpreter {
                 ]
             };
             let color = if apart {
-                let lc = self.light(&lights_mv, normal);
+                let pos = [h(0)? as f32, h(2)? as f32, h(4)? as f32];
+                let lc = self.light_variant(self.light_space_of(pos, &mv, &projection));
                 let c = |k: usize| -> Result<f32, GfxError> {
                     Ok(lc[k] * b(12 + k as u32)? as f32 / 255.0)
                 };
@@ -760,6 +784,47 @@ impl Interpreter {
             }
             w => self.warn(format!("vertex modify {w:#x} at {at:#010x}")),
         }
+    }
+
+    /// Lighting of the microcode variant, as its vertex code works it out:
+    /// ambient plus, for each point light, its colour times `min(1, 32768 *
+    /// strength / d^2)`, `d` the distance from the vertex in light space.
+    /// It has no directional term: a light with no strength adds nothing,
+    /// and games place a light near each model to shade it by direction.
+    fn light_variant(&self, at: [f32; 3]) -> [f32; 3] {
+        let mut c = self.lights[self.num_lights].color;
+        for l in &self.lights[..self.num_lights] {
+            let Some((p, strength)) = l.point else {
+                continue;
+            };
+            let d2: f32 = (0..3).map(|j| (at[j] - p[j]).powi(2)).sum();
+            let k = (32768.0 * strength / d2.max(1.0)).min(1.0);
+            for (c, lc) in c.iter_mut().zip(l.color) {
+                *c += lc * k;
+            }
+        }
+        c.map(|x| x.min(1.0))
+    }
+
+    /// A vertex's position in the variant's light space: its clip position
+    /// plus an offset, times a scale, per axis (the scale's whole and
+    /// fraction parts and the offset set with move-word 0x10). The game sets
+    /// these to undo its projection; before it does, camera space.
+    fn light_space_of(&self, pos: [f32; 3], mv: &Mat4, projection: &Mat4) -> [f32; 3] {
+        let eye: [f32; 4] =
+            [0, 1, 2, 3].map(|j| (0..3).map(|k| pos[k] * mv[k][j]).sum::<f32>() + mv[3][j]);
+        if self.light_space == [0; 12] {
+            return [eye[0], eye[1], eye[2]];
+        }
+        let clip: [f32; 4] = [0, 1, 2, 3].map(|j| (0..4).map(|k| eye[k] * projection[k][j]).sum());
+        let lane = |word: usize, i: usize| {
+            let w = self.light_space[word + i / 2];
+            (if i.is_multiple_of(2) { w >> 16 } else { w & 0xFFFF }) as u16
+        };
+        [0, 1, 2].map(|i| {
+            let scale = f32::from(lane(0, i) as i16) + f32::from(lane(4, i)) / 65536.0;
+            (clip[i] + f32::from(lane(8, i) as i16)) * scale
+        })
     }
 
     /// Directional lights plus ambient (the light after the last one).

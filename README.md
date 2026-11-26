@@ -346,8 +346,13 @@ The command set follows the name each microcode carries in its data (the
 task's own pointer, and the one a load-microcode command gives): the 2D
 sprite set, the usual 3D set, or the 3D variant that draws four triangles
 per command (opcodes `0x10` to `0x1F`), keeps vertex normals in a table of
-their own and lights in 48-byte places. That variant's coordinate
-move-word (`0x10`) and point lights are not done yet.
+their own and lights in 48-byte places. Its lighting is by distance only:
+ambient plus, for each light with a strength byte (offset 12; whole and
+sixteenths in its nibbles), its colour times `min(1, 32768 * strength /
+d^2)`, from the light's position (offset 32) to the vertex in light space,
+which is the clip position plus an offset, times a per-axis scale (move-word
+`0x10`); the sum scales the vertex colour. A light with no strength adds
+nothing.
 
 Vertices stay in object space with their model-view, projection and
 viewport kept apart until drawing, so widescreen and in-between frames for

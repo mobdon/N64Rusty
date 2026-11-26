@@ -289,33 +289,44 @@ fn a_3d_microcode_followed_in_ram_by_the_2d_one_stays_3d() {
 }
 
 #[test]
-fn a_named_microcode_reads_normals_from_their_own_table() {
+fn a_named_microcode_lights_by_distance_from_its_point_lights() {
     let mut ram = Ram::default();
     // The name every microcode carries in its data.
     let data = ram.put(b"RSP Gfx ucode F3DEXBG.NoN fifo 2.08");
     let second = ram.put(b"RSP Gfx ucode F3DEX.NoN   fifo 2.08");
-    // Two vertices, loaded at buffer places 1 and 2. The normal's third
-    // part is the byte after z's padding; the colour bytes are a colour.
+    // Two vertices 100 and 400 units from the light; the colour bytes are
+    // a colour.
     let mut vb = Vec::new();
-    for nz in [0u8, 127] {
-        vb.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, nz, 0, 0, 0, 0, 255, 128, 0, 200]);
+    for x in [100i16, 400] {
+        vb.extend_from_slice(&x.to_be_bytes());
+        vb.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 128, 0, 200]);
     }
     let verts = ram.put(&vb);
-    // Normal table by buffer place: place 1 points at +x, place 2 at +z.
-    let normals = ram.put(&[9, 9, 127, 0, 0, 0]);
-    // 48-byte light places: a full white light towards +z, no ambient.
-    let mut l = vec![255, 255, 255, 0, 255, 255, 255, 0, 0, 0, 127, 0];
+    // 48-byte light places: a white point light of strength 1.0 (0x10) at
+    // the origin, no ambient.
+    let mut l = vec![255, 255, 255, 0, 255, 255, 255, 0, 0, 0, 127, 0, 0x10];
     l.resize(48, 0);
     let light = ram.put(&l);
     let ambient = ram.put(&[0; 48]);
     let mut dl = Dl::default();
     setup(&mut ram, &mut dl);
     let place = |n: u32| 0xDC << 24 | 5 << 19 | (n * 48 / 8) << 8 | 10;
+    // Light space: clip position (setup's projection scales by 0.01)
+    // times 100, back to the vertices' own units.
+    let space = |offset: u32, w: u32| (0xDB << 24 | 0x10 << 16 | offset, w);
+    for (o, w) in [
+        (0, 100 << 16 | 100),
+        (4, 100 << 16),
+        (8, 100 << 16 | 100),
+        (12, 100 << 16),
+    ] {
+        let (w0, w1) = space(o, w);
+        dl.raw(w0, w1);
+    }
     dl.geometry(0, G_LIGHTING)
         .raw(0xDB << 24 | 0x02 << 16, 48) // one light
         .raw(place(2), light)
         .raw(place(3), ambient)
-        .raw(0xDC << 24 | 7 << 19 | 14, normals)
         // The game's second 3D microcode, under the usual name: the same
         // variant.
         .raw(0xE1 << 24, second)
@@ -328,14 +339,19 @@ fn a_named_microcode_reads_normals_from_their_own_table() {
     it.set_microcode_data(Some(data));
     it.run(&ram.bytes, addr).expect("display list runs");
     let f = it.take_frame();
-    // Facing away from the light: dark. Facing it: the vertex colour.
-    assert_eq!(f.vertices[0].color, [0.0, 0.0, 0.0, 200.0 / 255.0]);
-    let c = f.vertices[1].color;
+    // Near: the full vertex colour. Far: 32768 / 400^2 of it.
+    let c = f.vertices[0].color;
     assert!(
-        (c[0] - 1.0).abs() < 1e-5 && (c[1] - 128.0 / 255.0).abs() < 1e-5,
+        (c[0] - 1.0).abs() < 1e-3 && (c[1] - 128.0 / 255.0).abs() < 1e-3,
         "{c:?}"
     );
-    assert_eq!(c[2], 0.0);
+    assert_eq!((c[2], c[3]), (0.0, 200.0 / 255.0));
+    let c = f.vertices[1].color;
+    let k = 32768.0 / 160000.0;
+    assert!(
+        (c[0] - k).abs() < 1e-3 && (c[1] - k * 128.0 / 255.0).abs() < 1e-3,
+        "{c:?}"
+    );
 }
 
 #[test]
