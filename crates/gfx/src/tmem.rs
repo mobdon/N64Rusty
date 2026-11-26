@@ -267,8 +267,11 @@ impl Tmem {
         match (t.fmt, t.siz) {
             (0, 2) => rgba5551(u16::from_be_bytes([at(0), at(1)])).map(|v| (v * 255.0) as u8),
             (0, 3) => [at(0), at(1), at(2), at(3)],
-            (2, 0) => self.palette((t.palette << 4) | nib() as u32, tlut),
-            (2, 1) => self.palette(at(0) as u32, tlut),
+            // With the palette switched on (other modes), every 4- and
+            // 8-bit texel is an index into it, whatever format the tile
+            // names: some games leave that at RGBA.
+            (f, 0) if f == 2 || tlut >= 2 => self.palette((t.palette << 4) | nib() as u32, tlut),
+            (f, 1) if f == 2 || tlut >= 2 => self.palette(at(0) as u32, tlut),
             (3, 0) => {
                 let n = nib();
                 let i = ((n >> 1) as u16 * 255 / 7) as u8;
@@ -417,6 +420,21 @@ mod tests {
         };
         assert_eq!(m.texel(&t, 0, 0, 0), [255, 255, 255, 255]);
         assert_eq!(m.texel(&t, 1, 0, 0), [109, 109, 109, 0]);
+    }
+
+    #[test]
+    fn an_8_bit_texel_goes_through_the_palette_when_it_is_on() {
+        let mut m = Tmem::default();
+        m.mem[0] = 5; // texel 0 is index 5
+        m.mem[0x800 + 5 * 8..0x800 + 5 * 8 + 2].copy_from_slice(&0xF801u16.to_be_bytes());
+        // The tile says RGBA, 8 bits.
+        let t = Tile {
+            fmt: 0,
+            siz: 1,
+            ..Tile::default()
+        };
+        assert_eq!(m.texel(&t, 0, 0, 2), [255, 0, 0, 255], "palette on: red");
+        assert_eq!(m.texel(&t, 0, 0, 0), [5; 4], "palette off: the byte");
     }
 
     /// Odd rows are stored swapped but read back in order, whether the load
