@@ -130,7 +130,7 @@ pub fn routine_list(names: &BTreeMap<u32, String>) -> String {
 const N_AUDIO: [&str; 2] = ["n_alSynNew", "n_alAudioFrame"];
 
 /// Per-game config name: the `n_audio` command set with that game's stream
-/// commands skipped.
+/// commands (the last step of its MP3 decoding).
 const N_AUDIO_STREAMS: &str = "n_audio_streams";
 
 fn label(names: &BTreeMap<u32, String>, a: u32) -> String {

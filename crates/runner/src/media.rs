@@ -210,8 +210,8 @@ impl Media {
         self
     }
 
-    /// Uses the `n_audio` command set with one game's stream commands
-    /// skipped (see `AudioRsp::n_audio_streams`).
+    /// Uses the `n_audio` command set with one game's stream commands (see
+    /// `AudioRsp::n_audio_streams`).
     pub fn with_audio_streams(mut self, on: bool) -> Self {
         if on {
             self.sound = AudioRsp::n_audio_streams();
@@ -379,6 +379,8 @@ impl Devices for Media {
             self.audio_tasks += 1;
             let list = ctx.mem.read_u32(task + TASK_DATA_PTR);
             let len = ctx.mem.read_u32(task + TASK_DATA_SIZE);
+            self.sound
+                .set_microcode_data(ctx.mem.read_u32(task + TASK_UCODE_DATA));
             let (sound, mem) = (&mut self.sound, &mut ctx.mem);
             let t0 = Instant::now();
             if let Err(e) = panic::catch_unwind(AssertUnwindSafe(|| sound.run(mem, list, len))) {

@@ -220,21 +220,86 @@ fn pole_filter_gain_from_a_real_command_shape() {
 }
 
 #[test]
-fn a_game_that_asks_skips_its_stream_commands() {
+fn a_game_that_asks_turns_its_stream_frames_into_sound() {
+    const UCODE: u32 = 0x8030_0000;
+    const BUF: u32 = 0x8031_0000;
     let mut rsp = AudioRsp::n_audio_streams();
     let mut ram = Memory::new(8 << 20);
-    put(&mut ram, DATA, &[1, 2, 3, 4]);
+    // The microcode's synthesis window: rows of D[j + 32k] at 0x310, each
+    // stored twice, 0x40 bytes apart. Only the peak and D[5] are set.
+    let row = |j: u32, k: u32| UCODE + 0x310 + 0x40 * j + 2 * k;
+    for copy in [0, 32] {
+        ram.write_u16(row(0, 8) + copy, 0x7FFF);
+        ram.write_u16(row(5, 0) + copy, 0x4000);
+    }
+    rsp.set_microcode_data(UCODE);
+    // A frame: four header words (a gain of 1.5), then slot 0's subband 0
+    // at 1000.
+    ram.write_u32(BUF, 1 << 16 | 0x8000);
+    ram.write_u16(BUF + 8, 1000);
+    run(
+        &mut rsp,
+        &mut ram,
+        &[(8 << 24, STATE), (7 << 24 | 0x1C, BUF & 0xFF_FFFF)],
+    );
+    // The first time slot (32 samples) sees only that one window value;
+    // later slots see the sample again as it moves through the history.
+    let pcm = get(&ram, BUF, 32);
+    // cos(21 pi / 64) * 1000 * D[5] * gain, D[5] = 0x4000 in Q15.
+    let want = ((21.0 * std::f64::consts::PI / 64.0).cos() * 1000.0 * 0.5 * 1.5).round() as i16;
+    let mut expect = vec![0i16; 32];
+    expect[5] = want;
+    assert_eq!(pcm, expect);
+}
+
+#[test]
+fn a_game_that_asks_gets_its_biquad_filter() {
+    let mut rsp = AudioRsp::n_audio_streams();
+    let mut ram = Memory::new(8 << 20);
+    // b0 0.25, b1 0.5 (Q15); a1 0.5 (Q14) on y[n-1], a2 0.
+    let mut coef = [0i16; 16];
+    (coef[0], coef[1], coef[8]) = (8192, 16384, 8192);
+    for (i, c) in coef.iter().enumerate() {
+        ram.write_u16(DATA + 2 * i as u32, *c as u16);
+    }
+    put(&mut ram, DATA + 0x100, &[1000]);
     run(
         &mut rsp,
         &mut ram,
         &[
-            (8 << 24, STATE),
-            (7 << 24 | 0x1C, DATA + 0x100),
-            load(0, 8, DATA),
-            save(0, 8, OUT),
+            clear(0, SUBFRAME as u32 * 2),
+            load(0, 2, DATA + 0x100),
+            book(DATA),
+            (14 << 24 | 1 << 16, STATE), // initialise the history
+            save(0, 16, OUT),
         ],
     );
-    assert_eq!(get(&ram, OUT, 4), [1, 2, 3, 4]);
+    // x = 1000, 0, 0...: num = 250, 500, 250, 0...; y adds y[n-1] / 2,
+    // each product rounded as the vector unit rounds it.
+    assert_eq!(get(&ram, OUT, 6), [250, 626, 564, 282, 142, 72]);
+}
+
+#[test]
+fn other_games_keep_the_pole_filter_with_the_same_coefficients() {
+    let (mut rsp, mut ram) = setup();
+    let mut coef = [0i16; 16];
+    (coef[0], coef[1], coef[8]) = (8192, 16384, 8192);
+    for (i, c) in coef.iter().enumerate() {
+        ram.write_u16(DATA + 2 * i as u32, *c as u16);
+    }
+    put(&mut ram, DATA + 0x100, &[1000]);
+    run(
+        &mut rsp,
+        &mut ram,
+        &[
+            clear(0, SUBFRAME as u32 * 2),
+            load(0, 2, DATA + 0x100),
+            book(DATA),
+            (14 << 24 | 1 << 16, STATE), // gain 0: the pole filter mutes
+            save(0, 16, OUT),
+        ],
+    );
+    assert_eq!(get(&ram, OUT, 6), [0; 6]);
 }
 
 #[test]

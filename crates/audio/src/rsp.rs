@@ -15,6 +15,8 @@
 
 use n64rusty_runtime::Memory;
 
+use crate::synth::Streams;
+
 const DMEM: usize = 0x1000;
 const MASK: usize = DMEM - 1;
 
@@ -33,8 +35,12 @@ const A_SMALL: u8 = 0x04;
 /// volumes and the ADPCM codebook between tasks.
 pub struct AudioRsp {
     n_audio: bool,
-    /// Skip the stream commands one game's `n_audio` microcode adds.
+    /// Run the stream commands one game's `n_audio` microcode adds.
     streams: bool,
+    /// Their state: the synthesis window and each stream's history.
+    stream_state: Streams,
+    /// The running microcode's data, which holds the synthesis window.
+    ucode_data: u32,
     dmem: Box<[u8; DMEM]>,
     segments: [u32; 16],
     inp: u16,
@@ -78,6 +84,8 @@ impl AudioRsp {
         Self {
             n_audio: false,
             streams: false,
+            stream_state: Streams::default(),
+            ucode_data: 0,
             dmem: Box::new([0; DMEM]),
             segments: [0; 16],
             inp: 0,
@@ -107,14 +115,21 @@ impl AudioRsp {
     }
 
     /// The `n_audio` set as one game's own microcode extends it, with
-    /// commands 7 and 8 (its compressed-stream decoder) skipped. Only a
-    /// game that asks for it gets this; for any other, 7 and 8 stay
-    /// unknown commands.
+    /// commands 7 and 8: the last step of decoding its compressed (MP3)
+    /// streams, see the `synth` module. Only a game that asks for it gets
+    /// this; for any other, 7 and 8 stay unknown commands. Name the running
+    /// microcode's data with [`AudioRsp::set_microcode_data`].
     pub fn n_audio_streams() -> Self {
         Self {
             streams: true,
             ..Self::n_audio()
         }
+    }
+
+    /// The data of the microcode the coming tasks run (the task's own
+    /// pointer to it), where the stream commands find their window.
+    pub fn set_microcode_data(&mut self, data: u32) {
+        self.ucode_data = data;
     }
 
     /// Runs the `len`-byte command list at `list` in guest RAM, as the RSP
@@ -223,14 +238,18 @@ impl AudioRsp {
             11 => self.load_book(ram, a1, lo0),
             12 => self.mix(lo0 as i16, N_MAIN + hi1, N_MAIN + lo1, N_COUNT),
             13 => self.interleave(N_MAIN, N_DRY_LEFT, N_DRY_RIGHT, N_COUNT),
+            // That game's microcode runs a biquad instead when the first
+            // two coefficients are not both zero (its streams' low-pass).
+            14 if self.streams && (self.book[0], self.book[1]) != (0, 0) => {
+                self.biquad(ram, flags, N_MAIN + (lo0 & 0xFFF), a1);
+            }
             14 => {
                 let buf = if w1 >> 24 == 0 { N_MAIN } else { N_MAIN2 };
                 self.pole_filter(ram, flags, lo0, (buf, buf, N_COUNT), a1);
             }
             15 => self.loop_addr = a1,
-            // shortcut: the stream decoder is skipped, so its streams (that
-            // game's speech and music) stay silent; decode them to hear them.
-            7 | 8 if self.streams => {}
+            7 if self.streams => self.stream_state.frame(ram, self.ucode_data, a1),
+            8 if self.streams => self.stream_state.set_state(a1),
             op => panic!("n_audio command {op:#x} not implemented ({w0:08x} {w1:08x})"),
         }
     }
@@ -687,6 +706,38 @@ impl AudioRsp {
         ];
         for (i, w) in words.into_iter().enumerate() {
             ram.write_u32(state + 4 * i as u32, w as u32);
+        }
+    }
+
+    /// Biquad over one subframe at `buf`, in place, as one game's microcode
+    /// runs its filter command: `y[n] = b0 x[n] + b1 x[n-1] + b0 x[n-2]`
+    /// (Q15, coefficients 0 and 1 of the codebook) `+ a1 y[n-1] + a2 y[n-2]`
+    /// (Q14, coefficients 8 and 9). The state block keeps `x[n-2], x[n-1],
+    /// y[n-2], y[n-1]`.
+    fn biquad(&mut self, ram: &mut Memory, flags: u8, buf: u16, state: u32) {
+        let b = [self.book[0], self.book[1]].map(i32::from);
+        let a = [self.book[8], self.book[9]].map(i32::from);
+        assert!(
+            b[1] != 0 || self.book[2] != 0,
+            "biquad with no b1: a filter form not implemented"
+        );
+        // Multiply and round as the vector unit does in Q15.
+        let q15 = |c: i32, v: i32| (c * v * 2 + 0x8000) >> 16;
+        let (mut x, mut y) = ([0i32; 2], [0i32; 2]);
+        if flags & A_INIT == 0 {
+            let h = |k: u32| i32::from(ram.read_u16(state + 2 * k) as i16);
+            (x, y) = ([h(0), h(1)], [h(2), h(3)]);
+        }
+        for i in 0..N_COUNT / 2 {
+            let at = buf + 2 * i;
+            let xn = i32::from(self.ld(at));
+            let num = q15(b[0], xn) + q15(b[1], x[1]) + q15(b[0], x[0]);
+            let yn = clamp(i64::from(num + 2 * q15(a[0], y[1]) + 2 * q15(a[1], y[0])));
+            self.st(at, yn);
+            (x, y) = ([x[1], xn], [y[1], i32::from(yn)]);
+        }
+        for (k, v) in [x[0], x[1], y[0], y[1]].into_iter().enumerate() {
+            ram.write_u16(state + 2 * k as u32, v as u16);
         }
     }
 

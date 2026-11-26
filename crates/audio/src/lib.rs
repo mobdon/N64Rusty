@@ -26,6 +26,7 @@
 
 mod out;
 mod rsp;
+mod synth;
 mod wav;
 
 pub use out::AudioOut;
