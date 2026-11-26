@@ -73,8 +73,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let avg: Vec<u32> = (0..4)
             .map(|c| (vs.iter().map(|v| v.color[c]).sum::<f32>() / vs.len().max(1) as f32 * 255.0) as u32)
             .collect();
+        // The range of the first tile's texture coordinates, in texture
+        // widths (1.0 spans the texture once).
+        let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
+        for v in vs {
+            for c in 0..2 {
+                lo[c] = lo[c].min(v.uv[0][c]);
+                hi[c] = hi[c].max(v.uv[0][c]);
+            }
+        }
+        let uv = format!("uv {:.2}..{:.2} x {:.2}..{:.2}", lo[0], hi[0], lo[1], hi[1]);
         println!(
-            "draw {k:4}: {:4} tris, textures {:?}, combine {:016x}, geometry {:#08x}, shade {avg:?}{}",
+            "draw {k:4}: {:4} tris, textures {:?}, combine {:016x}, geometry {:#08x}, shade {avg:?}, {uv}{}",
             d.count / 3,
             s.textures,
             s.combine,
