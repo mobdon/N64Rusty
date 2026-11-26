@@ -31,6 +31,7 @@ pub fn load() -> Vec<(String, libloading::Library)> {
         if !on {
             continue;
         }
+        let path = runnable(&path);
         // SAFETY: a mod is code the player chose to put in the mods folder.
         let lib = match unsafe { libloading::Library::new(&path) } {
             Ok(l) => l,
@@ -48,6 +49,24 @@ pub fn load() -> Vec<(String, libloading::Library)> {
         libs.push((name, lib));
     }
     libs
+}
+
+/// Where the mod at `path` can be loaded from. On Android code cannot run
+/// from the shared folder the mods are put in, so it runs from a copy in
+/// the app's own folder.
+fn runnable(path: &std::path::Path) -> std::path::PathBuf {
+    #[cfg(target_os = "android")]
+    if let (Some(dir), Some(name)) = (n64rusty_host::android::private_dir(), path.file_name()) {
+        let dir = dir.join("mods");
+        let copy = dir.join(name);
+        if std::fs::create_dir_all(&dir)
+            .and_then(|()| std::fs::copy(path, &copy))
+            .is_ok()
+        {
+            return copy;
+        }
+    }
+    path.to_path_buf()
 }
 
 extern "C" fn find_rom(sha: *const u8, sha_len: usize, len: *mut usize) -> *const u8 {

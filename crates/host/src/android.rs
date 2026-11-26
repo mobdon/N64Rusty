@@ -23,6 +23,12 @@ pub fn start(app: AndroidApp, home: PathBuf) {
     let _ = HOME.set(home);
 }
 
+/// A folder only the app can see, where it may run code from: the shared
+/// files folder (ROMs, mods) does not allow that.
+pub fn private_dir() -> Option<PathBuf> {
+    APP.get()?.internal_data_path()
+}
+
 pub(crate) fn app() -> AndroidApp {
     APP.get().expect("android_main sets the app first").clone()
 }
