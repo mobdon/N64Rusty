@@ -106,6 +106,11 @@ pub struct Interpreter {
     /// table of their own and lights in 48-byte places (see
     /// [`Interpreter::set_microcode_data`]).
     normals_apart: bool,
+    /// The game has started a task on that variant: its other 3D
+    /// microcodes are the same variant under the usual name.
+    /// shortcut: one game, one 3D layout; tell them apart by their code if
+    /// a game mixes the variant with the standard microcode.
+    variant_game: bool,
     /// That variant's normal table: two bytes per vertex buffer place.
     normals: u32,
     /// The data of the microcode a task starts on, if the host named it.
@@ -221,6 +226,7 @@ impl Interpreter {
             rect_transform: None,
             ucode_2d: false,
             normals_apart: false,
+            variant_game: false,
             normals: 0,
             start_data: None,
             frame: Frame {
@@ -476,7 +482,8 @@ impl Interpreter {
             return false;
         }
         self.ucode_2d = has(b"ucode S2DEX");
-        self.normals_apart = has(b"ucode F3DEXBG");
+        self.variant_game |= has(b"ucode F3DEXBG");
+        self.normals_apart = self.variant_game && !self.ucode_2d;
         true
     }
 

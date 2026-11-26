@@ -273,6 +273,7 @@ fn a_named_microcode_reads_normals_from_their_own_table() {
     let mut ram = Ram::default();
     // The name every microcode carries in its data.
     let data = ram.put(b"RSP Gfx ucode F3DEXBG.NoN fifo 2.08");
+    let second = ram.put(b"RSP Gfx ucode F3DEX.NoN   fifo 2.08");
     // Two vertices, loaded at buffer places 1 and 2. The normal's third
     // part is the byte after z's padding; the colour bytes are a colour.
     let mut vb = Vec::new();
@@ -295,6 +296,10 @@ fn a_named_microcode_reads_normals_from_their_own_table() {
         .raw(place(2), light)
         .raw(place(3), ambient)
         .raw(0xDC << 24 | 7 << 19 | 14, normals)
+        // The game's second 3D microcode, under the usual name: the same
+        // variant.
+        .raw(0xE1 << 24, second)
+        .raw(0xDD << 24 | 0x7FF, 0)
         .vtx(verts, 2, 1)
         .tri(1, 2, 2)
         .end();
