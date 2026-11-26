@@ -437,6 +437,13 @@ CPU is a separate implementation with its own decoder and byte-by-byte
 unaligned accesses, so a mistake in one shows up as a mismatch. No game code
 or data is used.
 
+A change to the player can be checked against your own games: a headless
+run is repeatable, so two builds that agree end with the same RAM.
+
+    powershell -ExecutionPolicy Bypass -File scripts\compare.ps1 -Old <main's n64rusty-play.exe> -New <yours> -Roms <folder of ROMs> -Data <player data folder> -Frames 4000
+
+prints SAME or DIFF per game, with each build's time.
+
 ## Data rules
 
 These apply to every commit, pull request, issue and commit message.
