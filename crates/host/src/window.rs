@@ -46,6 +46,7 @@ pub fn run_windowed<G: Guest>(guest: G, cfg: &RunConfig) -> Result<G, String> {
         error: None,
         #[cfg(target_os = "android")]
         pad: Default::default(),
+        away: false,
     };
     crate::one_window::run(&mut app)?;
     if let Some(e) = app.error {
@@ -58,8 +59,16 @@ pub fn run_windowed<G: Guest>(guest: G, cfg: &RunConfig) -> Result<G, String> {
 
 /// The refresh rate of the display `window` is on, if the system says.
 pub fn display_rate(window: &Window) -> Option<f64> {
-    let mhz = window.current_monitor()?.refresh_rate_millihertz()?;
-    Some(f64::from(mhz) / 1000.0)
+    let mhz = window
+        .current_monitor()
+        .and_then(|m| m.refresh_rate_millihertz());
+    // shortcut: Android does not say through winit; 120 Hz is what phones
+    // that play games run at. Ask the display (ADisplay) if a 60 Hz phone
+    // ever stutters.
+    if cfg!(target_os = "android") && mhz.is_none() {
+        return Some(120.0);
+    }
+    Some(f64::from(mhz?) / 1000.0)
 }
 
 struct App<G> {
@@ -75,6 +84,9 @@ struct App<G> {
     /// Controllers already named on the console.
     named: Vec<gilrs::GamepadId>,
     error: Option<String>,
+    /// The app is out of sight (Android: the home screen or the app list):
+    /// no frames go to the game, so it waits, paused.
+    away: bool,
     /// A phone's controller, on the first port.
     #[cfg(target_os = "android")]
     pad: crate::android::Controller,
@@ -207,6 +219,7 @@ impl<G: Guest> ApplicationHandler for App<G> {
             if cfg!(target_os = "android") {
                 self.session.guest.attach_window(w.clone());
                 self.view();
+                self.away = false;
             }
             return;
         }
@@ -269,12 +282,32 @@ impl<G: Guest> ApplicationHandler for App<G> {
                 }
             }
             // Key releases are lost while unfocused; never leave a key stuck down.
-            WindowEvent::Focused(false) => self.keys.clear(),
+            WindowEvent::Focused(focused) => {
+                // Key releases are lost while unfocused; never leave a key
+                // stuck down. A phone pauses the game while it is away.
+                if !focused {
+                    self.keys.clear();
+                }
+                if cfg!(target_os = "android") {
+                    self.away = !focused;
+                }
+            }
             _ => {}
         }
     }
 
+    fn suspended(&mut self, _: &ActiveEventLoop) {
+        self.away = true;
+    }
+
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.away {
+            // Paused: wait for the app to come back, keeping the game's
+            // pace from jumping ahead to catch up afterwards.
+            self.pacer = Pacer::new(self.cfg.frame_rate, Instant::now());
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        }
         if let (Some(e), Some(w)) = (crate::one_window::take_over(), self.window.clone()) {
             crate::one_window::switch(w, crate::one_window::Next::Crashed(e));
             event_loop.exit();

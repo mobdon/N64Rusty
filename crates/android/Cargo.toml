@@ -25,6 +25,8 @@ n64rusty-runner = { path = "../runner" }
 package = "dev.n64rusty.player"
 apk_name = "N64Rusty"
 build_targets = ["aarch64-linux-android"]
+# The app icon: the player's window icon, six times its size.
+resources = "res"
 
 [package.metadata.android.sdk]
 min_sdk_version = 26
@@ -32,6 +34,7 @@ target_sdk_version = 35
 
 [package.metadata.android.application]
 label = "N64Rusty"
+icon = "@mipmap/ic_launcher"
 
 [package.metadata.android.application.activity]
 orientation = "sensorLandscape"
