@@ -105,6 +105,8 @@ pub struct Memory {
     map: Vec<(u32, u32, u32)>,
     /// Index in `map` of the page that matched last.
     last: AtomicUsize,
+    /// See [`Memory::map_version`].
+    map_version: u64,
 }
 
 impl Clone for Memory {
@@ -114,6 +116,7 @@ impl Clone for Memory {
             io: self.io.clone(),
             map: self.map.clone(),
             last: AtomicUsize::new(self.last.load(Ordering::Relaxed)),
+            map_version: self.map_version,
         }
     }
 }
@@ -126,6 +129,7 @@ impl Memory {
             io: None,
             map: Vec::new(),
             last: AtomicUsize::new(0),
+            map_version: 0,
         }
     }
 
@@ -136,6 +140,7 @@ impl Memory {
             io: None,
             map: Vec::new(),
             last: AtomicUsize::new(0),
+            map_version: 0,
         }
     }
 
@@ -143,6 +148,13 @@ impl Memory {
     /// (virtual base, length, physical base).
     pub fn set_map(&mut self, map: Vec<(u32, u32, u32)>) {
         self.map = map;
+        self.map_version += 1;
+    }
+
+    /// How many times [`Memory::set_map`] has been called: a copy of the
+    /// pages taken at one version is still right while it stays the same.
+    pub fn map_version(&self) -> u64 {
+        self.map_version
     }
 
     /// The pages given to [`Memory::set_map`].

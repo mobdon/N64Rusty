@@ -32,6 +32,10 @@ pub struct Cpu {
     pub map: Vec<(u32, u32, u32)>,
     /// The page of `map` that matched last: most accesses fall in it.
     last: std::cell::Cell<(u32, u32, u32)>,
+    /// Which version of a [`Memory`]-style page list `map` is a copy of
+    /// (its owner's count of changes), so a copy is refreshed only when
+    /// the list changed.
+    pub map_version: u64,
 }
 
 /// Why [`Cpu::run`] stopped early.
@@ -63,6 +67,7 @@ impl Cpu {
             mem,
             map: Vec::new(),
             last: std::cell::Cell::new((0, 0, 0)),
+            map_version: u64::MAX,
         }
     }
 
@@ -335,8 +340,19 @@ impl Cpu {
     /// interpreter's own RAM (same addressing: virtual address with the top
     /// three bits dropped).
     pub fn step_on(&mut self, mem: &mut [u8]) -> Result<(), Stop> {
+        let word = self.fetch(mem)?;
+        self.step_word(mem, word)
+    }
+
+    /// The instruction at `pc` in `mem`, as [`Cpu::step_on`] reads it.
+    pub fn fetch(&self, mem: &[u8]) -> Result<u32, Stop> {
+        Ok(Self::load(mem, self.virt(self.pc), 4, self.pc)? as u32)
+    }
+
+    /// [`Cpu::step_on`] with the instruction already fetched (by
+    /// [`Cpu::fetch`]).
+    pub fn step_word(&mut self, mem: &mut [u8], word: u32) -> Result<(), Stop> {
         let pc = self.pc;
-        let word = Self::load(mem, self.virt(pc), 4, pc)? as u32;
         // Default: the next instruction is the one in sequence.
         let mut npc = self.next_pc;
         let mut nnpc = self.next_pc.wrapping_add(4);

@@ -57,8 +57,9 @@ pub(crate) fn seen() -> BTreeMap<u32, (u32, Vec<u8>)> {
 fn load(cpu: &mut Cpu, c: &Ctx) {
     (cpu.r, cpu.hi, cpu.lo, cpu.f, cpu.fcr31, cpu.fr) = (c.r, c.hi, c.lo, c.f, c.fcr31, c.fr);
     // The callee may have written the TLB.
-    if cpu.map != c.mem.map() {
+    if cpu.map_version != c.mem.map_version() {
         cpu.set_map(c.mem.map().to_vec());
+        cpu.map_version = c.mem.map_version();
     }
 }
 
@@ -122,7 +123,13 @@ fn run(ctx: &mut Ctx, entry: u32) {
             cpu.jump_to(ctx.r[31] as u32);
             continue;
         }
-        let word = ctx.mem.read_u32(pc);
+        // Fetched once, here, and handed to the CPU. A fetch it cannot make
+        // fails again in `step` below, as before.
+        let fetched = cpu.fetch(ctx.mem.bytes());
+        let word = match fetched {
+            Ok(w) => w,
+            Err(_) => ctx.mem.read_u32(pc),
+        };
         if let Some(at) = *WATCH.get_or_init(watch_addr) {
             let now = ctx
                 .mem
@@ -150,7 +157,11 @@ fn run(ctx: &mut Ctx, entry: u32) {
         // call back to `entry` (recursion under `--interpret`), which stays
         // here.
         let calls = target.is_some_and(|t| t == entry || !ctx.has_translation(t));
-        if let Err(e) = cpu.step_on(ctx.mem.bytes_mut()) {
+        let stepped = match fetched {
+            Ok(w) => cpu.step_word(ctx.mem.bytes_mut(), w),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = stepped {
             if let Stop::BadAccess { addr, .. } = e {
                 if ctx.unmapped(addr) {
                     store(&cpu, ctx);
