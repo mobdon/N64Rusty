@@ -269,6 +269,26 @@ fn one_command_draws_four_triangles_by_5_bit_vertex_numbers() {
 }
 
 #[test]
+fn a_3d_microcode_followed_in_ram_by_the_2d_one_stays_3d() {
+    let mut ram = Ram::default();
+    // As in Majora's Mask: the 2D microcode's data, with its own name, right
+    // after the 3D one's.
+    let data = ram.put(b"RSP Gfx ucode F3DZEX.NoN fifo 2.08J");
+    ram.put(b"RSP Gfx ucode S2DEX  fifo 2.05");
+    let verts = ram.vertices(&[v(0, 0, 0, [255; 4]); 3]);
+    let mut dl = Dl::default();
+    setup(&mut ram, &mut dl);
+    dl.raw(0xE1 << 24, data)
+        .raw(0xDD << 24 | 0x7FF, 0)
+        .vtx(verts, 3, 0)
+        .tri(0, 1, 2)
+        .end();
+    let addr = ram.dl(&dl);
+    let f = run(&ram, addr);
+    assert_eq!(f.draws().map(|d| d.count).sum::<u32>(), 3);
+}
+
+#[test]
 fn a_named_microcode_reads_normals_from_their_own_table() {
     let mut ram = Ram::default();
     // The name every microcode carries in its data.

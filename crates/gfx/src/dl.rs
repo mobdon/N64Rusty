@@ -481,12 +481,15 @@ impl Interpreter {
         let Some(d) = rdram.get(at..(at + 0x800).min(rdram.len())) else {
             return false;
         };
-        let has = |name: &[u8]| d.windows(name.len()).any(|w| w == name);
-        if !has(b"RSP Gfx ucode ") {
+        // The first name only: the next microcode's data, with its own
+        // name, often follows in RAM (a 3D one before the 2D one).
+        let tag = b"RSP Gfx ucode ";
+        let Some(i) = d.windows(tag.len()).position(|w| w == tag) else {
             return false;
-        }
-        self.ucode_2d = has(b"ucode S2DEX");
-        self.variant_game |= has(b"ucode F3DEXBG");
+        };
+        let name = &d[i + tag.len()..];
+        self.ucode_2d = name.starts_with(b"S2DEX");
+        self.variant_game |= name.starts_with(b"F3DEXBG");
         self.normals_apart = self.variant_game && !self.ucode_2d;
         true
     }
