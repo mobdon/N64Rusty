@@ -495,6 +495,9 @@ two names with the same value keep only the first: give each its own.
   has not been drawn into for N frames. Without it a picture stays ready to
   be read back for good, and a game that later reuses that memory and loads
   a texture from it gets the old picture written over its data.
+- `rumble = 0x4`: each connected controller reports a Rumble Pak (status,
+  its ID area at 0x8000, motor writes at 0xC000). The motor is not yet
+  passed to the host's controller. Without it no pak is plugged in.
 
 ## Licence
 

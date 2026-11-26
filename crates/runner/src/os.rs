@@ -1370,8 +1370,9 @@ fn os_si_raw_start_dma(c: &mut Ctx) {
 
 /// Answers the controller commands in a PIF command block: per channel a
 /// send length, a reply length, the command and room for the reply. No
-/// pak is plugged in: pak reads and writes answer with a bad data CRC, as an
-/// empty slot does, and the status says no pak. Channel 4 is the cartridge
+/// pak is plugged in (unless the game's config asks for a Rumble Pak): pak
+/// reads and writes answer with a bad data CRC, as an empty slot does, and
+/// the status says no pak. Channel 4 is the cartridge
 /// EEPROM, when the game has one (see `Save::set_eeprom`).
 fn run_pif(pif: &mut [u8; 64], pads: &[Pad; 4], save: &mut Save) {
     const NO_REPLY: u8 = 0x80;
@@ -1410,14 +1411,28 @@ fn run_pif(pif: &mut [u8; 64], pads: &[Pad; 4], save: &mut Save) {
                         _ => None,
                     }
                 } else {
+                    let rumble = RUMBLE.load(Ordering::Relaxed);
                     pad.and_then(|p| match pif[cmd] {
-                        0x00 | 0xFF => Some(vec![0x05, 0x00, 0x00]),
+                        0x00 | 0xFF => Some(vec![0x05, 0x00, u8::from(rumble)]),
                         0x01 => Some(vec![
                             (p.buttons >> 8) as u8,
                             p.buttons as u8,
                             p.stick_x as u8,
                             p.stick_y as u8,
                         ]),
+                        // A Rumble Pak answers 0x80 from its ID area
+                        // (0x8000) and takes motor writes at 0xC000.
+                        // shortcut: the motor itself is not passed to the
+                        // host's controller.
+                        0x02 if rumble && tx >= 3 => {
+                            let addr = (u16::from(pif[cmd + 1]) << 8) & 0xF000;
+                            let data = vec![if addr == 0x8000 { 0x80 } else { 0 }; 32];
+                            let crc = pak_crc(&data);
+                            Some([data, vec![crc]].concat())
+                        }
+                        0x03 if rumble && tx >= 35 => Some(vec![pak_crc(&pif[cmd + 3..cmd + 35])]),
+                        // No pak: the check byte is the complement of the
+                        // data's.
                         0x02 => Some([vec![0; 32], vec![0xFF]].concat()),
                         0x03 => Some(vec![0xFF]),
                         _ => None,
@@ -1436,6 +1451,23 @@ fn run_pif(pif: &mut [u8; 64], pads: &[Pad; 4], save: &mut Save) {
         }
     }
     pif[63] = 0;
+}
+
+/// The check byte a controller pak sends after 32 bytes of data (CRC-8,
+/// polynomial 0x85, as the system library works it out).
+fn pak_crc(data: &[u8]) -> u8 {
+    let mut crc = 0u8;
+    for i in 0..=data.len() {
+        for bit in (0..8).rev() {
+            let tap = if crc & 0x80 != 0 { 0x85 } else { 0 };
+            crc <<= 1;
+            if data.get(i).is_some_and(|b| b >> bit & 1 != 0) {
+                crc |= 1;
+            }
+            crc ^= tap;
+        }
+    }
+    crc
 }
 
 fn os_cont_get_query(c: &mut Ctx) {
@@ -1682,6 +1714,10 @@ static RCP_MASK: AtomicU32 = AtomicU32::new(0x3F);
 /// config); otherwise it reports every line enabled and masks nothing.
 static INT_MASK: AtomicBool = AtomicBool::new(false);
 
+/// Whether each controller reports a Rumble Pak (a game asks with `rumble`
+/// in its config; others see no pak, as before).
+static RUMBLE: AtomicBool = AtomicBool::new(false);
+
 /// osSetIntMask: the CPU interrupt lines go into the running thread's
 /// Status (bits 8 to 15), as on the console, so a game that masks them
 /// around a list walk is not interrupted there (see `interrupt`). Returns
@@ -1783,6 +1819,7 @@ pub fn install<'a>(
     let mut done = Vec::new();
     THREAD_STATUS.store(0, Ordering::Relaxed);
     INT_MASK.store(false, Ordering::Relaxed);
+    RUMBLE.store(false, Ordering::Relaxed);
     RCP_MASK.store(0x3F, Ordering::Relaxed);
     for (name, &a) in addrs {
         if let Some((_, f)) = HOOKS.iter().find(|(h, _)| h == name) {
@@ -1796,6 +1833,9 @@ pub fn install<'a>(
             done.push(name.clone());
         } else if name == "int_mask" {
             INT_MASK.store(a != 0, Ordering::Relaxed);
+            done.push(name.clone());
+        } else if name == "rumble" {
+            RUMBLE.store(a != 0, Ordering::Relaxed);
             done.push(name.clone());
         }
     }
@@ -1954,6 +1994,15 @@ mod tests {
         assert_eq!(c_float(0.0001, 'g', 6), "0.0001");
         assert_eq!(c_float(100.0, 'G', 6), "100");
         assert_eq!(c_float(-3.25, 'f', 1), "-3.2");
+    }
+
+    #[test]
+    fn pak_check_byte() {
+        assert_eq!(pak_crc(&[0; 32]), 0);
+        // One set bit gives the polynomial shifted through the rest.
+        let mut one = [0u8; 32];
+        one[31] = 1;
+        assert_eq!(pak_crc(&one), 0x85);
     }
 
     #[test]
