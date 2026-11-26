@@ -200,14 +200,16 @@ struct Ai {
 
 impl Ai {
     /// Queues `len` bytes at clock `now`, after what is already queued.
-    fn push(&mut self, now: u64, len: u32) {
+    /// Returns when the buffer starts playing.
+    fn push(&mut self, now: u64, len: u32) -> Option<u64> {
         self.retire(now);
         if self.rate == 0 {
-            return;
+            return None;
         }
         let start = self.queue.last().map_or(now, |b| b.0.max(now));
         let ticks = u64::from(len / 4) * COUNT_HZ / self.rate;
         self.queue.push((start + ticks, len));
+        Some(start)
     }
 
     /// Bytes still to play of the buffer playing at `now`.
@@ -1285,6 +1287,9 @@ fn os_pi_raw_start_dma(c: &mut Ctx) {
     let (dir, dev, ram, len) = (arg(c, 0), arg(c, 1), arg(c, 2), arg(c, 3));
     let mut st = lock();
     pi_dma(c, &mut st, dir, dev, ram, len);
+    // The PI interrupt at the end of the transfer. (The queued routines
+    // leave it out: there the PI manager would take it.)
+    post_event(c, &mut st, event::PI);
     drop(st);
     ret(c, 0);
 }
@@ -1298,6 +1303,7 @@ fn os_epi_raw_start_dma(c: &mut Ctx) {
     let base = c.mem.read_u32(handle + 0x0C);
     let mut st = lock();
     pi_dma(c, &mut st, dir, base | dev, ram, len);
+    post_event(c, &mut st, event::PI);
     drop(st);
     ret(c, 0);
 }
@@ -1565,7 +1571,15 @@ fn post_event_at(c: &mut Ctx, st: &mut State, e: u32, at: u64, key: u32) {
 fn os_ai_set_next_buffer(c: &mut Ctx) {
     let (addr, len) = (arg(c, 0), arg(c, 1));
     let mut st = lock();
-    st.ai.push(c.clock, len);
+    // The AI interrupt comes as the buffer starts playing, which frees its
+    // slot for the next one.
+    // shortcut: one pending start (key 4); a third buffer queued past the
+    // two the hardware holds would drop the second's event.
+    match st.ai.push(c.clock, len) {
+        Some(at) if at > c.clock => post_event_at(c, &mut st, event::AI, at, 4),
+        Some(_) => post_event(c, &mut st, event::AI),
+        None => {}
+    }
     ai_regs(c, &mut st);
     st.devices.audio(c, addr, len);
     ret(c, 0);
