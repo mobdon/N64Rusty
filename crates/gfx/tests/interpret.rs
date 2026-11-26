@@ -217,6 +217,43 @@ fn decodes_a_palette_texture() {
     assert_eq!(&t.rgba[16..20], &[0, 0, 0, 255]);
 }
 
+/// A 4x2 RGBA16 tile with vertex 1 at s = 4 texels, drawn in `modes`.
+fn uv_of_far_vertex(modes: u32) -> [f32; 2] {
+    let mut ram = Ram::default();
+    let tex = ram.put(&[0; 16]);
+    let mut verts = [v(0, 0, 0, [255; 4]); 3];
+    verts[1].st = [4 << 5, 0];
+    let verts = ram.vertices(&verts);
+    let mut dl = Dl::default();
+    setup(&mut ram, &mut dl);
+    dl.other_modes(modes, 0)
+        .texture(true, 0)
+        .timg(0, 2, 1, tex)
+        .tile(0, 2, 0, 0, 7)
+        .load_block(7, 8)
+        .tile(0, 2, 1, 0, 0)
+        .tile_size(0, 4, 2)
+        .vtx(verts, 3, 0)
+        .tri(0, 1, 2)
+        .end();
+    let addr = ram.dl(&dl);
+    run(&ram, addr).vertices[1].uv[0]
+}
+
+#[test]
+fn perspective_correction_off_halves_texture_coordinates() {
+    // The sun billboard relies on this: its strips are drawn at s 0..63 over
+    // 32 texel rows.
+    assert_eq!(uv_of_far_vertex(CYCLE_1)[0], 1.0);
+    assert_eq!(uv_of_far_vertex(NO_PERSP)[0], 0.5);
+}
+
+#[test]
+fn bilinear_texel_centres_sit_on_whole_coordinates() {
+    // s = 4 is texel 4's centre: 4.5 of the 4-texel tile's width on a GPU.
+    assert_eq!(uv_of_far_vertex(CYCLE_1 | FILTER_BILERP)[0], 4.5 / 4.0);
+}
+
 #[test]
 fn texture_generation_maps_normals_through_the_look_at() {
     let mut ram = Ram::default();

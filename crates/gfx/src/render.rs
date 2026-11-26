@@ -866,7 +866,12 @@ impl Renderer {
         let mut prepared = Vec::with_capacity(draws.len());
         for d in &draws {
             let mut key = pipe_key(&d.state);
-            key.shader.sharp = self.sharp;
+            // Two textures blended (a stretched base under a fine detail
+            // layer, as the games' floors are) only look right filtered as
+            // the console does: kept crisp, the base shows as hard blocks.
+            key.shader.sharp = self.sharp
+                && !crate::combiner::Combiner::from_raw(d.state.combine)
+                    .reads_texel1(key.shader.two_cycle);
             self.pipeline(key);
             let linear = (d.state.other_h >> 20) & 3 != 2
                 && (d.state.other_h >> 12) & 3 != 0

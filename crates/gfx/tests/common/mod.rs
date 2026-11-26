@@ -104,7 +104,12 @@ pub const G_CULL_BACK: u32 = 0x400;
 pub const G_LIGHTING: u32 = 0x2_0000;
 pub const G_SHADING_SMOOTH: u32 = 0x20_0000;
 
-pub const CYCLE_1: u32 = 0;
+/// One cycle, texture perspective correction on (as games set it).
+pub const CYCLE_1: u32 = 1 << 19;
+/// Texture perspective correction off: coordinates are taken at half scale.
+pub const NO_PERSP: u32 = 0;
+/// Bilinear filtering (other modes, high word).
+pub const FILTER_BILERP: u32 = 2 << 12;
 pub const CYCLE_FILL: u32 = 3 << 20;
 pub const FILTER_POINT: u32 = 0;
 /// Depth compare and update.

@@ -44,9 +44,12 @@ pub(crate) struct Bound {
 }
 
 impl Bound {
-    /// Normalised coordinates for texel coordinates `st`.
-    pub fn uv(&self, st: [f32; 2]) -> [f32; 2] {
-        [0, 1].map(|k| (st[k] * self.scale[k] - self.offset[k]) / self.size[k])
+    /// Normalised coordinates for texel coordinates `st`. With `bilerp`,
+    /// texel centres sit on whole coordinates, as the console filters (a GPU
+    /// puts them at .5): tiles meant to overlap by one texel meet seamlessly.
+    pub fn uv(&self, st: [f32; 2], bilerp: bool) -> [f32; 2] {
+        let half = if bilerp { 0.5 } else { 0.0 };
+        [0, 1].map(|k| (st[k] * self.scale[k] - self.offset[k] + half) / self.size[k])
     }
 }
 

@@ -49,6 +49,15 @@ impl Combiner {
         raw
     }
 
+    /// Whether the cycles that run read texel 1 (colour or alpha): the draw
+    /// blends two textures, as detail-textured floors do.
+    pub fn reads_texel1(self, two_cycle: bool) -> bool {
+        let cycles: &[usize] = if two_cycle { &[0, 1] } else { &[1] };
+        cycles.iter().any(|&c| {
+            self.color[c].contains(&2) || self.color[c][2] == 9 || self.alpha[c].contains(&2)
+        })
+    }
+
     /// The same settings in both cycles.
     pub const fn both(color: [u8; 4], alpha: [u8; 4]) -> Self {
         Self {

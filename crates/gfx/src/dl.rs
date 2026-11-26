@@ -52,6 +52,8 @@ const G_CULL_BACK: u32 = 0x0400;
 const G_LIGHTING: u32 = 0x0002_0000;
 const G_TEXTURE_GEN: u32 = 0x0004_0000;
 const G_TEXTURE_GEN_LINEAR: u32 = 0x0008_0000;
+/// Other modes (high word): texture perspective correction on.
+const G_TP_PERSP: u32 = 1 << 19;
 
 /// A loaded vertex, after the vertex stage.
 #[derive(Clone, Copy, Default)]
@@ -213,7 +215,9 @@ impl Interpreter {
             tex_on: false,
             state: RenderState {
                 combine: 0,
-                other_h: 0,
+                // Perspective correction on until a list says otherwise, as
+                // games set it.
+                other_h: G_TP_PERSP,
                 other_l: 0,
                 geometry: 0,
                 prim: [1.0; 4],
@@ -850,13 +854,18 @@ impl Interpreter {
             return;
         }
         let tiles = self.tiles();
+        let bilerp = (self.state.other_h >> 12) & 3 != 0;
+        // Perspective correction off: the console takes the coordinates at
+        // half scale (games' billboards such as the sun are made for it).
+        let half = if self.state.other_h & G_TP_PERSP == 0 { 0.5 } else { 1.0 };
         let verts = idx.map(|i| {
             let v = self.vtx[i];
+            let st = v.st.map(|c| c * half);
             Vertex {
                 pos: v.pos,
                 transform: v.transform,
                 color: v.color,
-                uv: tiles.map(|t| t.map_or([0.0; 2], |t| t.uv(v.st))),
+                uv: tiles.map(|t| t.map_or([0.0; 2], |t| t.uv(st, bilerp))),
             }
         });
         let mut state = self.state.clone();
@@ -1211,7 +1220,7 @@ impl Interpreter {
             } else {
                 [st[x][0], st[y][1]]
             };
-            [b0.uv(p), b1.uv(p)]
+            [b0.uv(p, false), b1.uv(p, false)]
         };
         self.push_rect([x0, y0, x1, y1], uv, state);
     }
