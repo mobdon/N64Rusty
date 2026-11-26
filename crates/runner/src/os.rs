@@ -17,7 +17,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use n64rusty_runtime::{sx32, Ctx, Flash, FlashOp, GuestFn};
@@ -620,9 +620,13 @@ fn arm(c: &mut Ctx, st: &State) {
 /// Interrupt: the clock passed the deadline during a call. Delivers what is
 /// due and switches if that woke a thread of higher priority.
 fn interrupt(c: &mut Ctx) {
-    // Status.IE clear (inside __osDisableInt .. __osRestoreInt): try again
-    // on a later call.
-    if c.cop0[12] & 1 == 0 {
+    // Status.IE clear (inside __osDisableInt .. __osRestoreInt), or both
+    // lines that carry these events masked (the RCP's, IP2, and the
+    // timer's, IP7: osSetIntMask): try again on a later call.
+    // shortcut: either line lets every event through; tell retraces from
+    // timers if a game masks only one of them.
+    let masked = INT_MASK.load(Ordering::Relaxed) && c.cop0[12] & 0x8400 == 0;
+    if c.cop0[12] & 1 == 0 || masked {
         c.deadline = c.clock;
         return;
     }
@@ -1648,9 +1652,29 @@ fn os_inval_icache(c: &mut Ctx) {
     c.code_written(ram, len);
 }
 
+/// The RCP interrupt lines (MI mask, bits 16 to 21 of an `OSIntMask`) as
+/// the game last set them; the CPU lines live in each thread's Status.
+static RCP_MASK: AtomicU32 = AtomicU32::new(0x3F);
+
+/// Whether `os_set_int_mask` masks (a game asks with `int_mask` in its
+/// config); otherwise it reports every line enabled and masks nothing.
+static INT_MASK: AtomicBool = AtomicBool::new(false);
+
+/// osSetIntMask: the CPU interrupt lines go into the running thread's
+/// Status (bits 8 to 15), as on the console, so a game that masks them
+/// around a list walk is not interrupted there (see `interrupt`). Returns
+/// the mask before.
 fn os_set_int_mask(c: &mut Ctx) {
-    // Interrupts are not modelled; report all enabled.
-    ret(c, 0x003F_FF01);
+    if !INT_MASK.load(Ordering::Relaxed) {
+        ret(c, 0x003F_FF01);
+        return;
+    }
+    let new = arg(c, 0);
+    let status = c.cop0[12];
+    let old = 1 | (status & 0xFF00) | (RCP_MASK.load(Ordering::Relaxed) << 16);
+    RCP_MASK.store((new >> 16) & 0x3F, Ordering::Relaxed);
+    c.cop0[12] = (status & !0xFF00) | (new & 0xFF00);
+    ret(c, old);
 }
 
 /// System library routines replaced by the host, by their usual names.
@@ -1736,6 +1760,8 @@ pub fn install<'a>(
 ) -> Vec<String> {
     let mut done = Vec::new();
     THREAD_STATUS.store(0, Ordering::Relaxed);
+    INT_MASK.store(false, Ordering::Relaxed);
+    RCP_MASK.store(0x3F, Ordering::Relaxed);
     for (name, &a) in addrs {
         if let Some((_, f)) = HOOKS.iter().find(|(h, _)| h == name) {
             ctx.set_override(a, *f);
@@ -1745,6 +1771,9 @@ pub fn install<'a>(
             done.push(name.clone());
         } else if name == "thread_status" {
             THREAD_STATUS.store(a, Ordering::Relaxed);
+            done.push(name.clone());
+        } else if name == "int_mask" {
+            INT_MASK.store(a != 0, Ordering::Relaxed);
             done.push(name.clone());
         }
     }
@@ -1775,6 +1804,31 @@ mod tests {
         assert!(ai.length(one) >= 2120);
         // All played: empty and idle.
         assert_eq!((ai.length(3 * one), ai.status(3 * one)), (0, 0));
+    }
+
+    #[test]
+    fn the_interrupt_mask_goes_into_status_and_holds_back_interrupts() {
+        let mut c = Ctx::new(n64rusty_runtime::Memory::new(0x1000));
+        c.cop0[12] = STATUS_THREAD;
+        // Without the config name nothing is masked.
+        c.r[4] = 1;
+        os_set_int_mask(&mut c);
+        assert_eq!(c.cop0[12], STATUS_THREAD);
+        INT_MASK.store(true, Ordering::Relaxed);
+        c.r[4] = 1; // OS_IM_NONE
+        os_set_int_mask(&mut c);
+        assert_eq!(c.r[2] as u32, 0x003F_FF01, "the mask before");
+        assert_eq!(c.cop0[12] & 0xFF00, 0);
+        // Masked: an interrupt due now waits for a later call.
+        c.clock = 100;
+        interrupt(&mut c);
+        assert_eq!(c.deadline, 100);
+        // Restoring the old mask brings the lines back.
+        c.r[4] = 0x003F_FF01;
+        os_set_int_mask(&mut c);
+        assert_eq!(c.cop0[12], STATUS_THREAD);
+        assert_eq!(c.r[2] as u32, 1);
+        INT_MASK.store(false, Ordering::Relaxed);
     }
 
     #[test]

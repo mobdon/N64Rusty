@@ -210,6 +210,13 @@ impl Media {
         self
     }
 
+    /// Forgets a drawn picture once it has not been drawn into for `n`
+    /// frames (see `Interpreter::set_readback_frames`).
+    pub fn with_readback_frames(mut self, n: Option<u32>) -> Self {
+        self.gfx.set_readback_frames(n);
+        self
+    }
+
     /// Uses the `n_audio` command set with one game's stream commands (see
     /// `AudioRsp::n_audio_streams`).
     pub fn with_audio_streams(mut self, on: bool) -> Self {

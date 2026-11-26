@@ -677,6 +677,41 @@ fn fills_and_copies_land_in_ram_and_drawn_images_are_read_back() {
 }
 
 #[test]
+fn a_picture_not_drawn_for_some_frames_is_forgotten_when_asked() {
+    for (expire, want) in [(None, 1), (Some(1), 0)] {
+        let mut ram = Ram::default();
+        let tex = ram.put(&[0x07, 0xC1].repeat(16));
+        let drawn = ram.put(&[0; 8 * 6 * 2]);
+        // One list draws into the picture...
+        let mut dl = Dl::default();
+        setup(&mut ram, &mut dl);
+        dl.cimg(drawn, 8)
+            .other_modes(CYCLE_1, 0)
+            .timg(0, 2, 1, tex)
+            .tile(0, 2, 0, 0, 7)
+            .load_block(7, 16)
+            .tile(0, 2, 1, 0, 0)
+            .tile_size(0, 4, 4)
+            .tex_rect(0, [0, 0, 8, 6], [0, 0], [1 << 10, 1 << 10])
+            .end();
+        let draw = ram.dl(&dl);
+        // ...and a later one, after two frames of nothing, loads from it.
+        let mut dl = Dl::default();
+        dl.timg(0, 2, 8, drawn).load_block(7, 16).end();
+        let load = ram.dl(&dl);
+        let mut it = Interpreter::new();
+        it.set_readback_frames(expire);
+        let mut rb = Solid { asked: Vec::new() };
+        it.run_readback(&mut ram.bytes, draw, &mut rb).unwrap();
+        for _ in 0..3 {
+            it.take_frame();
+        }
+        it.run_readback(&mut ram.bytes, load, &mut rb).unwrap();
+        assert_eq!(rb.asked.len(), want, "expiry {expire:?}");
+    }
+}
+
+#[test]
 fn a_texture_of_another_pixel_size_inside_a_drawn_image_is_not_read_back() {
     let mut ram = Ram::default();
     let drawn = ram.put(&[0; 8 * 6 * 2]);

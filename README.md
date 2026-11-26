@@ -154,6 +154,7 @@ Two debugging aids, in headless and window runs alike:
   hold game addresses.
 - `--ram-out file` saves guest RAM when the run ends, to read state back.
 - `N64RUSTY_WATCH=addr` (environment, hex) prints each change the interpreter sees of the RAM word there, with the instruction it was at: finds what wrote a bad value.
+- `N64RUSTY_PAGES_OUT=file:lo-hi` (environment, hex) saves a game's TLB-mapped memory from `lo` to `hi` when the run ends: each 4 KiB page is brought in by the game's own refill routine and copied, so code a game unpacks only on demand can be read whole. Keep the file in the per-game folder: it is game code.
 - `--hash-out file` writes `frame hash` of guest RAM at every retrace. Two runs with the same input script should give the same lines; the first line that differs is where they part.
 - `--interpret lo-hi` (hex addresses) runs calls into that range in the reference interpreter even where a translation exists. With `--hash-out`, this checks translated code against the interpreter.
 - `N64RUSTY_PROFILE=n` (environment) prints a profile line every n frames: host time per frame in the guest, display lists, audio, capture rendering and PNG writing, and the renderer's split (recording, texture uploads, submit and wait, draws and textures uploaded per picture). In a window it prints the window's drawing. Measure with it before and after any speed change.
@@ -469,6 +470,20 @@ local/<sha256>/          # git-ignored
 
 The only per-game data that may ever be committed is a short file of hook
 addresses with role names that we found ourselves, named by the same hash.
+
+`config.toml` also takes a few switches, as `name = 0xVALUE` lines. Each
+changes only the game whose config names it. Names are kept by value, so
+two names with the same value keep only the first: give each its own.
+
+- `tlb_refill`, `thread_status`: see the TLB section.
+- `n_audio_streams`: see the audio section.
+- `int_mask = 0x2`: `osSetIntMask` sets the running thread's interrupt
+  lines, and retrace and timer interrupts wait while both are masked, as
+  on the console. Without it the mask is reported as all enabled.
+- `readback_frames = 0xN`: a picture the game drew is forgotten once it
+  has not been drawn into for N frames. Without it a picture stays ready to
+  be read back for good, and a game that later reuses that memory and loads
+  a texture from it gets the old picture written over its data.
 
 ## Licence
 

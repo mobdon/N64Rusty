@@ -129,6 +129,10 @@ pub fn routine_list(names: &BTreeMap<u32, String>) -> String {
 /// Routines that tell the alternative audio library is in use.
 const N_AUDIO: [&str; 2] = ["n_alSynNew", "n_alAudioFrame"];
 
+/// Per-game config name: forget a drawn picture once it has not been drawn
+/// into for this many frames (`readback_frames = 0x3`).
+const READBACK_FRAMES: &str = "readback_frames";
+
 /// Per-game config name: the `n_audio` command set with that game's stream
 /// commands (the last step of its MP3 decoding).
 const N_AUDIO_STREAMS: &str = "n_audio_streams";
@@ -236,6 +240,35 @@ fn record_run(
             .collect();
         std::fs::write(local.join("missing.txt"), text)?;
     }
+    Ok(())
+}
+
+/// See `N64RUSTY_PAGES_OUT` where it is read: `spec` is `file:lo-hi`.
+/// Pages no TLB entry maps after a refill are saved as zeros.
+fn save_pages(ctx: &mut Ctx, spec: &str) -> Result<(), String> {
+    let (file, range) = spec.rsplit_once(':').ok_or("needs file:lo-hi")?;
+    let (lo, hi) = range.split_once('-').ok_or("needs file:lo-hi")?;
+    let hex =
+        |s: &str| u32::from_str_radix(s.trim_start_matches("0x"), 16).map_err(|e| e.to_string());
+    let (lo, hi) = (hex(lo)? & !0xFFF, hex(hi)?);
+    let mut out = Vec::new();
+    let mut missing = 0;
+    for page in (lo..hi).step_by(0x1000) {
+        ctx.tlb_miss(page);
+        if ctx.unmapped(page) {
+            missing += 1;
+            out.extend_from_slice(&[0; 0x1000]);
+            continue;
+        }
+        for k in (0..0x1000).step_by(4) {
+            out.extend_from_slice(&ctx.mem.read_u32(page + k).to_be_bytes());
+        }
+    }
+    std::fs::write(file, &out).map_err(|e| e.to_string())?;
+    println!(
+        "saved {:#x} bytes of TLB-mapped memory from {lo:#010x} to {file} ({missing} pages not mapped)",
+        out.len()
+    );
     Ok(())
 }
 
@@ -639,6 +672,7 @@ pub fn main_args(
     let n_audio = streams || N_AUDIO.iter().any(|n| by_name.contains_key(*n));
     let media = media::Media::new(capture, every, wav, n_audio, script)
         .with_audio_streams(streams)
+        .with_readback_frames(by_name.get(READBACK_FRAMES).copied())
         .with_scale(scale)
         .with_widescreen(wide)
         .with_between(between)
@@ -689,6 +723,15 @@ fn run_and_report(
     if let Some(p) = RAM_OUT.lock().unwrap().as_ref() {
         if let Err(e) = std::fs::write(p, ctx.mem.bytes()) {
             eprintln!("warning: could not write RAM to {}: {e}", p.display());
+        }
+    }
+    // N64RUSTY_PAGES_OUT=file:lo-hi (hex) saves the game's TLB-mapped
+    // memory from lo to hi, a debugging aid: each 4 KiB page is brought in
+    // by the game's own refill routine and copied before the next one may
+    // replace it, so code a game unpacks only on demand can be read whole.
+    if let Ok(spec) = std::env::var("N64RUSTY_PAGES_OUT") {
+        if let Err(e) = save_pages(ctx, &spec) {
+            eprintln!("warning: N64RUSTY_PAGES_OUT={spec}: {e}");
         }
     }
     match outcome {

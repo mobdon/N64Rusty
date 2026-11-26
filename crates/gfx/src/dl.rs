@@ -119,6 +119,9 @@ pub struct Interpreter {
     /// Colour images drawn on the GPU since they were last read back into
     /// RAM, newest last.
     drawn: Vec<Drawn>,
+    /// Drop a drawn image's record once it has not been drawn into for this
+    /// many handed-over frames (see [`Interpreter::set_readback_frames`]).
+    readback_frames: Option<u32>,
 }
 
 /// A colour image drawn on the GPU and not yet read back.
@@ -134,6 +137,8 @@ struct Drawn {
     frame: Option<std::sync::Arc<Frame>>,
     /// Read back into RAM since it was last drawn into.
     read: bool,
+    /// Handed-over frames since it was last drawn into.
+    age: u32,
 }
 
 impl Drawn {
@@ -235,6 +240,7 @@ impl Interpreter {
                 ..Frame::default()
             },
             drawn: Vec::new(),
+            readback_frames: None,
         }
     }
 
@@ -255,9 +261,23 @@ impl Interpreter {
                     snap.get_or_insert_with(|| std::sync::Arc::new(f.clone()))
                         .clone(),
                 );
+                d.age = 0;
+            } else {
+                d.age += 1;
             }
         }
+        if let Some(n) = self.readback_frames {
+            self.drawn.retain(|d| d.age <= n);
+        }
         f
+    }
+
+    /// Forget a drawn image once it has not been drawn into for `n` frames,
+    /// so a texture load from memory the game has since reused for
+    /// something else does not get the old picture written over it. Without
+    /// this a picture drawn once stays ready to read back for good.
+    pub fn set_readback_frames(&mut self, n: Option<u32>) {
+        self.readback_frames = n;
     }
 
     /// The frame being recorded.
@@ -817,6 +837,7 @@ impl Interpreter {
                 height: h,
                 frame: None,
                 read: false,
+                age: 0,
             }),
         }
         let first = self.frame.vertices.len() as u32;
