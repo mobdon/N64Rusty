@@ -1284,6 +1284,19 @@ fn os_pi_raw_start_dma(c: &mut Ctx) {
     ret(c, 0);
 }
 
+/// osEPiRawStartDma(handle, direction, devAddr, dramAddr, size): as
+/// osPiRawStartDma, with the handle's base address ORed in (see
+/// `os_epi_start_dma`).
+fn os_epi_raw_start_dma(c: &mut Ctx) {
+    let (handle, dir, dev, ram) = (arg(c, 0), arg(c, 1), arg(c, 2), arg(c, 3));
+    let len = arg(c, 4);
+    let base = c.mem.read_u32(handle + 0x0C);
+    let mut st = lock();
+    pi_dma(c, &mut st, dir, base | dev, ram, len);
+    drop(st);
+    ret(c, 0);
+}
+
 fn os_pi_read_io(c: &mut Ctx) {
     let (dev, out) = (arg(c, 0), arg(c, 1));
     let off = (dev & 0x0FFF_FFFC) as usize;
@@ -1320,7 +1333,12 @@ fn write_status(c: &mut Ctx, at: u32, pads: &[Pad; 4]) {
     for (k, p) in pads.iter().enumerate() {
         let a = at + 4 * k as u32;
         c.mem.write_u16(a, if p.connected { 0x0005 } else { 0 });
-        c.mem.write_u8(a + 2, 0);
+        // Pak status: a Rumble Pak when the game's config asks for one, as
+        // the controller itself answers (see `run_pif`).
+        c.mem.write_u8(
+            a + 2,
+            u8::from(p.connected && RUMBLE.load(Ordering::Relaxed)),
+        );
         c.mem.write_u8(a + 3, if p.connected { 0 } else { 8 });
     }
 }
@@ -1789,7 +1807,7 @@ pub const HOOKS: &[(&str, GuestFn)] = &[
     ("osPiStartDma", os_pi_start_dma),
     ("osEPiStartDma", os_epi_start_dma),
     ("osPiRawStartDma", os_pi_raw_start_dma),
-    ("osEPiRawStartDma", os_pi_raw_start_dma),
+    ("osEPiRawStartDma", os_epi_raw_start_dma),
     ("osPiReadIo", os_pi_read_io),
     ("osPiGetStatus", ret_zero),
     ("osCartRomInit", os_cart_rom_init),
