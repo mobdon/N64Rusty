@@ -1141,7 +1141,16 @@ fn os_set_timer(c: &mut Ctx) {
     let countdown = arg64(c, 2);
     let interval = arg64(c, 4);
     let (mq, msg) = (arg(c, 6), arg(c, 7));
-    let at = c.clock + if countdown > 0 { countdown } else { interval };
+    let first = if countdown > 0 { countdown } else { interval };
+    // The OSTimer as the system library fills it (no list links: the host
+    // keeps the timers).
+    c.mem.write_u32(t, 0);
+    c.mem.write_u32(t + 4, 0);
+    c.mem.write_u64(t + 8, interval);
+    c.mem.write_u64(t + 0x10, first);
+    c.mem.write_u32(t + 0x18, mq);
+    c.mem.write_u32(t + 0x1C, msg);
+    let at = c.clock + first;
     lock().timers.insert(
         t,
         Timer {
