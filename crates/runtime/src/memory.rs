@@ -219,6 +219,10 @@ impl Memory {
                     (w >> (8 * (3 - (a & 3)))) as u8
                 }
                 0x1000_0000..=0x1FBF_FFFF => io.rom.get(a - 0x1000_0000).copied().unwrap_or(0),
+                // SP_STATUS: HALT. Each RSP task is done at once, so the RSP
+                // is always idle; what the game wrote there are set/clear
+                // commands, not the status.
+                0x0404_0010..=0x0404_0013 => u8::from(a == 0x0404_0013),
                 _ => {
                     let w = io.regs.get(&(a as u32 & !3)).copied().unwrap_or(0);
                     (w >> (8 * (3 - (a & 3)))) as u8
