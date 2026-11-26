@@ -121,8 +121,17 @@ fn tlb_pages(tlb: &[[u32; 4]; 32]) -> Vec<(u32, u32, u32)> {
         let base = e[1] & !mask;
         for (k, lo) in [e[2], e[3]].into_iter().enumerate() {
             // Bit 1 is Valid; the frame number starts at bit 6.
-            if lo & 2 != 0 {
-                pages.push((base + k as u32 * len, len, (lo >> 6) << 12));
+            // A page an earlier entry already covers is left out: the first
+            // match wins, and lookups that remember their last page then
+            // agree with a search from the start.
+            // shortcut: only a page wholly covered goes; pages of mixed
+            // sizes that partly overlap would still disagree.
+            let page = base + k as u32 * len;
+            let covered = pages.iter().any(|&(b, l, _): &(u32, u32, u32)| {
+                page.wrapping_sub(b) < l && len <= l - (page - b)
+            });
+            if lo & 2 != 0 && !covered {
+                pages.push((page, len, (lo >> 6) << 12));
             }
         }
     }
@@ -856,6 +865,17 @@ mod interpret_tests {
         assert_eq!(c.r[2], 2);
         c.call(0x8000_0200);
         assert_eq!(c.r[2], 1, "the range's end is outside it");
+    }
+
+    #[test]
+    fn tlb_pages_first_match_wins() {
+        // Two entries for the same 4 KiB page: the first one maps it, and
+        // stays mapping it after a lookup through the second's frame.
+        let entry = |frame: u32| [0, 0x1000_0000, frame << 6 | 2, 0];
+        let mut tlb = [[0u32; 4]; 32];
+        (tlb[0], tlb[1]) = (entry(2), entry(3));
+        let pages = super::tlb_pages(&tlb);
+        assert_eq!(pages, vec![(0x1000_0000, 0x1000, 0x2000)]);
     }
 
     #[test]

@@ -351,7 +351,14 @@ impl Cpu {
         let simm = i64::from(imm as u16 as i16);
         let s = self.r[rs as usize];
         let t = self.r[rt as usize];
-        let ea = self.virt((s as u32).wrapping_add(simm as u32));
+        // Only loads and stores (LDL and LDR at 0x1A and 0x1B, the rest from
+        // 0x20) use it; working it out for every instruction cost a TLB
+        // search on most.
+        let ea = if opc >= 0x1A {
+            self.virt((s as u32).wrapping_add(simm as u32))
+        } else {
+            0
+        };
         let link = se32(pc.wrapping_add(8));
         let btarget = pc.wrapping_add(4).wrapping_add((simm * 4) as u32);
         let unimpl = Stop::Unimplemented { pc, word };

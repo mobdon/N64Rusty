@@ -92,6 +92,11 @@ fn run(ctx: &mut Ctx, entry: u32) {
     // The 4 KiB page of code known to be mapped. Forgotten after anything
     // that can run game code or bring pages in (and so push others out).
     let mut known = u32::MAX;
+    // Where the next instruction in sequence would be: translated code is
+    // looked for only where execution jumped to.
+    // shortcut: code that runs on into the start of a translated function
+    // without a jump stays here; no game has needed it.
+    let mut next = entry;
     while cpu.pc != stop {
         let pc = cpu.pc;
         if pc >> 12 != known {
@@ -105,7 +110,9 @@ fn run(ctx: &mut Ctx, entry: u32) {
             }
             known = pc >> 12;
         }
-        if pc != entry && ctx.has_translation(pc) {
+        let jumped = pc != next;
+        next = pc.wrapping_add(4);
+        if jumped && pc != entry && ctx.has_translation(pc) {
             // A call (or tail jump) into translated code: run it there, then
             // carry on at the return address it leaves.
             store(&cpu, ctx);
