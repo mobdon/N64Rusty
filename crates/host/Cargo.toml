@@ -18,3 +18,5 @@ winit = { version = "0.30", features = ["serde"] }
 [target.'cfg(windows)'.dependencies]
 muda = { version = "0.17", default-features = false }
 rfd = "0.15"
+# Waiting for the program started again to show its window.
+windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }

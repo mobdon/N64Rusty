@@ -9,7 +9,7 @@ use gilrs::Gilrs;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, KeyEvent, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
@@ -33,7 +33,6 @@ pub fn run_windowed<G: Guest>(guest: G, cfg: &RunConfig) -> Result<G, String> {
     let gilrs = Gilrs::new()
         .map_err(|e| eprintln!("gamepads unavailable: {e}"))
         .ok();
-    let event_loop = EventLoop::new().map_err(|e| e.to_string())?;
     let mut app = App {
         session,
         cfg: cfg.clone(),
@@ -46,7 +45,7 @@ pub fn run_windowed<G: Guest>(guest: G, cfg: &RunConfig) -> Result<G, String> {
         named: Vec::new(),
         error: None,
     };
-    event_loop.run_app(&mut app).map_err(|e| e.to_string())?;
+    crate::one_window::run(&mut app)?;
     if let Some(e) = app.error {
         return Err(e);
     }
@@ -102,11 +101,9 @@ impl<G: Guest> App<G> {
                     Action::Screen(page) => vec!["--screen".into(), page.into()],
                     _ => Vec::new(),
                 };
-                if let Ok(exe) = std::env::current_exe() {
-                    match std::process::Command::new(exe).args(rom).spawn() {
-                        Ok(_) => event_loop.exit(),
-                        Err(e) => eprintln!("warning: starting the other ROM: {e}"),
-                    }
+                match crate::one_window::hand_over(&window, rom) {
+                    Ok(()) => event_loop.exit(),
+                    Err(e) => eprintln!("warning: starting the other ROM: {e}"),
                 }
                 return;
             }
@@ -122,16 +119,10 @@ impl<G: Guest> App<G> {
                     ),
                     _ => unreachable!(),
                 };
-                let restart = change
-                    .map_err(|e| e.to_string())
-                    .and_then(|_| std::env::current_exe().map_err(|e| e.to_string()))
-                    .and_then(|exe| {
-                        let args = std::env::args_os().skip(1);
-                        std::process::Command::new(exe)
-                            .args(args)
-                            .spawn()
-                            .map_err(|e| e.to_string())
-                    });
+                let restart = change.map_err(|e| e.to_string()).and_then(|_| {
+                    crate::one_window::hand_over(&window, std::env::args_os().skip(1))
+                        .map_err(|e| e.to_string())
+                });
                 match restart {
                     Ok(_) => event_loop.exit(),
                     Err(e) => eprintln!("warning: turning mod {} on or off: {e}", path.display()),
@@ -195,19 +186,42 @@ impl<G: Guest> App<G> {
 }
 
 impl<G: Guest> ApplicationHandler for App<G> {
+    // Each run of the shared event loop starts here; `resumed` may not come
+    // again on a later run.
+    fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: winit::event::StartCause) {
+        if cause == winit::event::StartCause::Init {
+            self.resumed(event_loop);
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
         }
         let scale = self.cfg.window.scale as f64;
-        let attrs = Window::default_attributes()
-            .with_title(self.cfg.window.title.clone())
-            .with_theme(Some(winit::window::Theme::Dark))
-            .with_window_icon(crate::launcher::icon())
-            .with_inner_size(LogicalSize::new(320.0 * scale, 240.0 * scale));
-        match event_loop.create_window(attrs) {
+        let size = LogicalSize::new(320.0 * scale, 240.0 * scale);
+        // The start screen's window, when the game was picked there.
+        let window = match crate::one_window::take() {
+            Some(w) => {
+                w.set_title(&self.cfg.window.title);
+                if w.fullscreen().is_none() && !w.is_maximized() {
+                    let _ = w.request_inner_size(size);
+                }
+                Ok(w)
+            }
+            None => {
+                let attrs = Window::default_attributes()
+                    .with_title(self.cfg.window.title.clone())
+                    .with_theme(Some(winit::window::Theme::Dark))
+                    .with_window_icon(crate::launcher::icon())
+                    .with_inner_size(size);
+                event_loop
+                    .create_window(crate::one_window::placed(attrs))
+                    .map(Arc::new)
+            }
+        };
+        match window {
             Ok(window) => {
-                let window = Arc::new(window);
                 self.menu = Menu::new(&window, &self.cfg.window);
                 self.session.guest.attach_window(window.clone());
                 self.window = Some(window);

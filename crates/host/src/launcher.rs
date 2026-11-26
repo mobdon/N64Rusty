@@ -6,12 +6,12 @@
 
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::sync::Arc;
 
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Theme, Window, WindowId};
 
@@ -369,8 +369,7 @@ pub fn pick(roms: &[PathBuf], page: Page) -> Option<PathBuf> {
 }
 
 /// Shows a message (an error) in the same style until it is closed.
-/// Returns false when no window could open, for example when the program
-/// already had one: a program gets one window loop.
+/// Returns false when no window could open.
 pub fn message(head: &str, body: &str) -> bool {
     let ui = Ui {
         page: Page::Games,
@@ -379,28 +378,32 @@ pub fn message(head: &str, body: &str) -> bool {
         settings: RunConfig::default(),
         message: Some((head.to_uppercase(), body.to_string())),
     };
-    let Ok(event_loop) = EventLoop::new() else {
-        return false;
-    };
     let mut app = Screens::new(ui, true);
-    event_loop.run_app(&mut app).is_ok() && app.surface.is_some()
+    crate::one_window::run(&mut app).is_ok() && app.shown
 }
 
+/// Picking a game keeps the window open for it (see [`crate::one_window`]).
 fn run(ui: Ui) -> Option<PathBuf> {
-    let event_loop = EventLoop::new().ok()?;
     let mut app = Screens::new(ui, false);
-    event_loop.run_app(&mut app).ok()?;
-    app.picked
+    crate::one_window::run(&mut app).ok()?;
+    let picked = app.picked.take()?;
+    app.surface = None;
+    if let Some(w) = app.window.take() {
+        crate::one_window::keep(w);
+    }
+    Some(picked)
 }
 
 struct Screens {
     ui: Ui,
     /// Closing the message closes the program (an error screen).
     message_only: bool,
-    window: Option<Rc<Window>>,
-    surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
+    window: Option<Arc<Window>>,
+    surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
     cursor: Option<(isize, isize)>,
     picked: Option<PathBuf>,
+    /// A window opened and could be drawn in.
+    shown: bool,
 }
 
 impl Screens {
@@ -412,6 +415,7 @@ impl Screens {
             surface: None,
             cursor: None,
             picked: None,
+            shown: false,
         }
     }
 
@@ -474,29 +478,49 @@ impl Screens {
 }
 
 impl ApplicationHandler for Screens {
+    // Each run of the shared event loop starts here; `resumed` may not come
+    // again on a later run.
+    fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: winit::event::StartCause) {
+        if cause == winit::event::StartCause::Init {
+            self.resumed(event_loop);
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
         }
-        let attrs = Window::default_attributes()
-            .with_title("N64Rusty")
-            .with_theme(Some(Theme::Dark))
-            .with_window_icon(icon())
-            .with_inner_size(LogicalSize::new(W as f64 * 3.0, H as f64 * 3.0));
-        let Ok(window) = event_loop.create_window(attrs) else {
-            event_loop.exit();
-            return;
+        let window = match crate::one_window::take() {
+            Some(w) => w,
+            None => {
+                let attrs = Window::default_attributes()
+                    .with_title("N64Rusty")
+                    .with_theme(Some(Theme::Dark))
+                    .with_window_icon(icon())
+                    .with_inner_size(LogicalSize::new(W as f64 * 3.0, H as f64 * 3.0));
+                match event_loop.create_window(crate::one_window::placed(attrs)) {
+                    Ok(w) => Arc::new(w),
+                    Err(_) => {
+                        event_loop.exit();
+                        return;
+                    }
+                }
+            }
         };
-        let window = Rc::new(window);
+        window.set_title("N64Rusty");
         let surface = softbuffer::Context::new(window.clone())
             .and_then(|c| softbuffer::Surface::new(&c, window.clone()));
         match surface {
-            Ok(s) => self.surface = Some(s),
+            Ok(s) => {
+                self.surface = Some(s);
+                self.shown = true;
+            }
             Err(e) => {
                 eprintln!("error: the start screen cannot draw: {e}");
                 event_loop.exit();
             }
         }
+        window.request_redraw();
         self.window = Some(window);
     }
 
