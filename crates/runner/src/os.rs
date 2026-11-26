@@ -1853,8 +1853,8 @@ pub const HOOKS: &[(&str, GuestFn)] = &[
     ("osInvalICache", os_inval_icache),
     ("osWritebackDCache", nothing),
     ("osWritebackDCacheAll", nothing),
-    ("osMapTLB", nothing),
-    ("osUnmapTLBAll", nothing),
+    // osMapTLB and osUnmapTLBAll are not replaced: the game's own code
+    // writes the TLB, which the runtime keeps (`Ctx::tlb`).
 ];
 
 /// Config name of a game's own TLB refill routine: not replaced, but run
