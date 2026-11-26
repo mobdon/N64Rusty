@@ -310,9 +310,26 @@ pub fn play(
         .name("game".into())
         .spawn(move || {
             let code = run(Box::new(live));
-            if !stopped.load(std::sync::atomic::Ordering::Acquire) {
-                std::process::exit(code.into());
+            if stopped.load(std::sync::atomic::Ordering::Acquire) {
+                return;
             }
+            // A crash in a program with a start screen (the player) goes
+            // back to it in the same window instead of closing everything.
+            let screens =
+                n64rusty_host::menu::START_SCREEN.load(std::sync::atomic::Ordering::Relaxed);
+            if code != 0 && screens {
+                let m = crate::os::PANIC_MESSAGE
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                n64rusty_host::one_window::game_over(if m.is_empty() {
+                    "The game stopped responding.".into()
+                } else {
+                    m
+                });
+                return;
+            }
+            std::process::exit(code.into());
         })
         .expect("starting the game thread");
     match n64rusty_host::run_windowed(screen, cfg) {

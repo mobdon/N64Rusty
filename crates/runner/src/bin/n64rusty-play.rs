@@ -150,7 +150,31 @@ fn play(args: &mut Vec<String>, dir: &Path, plain: bool) -> ExitCode {
 fn play_on(args: &mut Vec<String>, dir: &Path, mut plain: bool) -> ExitCode {
     loop {
         let this = args.clone();
-        let code = played(args, dir, plain);
+        let code = match played(args, dir, plain) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("error: {e}");
+                // Command-line runs (scripts, tests) stop with the error.
+                if !plain {
+                    return ExitCode::from(2);
+                }
+                // A player sees why, then picks another game in the same
+                // window.
+                if !n64rusty_host::launcher::message("Can't play this one", &friendly(&e)) {
+                    // No window could open: the plain error box shows it.
+                    return ExitCode::from(2);
+                }
+                if !n64rusty_host::one_window::kept() {
+                    // Closed instead of dismissed.
+                    return ExitCode::SUCCESS;
+                }
+                let Some(rom) = n64rusty_host::launcher::pick(&games(dir), Page::Games) else {
+                    return ExitCode::SUCCESS;
+                };
+                *args = vec![rom.display().to_string()];
+                continue;
+            }
+        };
         let rom = match n64rusty_host::one_window::take_next() {
             None => return code,
             Some(Next::Again) => {
@@ -158,6 +182,20 @@ fn play_on(args: &mut Vec<String>, dir: &Path, mut plain: bool) -> ExitCode {
                 continue;
             }
             Some(Next::Rom(rom)) => rom,
+            Some(Next::Crashed(e)) => {
+                let text = format!(
+                    "The game crashed, so it was stopped. Pick a game to play.\n\n{e}\n\nDetails: crash.txt next to the player."
+                );
+                if !n64rusty_host::launcher::message("Game crashed", &text)
+                    || !n64rusty_host::one_window::kept()
+                {
+                    return ExitCode::SUCCESS;
+                }
+                let Some(rom) = n64rusty_host::launcher::pick(&games(dir), Page::Games) else {
+                    return ExitCode::SUCCESS;
+                };
+                rom
+            }
             Some(Next::Screen(page)) => {
                 let Some(page) = Page::parse(page) else {
                     return code;
@@ -173,6 +211,24 @@ fn play_on(args: &mut Vec<String>, dir: &Path, mut plain: bool) -> ExitCode {
     }
 }
 
+/// What a player is told when a game cannot start.
+fn friendly(error: &str) -> String {
+    if error.contains("no system routines found") {
+        "This game has not been set up for N64Rusty yet, so it cannot run. \
+         Pick another game."
+            .into()
+    } else {
+        format!("This file could not be opened as an N64 game.\n\n{error}")
+    }
+}
+
+#[test]
+fn a_game_not_set_up_yet_gets_a_plain_message() {
+    let e = "no system routines found in this ROM, so it cannot run yet (x has 3 fingerprints)";
+    assert!(friendly(e).contains("not been set up"));
+    assert!(friendly("game.z64: not an N64 ROM").contains("not an N64 ROM"));
+}
+
 /// The start screen's games: those played before, then every ROM in `dir`
 /// (the player's folder), so a friend only drops ROMs next to it.
 fn games(dir: &Path) -> Vec<PathBuf> {
@@ -185,24 +241,16 @@ fn games(dir: &Path) -> Vec<PathBuf> {
     games
 }
 
-/// Plays the ROM `args` starts with.
-fn played(args: &mut Vec<String>, dir: &Path, plain: bool) -> ExitCode {
+/// Plays the ROM `args` starts with. `Err` when it cannot start: not a ROM,
+/// or a game the player cannot set up yet.
+fn played(args: &mut Vec<String>, dir: &Path, plain: bool) -> Result<ExitCode, String> {
     let recent = dir.join("recent.txt");
-    let rom = match std::fs::read(&args[0])
+    let rom = std::fs::read(&args[0])
         .map_err(|e| e.to_string())
         .and_then(|b| Rom::from_bytes(b).map_err(|e| e.to_string()))
-    {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("error: {}: {e}", args[0]);
-            return ExitCode::from(2);
-        }
-    };
+        .map_err(|e| format!("{}: {e}", args[0]))?;
     let local = dir.join("games").join(&rom.sha256);
-    if let Err(e) = routines(args, dir, &rom, &local) {
-        eprintln!("error: {e}");
-        return ExitCode::from(2);
-    }
+    routines(args, dir, &rom, &local)?;
     // Remembered once it is known to be a ROM the player can set up.
     if plain {
         let rom = std::path::absolute(&args[0]).unwrap_or_else(|_| PathBuf::from(&args[0]));
@@ -249,7 +297,7 @@ fn played(args: &mut Vec<String>, dir: &Path, plain: bool) -> ExitCode {
         entry: rom.entry(),
         sha256: rom.sha256.clone().leak(),
     };
-    main_args(game, None, std::mem::take(args))
+    Ok(main_args(game, None, std::mem::take(args)))
 }
 
 /// Makes sure the game has a routine list: from `--symbols` maps (also

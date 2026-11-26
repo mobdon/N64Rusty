@@ -21,6 +21,23 @@ pub enum Next {
     Screen(&'static str),
     /// Play the same game again (mods install at start).
     Again,
+    /// The game ended by itself with this error (a crash): tell the player
+    /// and go back to the start screen.
+    Crashed(String),
+}
+
+/// Set by the game's own thread when it ends by itself, so the window
+/// leaves the game instead of the whole program exiting.
+static OVER: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Ends the game in the window with `error` (see [`Next::Crashed`]).
+pub fn game_over(error: String) {
+    *OVER.lock().unwrap_or_else(|e| e.into_inner()) = Some(error);
+}
+
+/// The error a game ended with, if it did.
+pub(crate) fn take_over() -> Option<String> {
+    OVER.lock().unwrap_or_else(|e| e.into_inner()).take()
 }
 
 thread_local! {
@@ -43,6 +60,11 @@ pub(crate) fn run<A: ApplicationHandler>(app: &mut A) -> Result<(), String> {
 /// Keeps `window` open for the next screen, instead of closing it.
 pub(crate) fn keep(window: Arc<Window>) {
     KEPT.set(Some(window));
+}
+
+/// Whether the last screen kept its window open for the next one.
+pub fn kept() -> bool {
+    KEPT.with_borrow(Option::is_some)
 }
 
 /// The window the last screen kept, if any.

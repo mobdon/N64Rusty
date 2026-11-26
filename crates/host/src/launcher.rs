@@ -379,7 +379,13 @@ pub fn message(head: &str, body: &str) -> bool {
         message: Some((head.to_uppercase(), body.to_string())),
     };
     let mut app = Screens::new(ui, true);
-    crate::one_window::run(&mut app).is_ok() && app.shown
+    let shown = crate::one_window::run(&mut app).is_ok() && app.shown;
+    // Read and dismissed, not closed: the next screen uses this window.
+    app.surface = None;
+    if let (false, Some(w)) = (app.closed, app.window.take()) {
+        crate::one_window::keep(w);
+    }
+    shown
 }
 
 /// Picking a game keeps the window open for it (see [`crate::one_window`]).
@@ -404,6 +410,8 @@ struct Screens {
     picked: Option<PathBuf>,
     /// A window opened and could be drawn in.
     shown: bool,
+    /// The player closed the window.
+    closed: bool,
 }
 
 impl Screens {
@@ -416,6 +424,7 @@ impl Screens {
             cursor: None,
             picked: None,
             shown: false,
+            closed: false,
         }
     }
 
@@ -527,7 +536,10 @@ impl ApplicationHandler for Screens {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
         let mut changed = true;
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                self.closed = true;
+                event_loop.exit();
+            }
             WindowEvent::RedrawRequested | WindowEvent::Resized(_) => {
                 self.redraw();
                 changed = false;

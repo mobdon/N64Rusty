@@ -257,6 +257,11 @@ impl<G: Guest> ApplicationHandler for App<G> {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if let (Some(e), Some(w)) = (crate::one_window::take_over(), self.window.clone()) {
+            crate::one_window::switch(w, crate::one_window::Next::Crashed(e));
+            event_loop.exit();
+            return;
+        }
         while let Some(a) = self.menu.as_ref().and_then(Menu::poll) {
             self.act(a, event_loop);
         }
