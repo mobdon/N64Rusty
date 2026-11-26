@@ -284,9 +284,11 @@ with `CARGO_APK_RELEASE_KEYSTORE` and `CARGO_APK_RELEASE_KEYSTORE_PASSWORD`
 naming a signing key (the SDK's debug key will do). The APK lands in
 `target/release/apk/N64Rusty.apk`. ROMs go in the app's folder on the phone,
 `Android/data/dev.n64rusty.player/files` (for example with `adb push`). A
-controller plays: A is A, X is B, LT is Z, RB and RT are R, and the
-C-buttons are Y, B, LB and the right stick click; the left stick and D-pad
-are the console's. The right stick does not reach the app.
+controller plays as on a computer (A, B, X and Y are A, B, C-down and
+C-up, LT and RB Z, LB L, RT R, the right stick the C-buttons); its View
+button, or Back, goes to the start screen, whose LB and RB change pages.
+The right stick, triggers and an axis D-pad reach the app through a
+patched winit (`vendor/winit`).
 
 ## Window and input
 

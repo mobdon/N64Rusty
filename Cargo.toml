@@ -2,6 +2,13 @@
 resolver = "2"
 members = ["crates/translator", "crates/runtime", "crates/cli", "crates/refcpu", "crates/conformance", "crates/rom", "crates/host", "crates/gfx", "crates/runner", "crates/audio", "crates/mod-api", "crates/android"]
 
+exclude = ["vendor"]
+
+# winit with an Android game controller's right stick, triggers and D-pad
+# passed on (vendor/winit: one change, marked N64RUSTY).
+[patch.crates-io]
+winit = { path = "vendor/winit" }
+
 [workspace.package]
 version = "0.0.0"
 edition = "2021"

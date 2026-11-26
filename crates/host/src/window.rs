@@ -260,6 +260,9 @@ impl<G: Guest> ApplicationHandler for App<G> {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
         #[cfg(target_os = "android")]
         if self.pad.event(&event) {
+            if self.pad.wants_start_screen() {
+                self.act(Action::Screen("games"), event_loop);
+            }
             return;
         }
         match event {

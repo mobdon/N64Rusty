@@ -1,9 +1,10 @@
 //! Android: the app's files folder, its event loop, and controllers.
 //!
 //! winit hands an Android controller's buttons over as unidentified keys
-//! with Android key codes, and its left stick as touch movement in the
-//! range -1 to 1 (the joystick's X and Y axes). The right stick and analog
-//! triggers do not reach the app, so C-buttons sit on spare buttons.
+//! with Android key codes (the D-pad of some as arrow keys), and its left
+//! stick as touch movement in the range -1 to 1. The right stick, the
+//! triggers and a D-pad that is an axis come the same way, from the
+//! project's patched winit (vendor/winit), with their own touch ids.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -51,30 +52,31 @@ const BUTTON_L1: u32 = 102;
 const BUTTON_R1: u32 = 103;
 const BUTTON_L2: u32 = 104;
 const BUTTON_R2: u32 = 105;
-const BUTTON_THUMBL: u32 = 106;
-const BUTTON_THUMBR: u32 = 107;
 const BUTTON_START: u32 = 108;
 const BUTTON_SELECT: u32 = 109;
 
-/// The console button for a controller button, laid out as on an Xbox
-/// style pad: A is A, X is B, LT is Z, RB and RT are R; the C-buttons go on
-/// Y (left), B (down), LB (right) and the right stick click (up).
+/// Touch ids of the axes the patched winit passes on.
+const RIGHT_STICK: u64 = u64::MAX;
+const TRIGGERS: u64 = u64::MAX - 1;
+const HAT: u64 = u64::MAX - 2;
+
+/// The console button for a controller button, as on a computer (see
+/// `mapping::PadMap::default`): A is A, B is B, X and Y are C-down and
+/// C-up, LT and RB are Z, LB is L, RT is R.
 fn n64_button(code: u32) -> u16 {
     match code {
         BUTTON_A => button::A,
-        BUTTON_X => button::B,
-        BUTTON_L2 => button::Z,
+        BUTTON_B => button::B,
+        BUTTON_X => button::C_DOWN,
+        BUTTON_Y => button::C_UP,
+        BUTTON_L2 | BUTTON_R1 => button::Z,
+        BUTTON_L1 => button::L,
+        BUTTON_R2 => button::R,
         BUTTON_START => button::START,
         DPAD_UP => button::D_UP,
         DPAD_DOWN => button::D_DOWN,
         DPAD_LEFT => button::D_LEFT,
         DPAD_RIGHT => button::D_RIGHT,
-        BUTTON_THUMBL | BUTTON_SELECT => button::L,
-        BUTTON_R1 | BUTTON_R2 => button::R,
-        BUTTON_Y => button::C_LEFT,
-        BUTTON_B | BACK => button::C_DOWN,
-        BUTTON_L1 => button::C_RIGHT,
-        BUTTON_THUMBR => button::C_UP,
         _ => 0,
     }
 }
@@ -95,18 +97,31 @@ fn menu_key(code: u32) -> Option<KeyCode> {
 
 /// Stick values below this count as centred.
 const DEAD: f64 = 0.15;
+/// How far the right stick, a trigger or the D-pad axis goes before it
+/// counts as a press.
+const PRESS: f64 = 0.5;
 
 /// One Android controller as the window sees it.
 #[derive(Default)]
 pub struct Controller {
     buttons: u16,
-    x: f64,
-    y: f64,
-    /// The stick direction last turned into a start screen key.
+    left: (f64, f64),
+    right: (f64, f64),
+    triggers: (f64, f64),
+    hat: (f64, f64),
+    /// The direction last turned into a start screen key.
     menu_dir: Option<KeyCode>,
+    /// The View button or Back was pressed: the start screen, in place of
+    /// the menu bar a computer has.
+    start_screen: bool,
 }
 
 impl Controller {
+    /// Whether View or Back asked for the start screen since last asked.
+    pub fn wants_start_screen(&mut self) -> bool {
+        std::mem::take(&mut self.start_screen)
+    }
+
     /// Takes in a window event; true if it was the controller's.
     pub fn event(&mut self, event: &WindowEvent) -> bool {
         match event {
@@ -122,6 +137,9 @@ impl Controller {
                 let Some(code) = android_code(physical_key) else {
                     return false;
                 };
+                if matches!(code, BUTTON_SELECT | BACK) && *state == ElementState::Pressed {
+                    self.start_screen = true;
+                }
                 let b = n64_button(code);
                 if *state == ElementState::Pressed {
                     self.buttons |= b;
@@ -131,7 +149,13 @@ impl Controller {
                 true
             }
             WindowEvent::Touch(t) if is_stick(t.phase, t.location.x, t.location.y) => {
-                (self.x, self.y) = (t.location.x, t.location.y);
+                let at = (t.location.x, t.location.y);
+                match t.id {
+                    RIGHT_STICK => self.right = at,
+                    TRIGGERS => self.triggers = at,
+                    HAT => self.hat = at,
+                    _ => self.left = at,
+                }
                 true
             }
             _ => false,
@@ -147,16 +171,36 @@ impl Controller {
                 (v.clamp(-1.0, 1.0) * f64::from(STICK_MAX)) as i8
             }
         };
+        // Pushed one way: (negative, positive) buttons.
+        let dir = |v: f64, (minus, plus): (u16, u16)| {
+            if v <= -PRESS {
+                minus
+            } else if v >= PRESS {
+                plus
+            } else {
+                0
+            }
+        };
+        let (rx, ry) = self.right;
+        let (hx, hy) = self.hat;
+        let (lt, rt) = self.triggers;
+        let buttons = self.buttons
+            | dir(rx, (button::C_LEFT, button::C_RIGHT))
+            | dir(ry, (button::C_UP, button::C_DOWN))
+            | dir(hx, (button::D_LEFT, button::D_RIGHT))
+            | dir(hy, (button::D_UP, button::D_DOWN))
+            | dir(lt, (0, button::Z))
+            | dir(rt, (0, button::R));
         Pad {
-            buttons: self.buttons,
-            x: axis(self.x),
+            buttons,
+            x: axis(self.left.0),
             // Android's Y grows downwards; the console's upwards.
-            y: axis(-self.y),
+            y: axis(-self.left.1),
         }
     }
 
-    /// A start screen key for this event: a pressed button, or the stick
-    /// newly pushed one way.
+    /// A start screen key for this event: a pressed button, or the left
+    /// stick or D-pad newly pushed one way.
     pub fn menu_key(&mut self, event: &WindowEvent) -> Option<KeyCode> {
         match event {
             WindowEvent::KeyboardInput {
@@ -168,15 +212,18 @@ impl Controller {
                     },
                 ..
             } => android_code(physical_key).and_then(menu_key),
-            WindowEvent::Touch(t) if is_stick(t.phase, t.location.x, t.location.y) => {
+            WindowEvent::Touch(t)
+                if is_stick(t.phase, t.location.x, t.location.y)
+                    && !matches!(t.id, RIGHT_STICK | TRIGGERS) =>
+            {
                 let (x, y) = (t.location.x, t.location.y);
-                let dir = if y < -0.5 {
+                let dir = if y <= -PRESS {
                     Some(KeyCode::KeyW)
-                } else if y > 0.5 {
+                } else if y >= PRESS {
                     Some(KeyCode::KeyS)
-                } else if x < -0.5 {
+                } else if x <= -PRESS {
                     Some(KeyCode::KeyA)
-                } else if x > 0.5 {
+                } else if x >= PRESS {
                     Some(KeyCode::KeyD)
                 } else {
                     None
@@ -214,11 +261,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn controller_buttons_map_to_console_buttons() {
+    fn controller_buttons_map_as_on_a_computer() {
         assert_eq!(n64_button(BUTTON_A), button::A);
-        assert_eq!(n64_button(BUTTON_X), button::B);
-        assert_eq!(n64_button(BUTTON_L2), button::Z);
+        assert_eq!(n64_button(BUTTON_B), button::B);
+        assert_eq!(n64_button(BUTTON_X), button::C_DOWN);
+        assert_eq!(n64_button(BUTTON_R1), button::Z);
         assert_eq!(n64_button(12345), 0);
+    }
+
+    #[test]
+    fn the_right_stick_triggers_and_d_pad_press_buttons() {
+        let mut c = Controller {
+            right: (-0.9, 0.0),
+            triggers: (1.0, 0.2),
+            hat: (0.0, 1.0),
+            ..Default::default()
+        };
+        assert_eq!(c.pad().buttons, button::C_LEFT | button::Z | button::D_DOWN);
+        c.right = (0.0, -0.8);
+        c.triggers = (0.0, 0.9);
+        assert_eq!(
+            c.pad().buttons & (button::C_UP | button::R),
+            button::C_UP | button::R
+        );
     }
 
     #[test]
