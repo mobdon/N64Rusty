@@ -1236,6 +1236,17 @@ fn os_pi_start_dma(c: &mut Ctx) {
         arg(c, 5),
         arg(c, 6),
     );
+    // The request is filled in as the system library does before handing
+    // it on (type, priority, return queue, RAM and cartridge address,
+    // size): games match the message they get back by these fields.
+    const OS_MESG_TYPE_DMAREAD: u16 = 11;
+    c.mem
+        .write_u16(mb, OS_MESG_TYPE_DMAREAD + u16::from(dir != 0));
+    c.mem.write_u8(mb + 2, arg(c, 1) as u8);
+    c.mem.write_u32(mb + 4, mq);
+    c.mem.write_u32(mb + 8, ram);
+    c.mem.write_u32(mb + 0x0C, dev);
+    c.mem.write_u32(mb + 0x10, len);
     let mut st = lock();
     pi_dma(c, &mut st, dir, dev, ram, len);
     if mq != 0 {
