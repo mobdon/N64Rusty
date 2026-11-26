@@ -20,7 +20,7 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
 
 use n64rusty_host::launcher::Page;
 use n64rusty_rom::{signature, Rom};
@@ -91,7 +91,7 @@ fn console(_dir: &Path) -> Option<PathBuf> {
 }
 
 /// The error on the 8-bit message screen, or in a plain Windows box when
-/// the program already used its one window loop (the game ran).
+/// that screen cannot open.
 fn error_box(text: &str) {
     let shown = n64rusty_host::launcher::message("Could not start", text);
     #[cfg(windows)]
@@ -109,7 +109,6 @@ fn error_box(text: &str) {
 fn play(args: &mut Vec<String>, dir: &Path, plain: bool) -> ExitCode {
     // Its Game menu can go back to the start screen.
     n64rusty_host::menu::START_SCREEN.store(true, std::sync::atomic::Ordering::Relaxed);
-    let recent = dir.join("recent.txt");
     if args.first().is_none_or(|a| a.starts_with("--")) {
         let recent = n64rusty_host::menu::recent_roms();
         let page = match args.as_slice() {
@@ -120,20 +119,13 @@ fn play(args: &mut Vec<String>, dir: &Path, plain: bool) -> ExitCode {
         if let Some(page) = page {
             let mut games = recent.clone();
             games.extend(find_rom(dir).filter(|r| !recent.contains(r)));
-            // The start screen has its own window, and a program gets one
-            // window loop: the game plays in a fresh start of the program.
+            // The game plays in the start screen's window, as a double-click
+            // on that ROM would.
             let Some(rom) = n64rusty_host::launcher::pick(&games, page) else {
                 return ExitCode::SUCCESS;
             };
-            let started =
-                std::env::current_exe().and_then(|exe| Command::new(exe).arg(&rom).spawn());
-            return match started {
-                Ok(_) => ExitCode::SUCCESS,
-                Err(e) => {
-                    eprintln!("error: starting {}: {e}", rom.display());
-                    ExitCode::from(2)
-                }
-            };
+            *args = vec![rom.display().to_string()];
+            return played(args, dir, true);
         }
         let remembered = recent.into_iter().next();
         let Some(rom) = remembered.or_else(|| find_rom(dir)).or_else(pick_rom) else {
@@ -145,6 +137,12 @@ fn play(args: &mut Vec<String>, dir: &Path, plain: bool) -> ExitCode {
         };
         args.insert(0, rom.display().to_string());
     }
+    played(args, dir, plain)
+}
+
+/// Plays the ROM `args` starts with.
+fn played(args: &mut Vec<String>, dir: &Path, plain: bool) -> ExitCode {
+    let recent = dir.join("recent.txt");
     let rom = match std::fs::read(&args[0])
         .map_err(|e| e.to_string())
         .and_then(|b| Rom::from_bytes(b).map_err(|e| e.to_string()))
