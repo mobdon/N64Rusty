@@ -25,6 +25,8 @@ const TASK_AUDIO: u32 = 2;
 const TASK_JPEG: u32 = 4;
 /// Offset of `OSTask.t.data_ptr`: the display list or audio command list.
 const TASK_DATA_PTR: u32 = 0x30;
+/// Offset of the microcode data pointer in the task.
+const TASK_UCODE_DATA: u32 = 0x18;
 /// Offset of `OSTask.t.data_size`.
 const TASK_DATA_SIZE: u32 = 0x34;
 
@@ -67,6 +69,8 @@ pub struct Media {
     renderer: Option<Renderer>,
     renderer_failed: bool,
     tasks: u64,
+    /// The last graphics task's display list, for the report.
+    last_dl: u32,
     errors: u64,
     first_error: Option<String>,
     swaps: u64,
@@ -168,6 +172,7 @@ impl Media {
             renderer: None,
             renderer_failed: false,
             tasks: 0,
+            last_dl: 0,
             errors: 0,
             first_error: None,
             swaps: 0,
@@ -373,6 +378,11 @@ impl Devices for Media {
         }
         self.tasks += 1;
         let dl = ctx.mem.read_u32(task + TASK_DATA_PTR);
+        self.last_dl = dl;
+        // The microcode names itself in its data: the command set follows.
+        let data = ctx.mem.read_u32(task + TASK_UCODE_DATA);
+        self.gfx
+            .set_microcode_data(Some(ctx.mem.kseg0(data) & 0x00FF_FFFF));
         // A panic inside the interpreter counts as an error for that task;
         // the game keeps running.
         let (gfx, bytes) = (&mut self.gfx, ctx.mem.bytes_mut());
@@ -476,6 +486,7 @@ impl Devices for Media {
             s.push_str(&format!(
                 "  last frame shown at retrace {frame}: {draws} draws, {textures} textures\n"
             ));
+            s.push_str(&format!("  last display list at {:#010x}\n", self.last_dl));
         }
         for w in &self.warnings {
             s.push_str(&format!("  skipped: {w}\n"));

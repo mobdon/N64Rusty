@@ -252,6 +252,68 @@ fn texture_generation_maps_normals_through_the_look_at() {
 }
 
 #[test]
+fn one_command_draws_four_triangles_by_5_bit_vertex_numbers() {
+    let mut ram = Ram::default();
+    let verts = ram.vertices(&[v(0, 0, 0, [255; 4]); 32]);
+    // Triangles (1, 2, 31), (4, 5, 6), (7, 8, 9); the fourth place unused
+    // (one vertex three times). The first one's third corner is split:
+    // 31 = 0b111_11, three bits in the first word, two in the second.
+    let w0 = 0x10 << 24 | 1 << 23 | 2 << 18 | 0b111 << 15 | 4 << 10 | 5 << 5 | 6;
+    let w1 = 0b11 << 30 | 7 << 25 | 8 << 20 | 9 << 15;
+    let mut dl = Dl::default();
+    setup(&mut ram, &mut dl);
+    dl.vtx(verts, 32, 0).raw(w0, w1).end();
+    let addr = ram.dl(&dl);
+    let f = run(&ram, addr);
+    assert_eq!(f.draws().map(|d| d.count).sum::<u32>(), 9);
+}
+
+#[test]
+fn a_named_microcode_reads_normals_from_their_own_table() {
+    let mut ram = Ram::default();
+    // The name every microcode carries in its data.
+    let data = ram.put(b"RSP Gfx ucode F3DEXBG.NoN fifo 2.08");
+    // Two vertices, loaded at buffer places 1 and 2. The normal's third
+    // part is the byte after z's padding; the colour bytes are a colour.
+    let mut vb = Vec::new();
+    for nz in [0u8, 127] {
+        vb.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, nz, 0, 0, 0, 0, 255, 128, 0, 200]);
+    }
+    let verts = ram.put(&vb);
+    // Normal table by buffer place: place 1 points at +x, place 2 at +z.
+    let normals = ram.put(&[9, 9, 127, 0, 0, 0]);
+    // 48-byte light places: a full white light towards +z, no ambient.
+    let mut l = vec![255, 255, 255, 0, 255, 255, 255, 0, 0, 0, 127, 0];
+    l.resize(48, 0);
+    let light = ram.put(&l);
+    let ambient = ram.put(&[0; 48]);
+    let mut dl = Dl::default();
+    setup(&mut ram, &mut dl);
+    let place = |n: u32| 0xDC << 24 | 5 << 19 | (n * 48 / 8) << 8 | 10;
+    dl.geometry(0, G_LIGHTING)
+        .raw(0xDB << 24 | 0x02 << 16, 48) // one light
+        .raw(place(2), light)
+        .raw(place(3), ambient)
+        .raw(0xDC << 24 | 7 << 19 | 14, normals)
+        .vtx(verts, 2, 1)
+        .tri(1, 2, 2)
+        .end();
+    let addr = ram.dl(&dl);
+    let mut it = Interpreter::new();
+    it.set_microcode_data(Some(data));
+    it.run(&ram.bytes, addr).expect("display list runs");
+    let f = it.take_frame();
+    // Facing away from the light: dark. Facing it: the vertex colour.
+    assert_eq!(f.vertices[0].color, [0.0, 0.0, 0.0, 200.0 / 255.0]);
+    let c = f.vertices[1].color;
+    assert!(
+        (c[0] - 1.0).abs() < 1e-5 && (c[1] - 128.0 / 255.0).abs() < 1e-5,
+        "{c:?}"
+    );
+    assert_eq!(c[2], 0.0);
+}
+
+#[test]
 fn lights_vertices_from_normals() {
     let mut ram = Ram::default();
     // Normal pointing at +z, stored in the colour bytes; alpha 200.

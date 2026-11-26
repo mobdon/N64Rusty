@@ -133,6 +133,10 @@ impl Dl {
         self.0.extend([w0, w1]);
         self
     }
+    /// Any command, as its two words.
+    pub fn raw(&mut self, w0: u32, w1: u32) -> &mut Self {
+        self.c(w0, w1)
+    }
     pub fn vtx(&mut self, addr: u32, n: u32, v0: u32) -> &mut Self {
         self.c(0x01 << 24 | n << 12 | (v0 + n) << 1, addr)
     }

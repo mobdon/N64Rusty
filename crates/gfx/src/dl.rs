@@ -102,6 +102,14 @@ pub struct Interpreter {
     /// Running the 2D (sprite and background) microcode a display list
     /// switched to with `G_LOAD_UCODE`, whose low opcodes differ.
     ucode_2d: bool,
+    /// Running the 3D microcode variant that keeps vertex normals in a
+    /// table of their own and lights in 48-byte places (see
+    /// [`Interpreter::set_microcode_data`]).
+    normals_apart: bool,
+    /// That variant's normal table: two bytes per vertex buffer place.
+    normals: u32,
+    /// The data of the microcode a task starts on, if the host named it.
+    start_data: Option<u32>,
     frame: Frame,
     /// Colour images drawn on the GPU since they were last read back into
     /// RAM, newest last.
@@ -212,6 +220,9 @@ impl Interpreter {
             tmem: Tmem::default(),
             rect_transform: None,
             ucode_2d: false,
+            normals_apart: false,
+            normals: 0,
+            start_data: None,
             frame: Frame {
                 width: 320,
                 ..Frame::default()
@@ -249,6 +260,13 @@ impl Interpreter {
 
     /// Follow the display list at `addr` (a segmented or physical address)
     /// in `rdram`, the big-endian guest RAM.
+    /// Names the data of the microcode the coming tasks start on (the
+    /// task's own pointer to it), so the command set follows the name in
+    /// it. Without this every task starts on the usual 3D set.
+    pub fn set_microcode_data(&mut self, data: Option<u32>) {
+        self.start_data = data;
+    }
+
     pub fn run(&mut self, rdram: &[u8], addr: u32) -> Result<(), GfxError> {
         self.exec(Ram::Shared(rdram), addr, None)
     }
@@ -276,6 +294,10 @@ impl Interpreter {
         let mut stack: Vec<u32> = Vec::new();
         // Every task starts on its own (3D) microcode.
         self.ucode_2d = false;
+        self.normals_apart = false;
+        if let Some(data) = self.start_data {
+            self.microcode(ram.r(), data);
+        }
         for _ in 0..MAX_COMMANDS {
             let w0 = rd32(ram.r(), pc, pc)?;
             let w1 = rd32(ram.r(), pc + 4, pc)?;
@@ -289,10 +311,15 @@ impl Interpreter {
                 continue;
             }
             match w0 >> 24 {
-                // shortcut: games switch between their 3D microcode and the
-                // 2D one and back, so each load toggles; track the loaded
-                // code's address if a game loads a third microcode.
-                0xDD => self.ucode_2d = !self.ucode_2d,
+                // A load names the new microcode's data in the half word
+                // before it. shortcut: data with no name in it toggles
+                // between 3D and 2D, as games with those two do.
+                0xDD => {
+                    let data = self.phys(self.rdphalf1);
+                    if !self.microcode(ram.r(), data) {
+                        self.ucode_2d = !self.ucode_2d;
+                    }
+                }
                 0x01 => self.vertices(ram.r(), w0, w1, at)?,
                 0x02 => self.modify_vertex(w0, w1, at),
                 0xED => {
@@ -304,6 +331,26 @@ impl Interpreter {
                 0x06 | 0x07 => {
                     self.tri([(w0 >> 16) & 0xFF, (w0 >> 8) & 0xFF, w0 & 0xFF], at);
                     self.tri([(w1 >> 16) & 0xFF, (w1 >> 8) & 0xFF, w1 & 0xFF], at);
+                }
+                // Four triangles in one command (a microcode some games
+                // use), each corner a 5-bit vertex number: the opcode's low
+                // four bits and the first word hold the first two
+                // triangles, with the third corner of the first split
+                // across both words. A triangle with one vertex three times
+                // fills an unused place.
+                0x10..=0x1F => {
+                    let f = |v: u32, s: u32| (v >> s) & 31;
+                    let tris = [
+                        [f(w0, 23), f(w0, 18), ((w0 >> 15) & 7) << 2 | w1 >> 30],
+                        [f(w0, 10), f(w0, 5), f(w0, 0)],
+                        [f(w1, 25), f(w1, 20), f(w1, 15)],
+                        [f(w1, 10), f(w1, 5), f(w1, 0)],
+                    ];
+                    for t in tris {
+                        if t[0] != t[1] || t[1] != t[2] {
+                            self.tri(t.map(|i| i * 2), at);
+                        }
+                    }
                 }
                 // G_SPNOOP, G_CULLDL (drawing everything is always safe),
                 // syncs, scissor and the coprocessor-only commands.
@@ -416,6 +463,23 @@ impl Interpreter {
         }
     }
 
+    /// Picks the command set from the name in the microcode data at `data`
+    /// (the text every microcode carries near its start); returns whether
+    /// one was found.
+    fn microcode(&mut self, rdram: &[u8], data: u32) -> bool {
+        let at = data as usize & 0x00FF_FFFF;
+        let Some(d) = rdram.get(at..(at + 0x800).min(rdram.len())) else {
+            return false;
+        };
+        let has = |name: &[u8]| d.windows(name.len()).any(|w| w == name);
+        if !has(b"RSP Gfx ucode ") {
+            return false;
+        }
+        self.ucode_2d = has(b"ucode S2DEX");
+        self.normals_apart = has(b"ucode F3DEXBG");
+        true
+    }
+
     /// Resolve a segmented address to a physical one.
     fn phys(&self, addr: u32) -> u32 {
         let seg = ((addr >> 24) & 0xF) as usize;
@@ -456,7 +520,7 @@ impl Interpreter {
     fn moveword(&mut self, w0: u32, w1: u32, at: u32) {
         let (index, offset) = ((w0 >> 16) & 0xFF, w0 & 0xFFFF);
         match index {
-            0x02 => self.num_lights = (w1 / 24).min(7) as usize,
+            0x02 => self.num_lights = (w1 / self.light_size()).min(7) as usize,
             0x06 => self.segments[(offset / 4) as usize & 0xF] = w1 & 0x00FF_FFFF,
             // Fog factors, clip ratio, perspective norm: not
             // needed by this renderer.
@@ -513,9 +577,10 @@ impl Interpreter {
             10 => {
                 // Lights start after the two look-at entries.
                 let b = |k: u32| rd8(rdram, a + k, at);
-                let Some(n) = (offset / 24).checked_sub(2) else {
+                let place = offset / self.light_size();
+                let Some(n) = place.checked_sub(2) else {
                     let dir = [b(8)? as i8 as f32, b(9)? as i8 as f32, b(10)? as i8 as f32];
-                    self.look_at[(offset / 24) as usize] = normalize(dir);
+                    self.look_at[place as usize] = normalize(dir);
                     return Ok(());
                 };
                 let light = Light {
@@ -530,9 +595,19 @@ impl Interpreter {
                     *l = light;
                 }
             }
+            14 if self.normals_apart => self.normals = a,
             idx => self.warn(format!("movemem {idx:#x} at {at:#010x}")),
         }
         Ok(())
+    }
+
+    /// Bytes per place in the light table.
+    fn light_size(&self) -> u32 {
+        if self.normals_apart {
+            48
+        } else {
+            24
+        }
     }
 
     fn vertices(&mut self, rdram: &[u8], w0: u32, w1: u32, at: u32) -> Result<(), GfxError> {
@@ -561,12 +636,30 @@ impl Interpreter {
             let v = a + i as u32 * 16;
             let h = |k: u32| -> Result<i16, GfxError> { Ok(rd16(rdram, v + k, at)? as i16) };
             let b = |k: u32| rd8(rdram, v + k, at);
-            let normal = [
-                b(12)? as i8 as f32,
-                b(13)? as i8 as f32,
-                b(14)? as i8 as f32,
-            ];
-            let color = if lit {
+            let apart = lit && self.normals_apart;
+            let normal = if apart {
+                // Two bytes in the table at the vertex's buffer place, the
+                // third in the vertex; its colour bytes stay a colour.
+                let t = self.normals + (end - n + i) as u32 * 2;
+                [
+                    rd8(rdram, t, at)? as i8 as f32,
+                    rd8(rdram, t + 1, at)? as i8 as f32,
+                    b(7)? as i8 as f32,
+                ]
+            } else {
+                [
+                    b(12)? as i8 as f32,
+                    b(13)? as i8 as f32,
+                    b(14)? as i8 as f32,
+                ]
+            };
+            let color = if apart {
+                let lc = self.light(&lights_mv, normal);
+                let c = |k: usize| -> Result<f32, GfxError> {
+                    Ok(lc[k] * b(12 + k as u32)? as f32 / 255.0)
+                };
+                [c(0)?, c(1)?, c(2)?, b(15)? as f32 / 255.0]
+            } else if lit {
                 let lc = self.light(&lights_mv, normal);
                 [lc[0], lc[1], lc[2], b(15)? as f32 / 255.0]
             } else {

@@ -314,6 +314,13 @@ render-mode state. A wgpu renderer then draws each frame offscreen, with a
 fragment shader generated per combiner setting, and can save chosen frames
 as PNG files. Nothing opens a window.
 
+The command set follows the name each microcode carries in its data (the
+task's own pointer, and the one a load-microcode command gives): the 2D
+sprite set, the usual 3D set, or the 3D variant that draws four triangles
+per command (opcodes `0x10` to `0x1F`), keeps vertex normals in a table of
+their own and lights in 48-byte places. That variant's coordinate
+move-word (`0x10`) and point lights are not done yet.
+
 Vertices stay in object space with their model-view, projection and
 viewport kept apart until drawing, so widescreen and in-between frames for
 high refresh rates can be added later without changing game speed.
