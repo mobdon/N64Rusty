@@ -12,6 +12,7 @@ use std::sync::OnceLock;
 use winit::event::{ElementState, KeyEvent, TouchPhase, WindowEvent};
 use winit::keyboard::{KeyCode, NativeKeyCode, PhysicalKey};
 pub use winit::platform::android::activity::AndroidApp;
+use winit::platform::android::activity::WindowManagerFlags;
 
 use crate::pad::{button, Pad, STICK_MAX};
 
@@ -20,6 +21,12 @@ static HOME: OnceLock<PathBuf> = OnceLock::new();
 
 /// Called first by the app: its activity and its files folder.
 pub fn start(app: AndroidApp, home: PathBuf) {
+    // No status bar over the picture (it overlaps it on the cover screen),
+    // and no dimming during long play without touching the screen.
+    app.set_window_flags(
+        WindowManagerFlags::FULLSCREEN | WindowManagerFlags::KEEP_SCREEN_ON,
+        WindowManagerFlags::empty(),
+    );
     let _ = APP.set(app);
     let _ = HOME.set(home);
 }
