@@ -241,6 +241,10 @@ impl Dl {
     pub fn cimg(&mut self, addr: u32, width: u32) -> &mut Self {
         self.c(0xFF << 24 | 2 << 19 | (width - 1), addr)
     }
+    /// An 8-bit colour image.
+    pub fn cimg8(&mut self, addr: u32, width: u32) -> &mut Self {
+        self.c(0xFF << 24 | 1 << 19 | (width - 1), addr)
+    }
     pub fn zimg(&mut self, addr: u32) -> &mut Self {
         self.c(0xFE << 24, addr)
     }

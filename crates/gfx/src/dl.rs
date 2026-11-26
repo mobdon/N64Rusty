@@ -113,7 +113,7 @@ pub struct Interpreter {
 struct Drawn {
     image: u32,
     width: u32,
-    /// Pixel size code (3: 32-bit, else 16-bit).
+    /// Pixel size code (3: 32-bit, 1: 8-bit, else 16-bit).
     siz: u32,
     height: u32,
     /// The handed-over frame that last drew into it, for an image read in
@@ -735,7 +735,7 @@ impl Interpreter {
         // the image's guessed extent (its height is a guess from its width),
         // not the picture read back.
         let inside = |d: &Drawn| {
-            let len = d.width * d.height * if d.siz == 3 { 4 } else { 2 };
+            let len = d.width * d.height * pixel_bytes(d.siz);
             src >= d.image && src < d.image + len && src_siz == d.siz
         };
         // Images of other widths can share the address: the load's own row
@@ -857,6 +857,9 @@ impl Interpreter {
                     let i = y * w + x;
                     if siz == 3 {
                         put_raw(ram, a + 4 * i, &self.fill_color.to_be_bytes());
+                    } else if siz == 1 {
+                        // Four 8-bit pixels per word.
+                        put_raw(ram, a + i, &[self.fill_color.to_be_bytes()[x as usize % 4]]);
                     } else {
                         let c = if x % 2 == 0 {
                             self.fill_color >> 16
@@ -1048,11 +1051,23 @@ fn put_raw(ram: &mut [u8], at: u32, bytes: &[u8]) {
     }
 }
 
+/// Bytes per pixel of a colour image with pixel size code `siz`.
+fn pixel_bytes(siz: u32) -> u32 {
+    match siz {
+        3 => 4,
+        1 => 1,
+        _ => 2,
+    }
+}
+
 /// Writes RGBA8 `c` as pixel `i` of the colour image at `image` with pixel
-/// size code `siz` (3: 32-bit, else 16-bit RGBA5551).
+/// size code `siz` (3: 32-bit, 1: 8-bit, which keeps the red channel, else
+/// 16-bit RGBA5551).
 fn put_pixel(ram: &mut [u8], image: u32, siz: u32, i: u32, c: [u8; 4]) {
     if siz == 3 {
         put_raw(ram, image + 4 * i, &c);
+    } else if siz == 1 {
+        put_raw(ram, image + i, &c[..1]);
     } else {
         let ch = |v: u8| u16::from(v >> 3);
         let p = ch(c[0]) << 11 | ch(c[1]) << 6 | ch(c[2]) << 1 | u16::from(c[3] >= 128);

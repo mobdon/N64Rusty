@@ -501,6 +501,28 @@ impl n64rusty_gfx::Readback for Solid {
 }
 
 #[test]
+fn a_fill_of_an_8_bit_image_writes_one_byte_per_pixel() {
+    let mut ram = Ram::default();
+    // An 8-wide, 2-row 8-bit image, then what lies after it in RAM.
+    let image = ram.put(&[0; 16]);
+    let after = ram.put(&[0xAA; 16]);
+    let mut dl = Dl::default();
+    setup(&mut ram, &mut dl);
+    dl.cimg8(image, 8)
+        .other_modes(CYCLE_FILL, 0)
+        .fill_color(0x1122_3344)
+        .fill_rect(0, 0, 7, 1)
+        .end();
+    let addr = ram.dl(&dl);
+    let mut it = Interpreter::new();
+    let mut rb = Solid { asked: Vec::new() };
+    it.run_readback(&mut ram.bytes, addr, &mut rb).unwrap();
+    let at = |a: u32| &ram.bytes[a as usize..a as usize + 16];
+    assert_eq!(at(image), [0x11, 0x22, 0x33, 0x44].repeat(4));
+    assert_eq!(at(after), [0xAA; 16], "nothing past the image");
+}
+
+#[test]
 fn fills_and_copies_land_in_ram_and_drawn_images_are_read_back() {
     const CYCLE_COPY: u32 = 2 << 20;
     let mut ram = Ram::default();
