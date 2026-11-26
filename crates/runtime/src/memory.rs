@@ -1,6 +1,7 @@
 //! Big-endian guest RAM.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::sx32;
@@ -96,13 +97,25 @@ impl Flash {
 /// one covers them. Accesses outside RAM and misaligned
 /// accesses panic with the address, since on hardware they raise exceptions
 /// that recompiled code is not expected to rely on.
-#[derive(Clone)]
 pub struct Memory {
     bytes: Vec<u8>,
     io: Option<Box<Io>>,
     /// Valid TLB pages as (virtual base, length, physical base); see
     /// [`Memory::set_map`].
     map: Vec<(u32, u32, u32)>,
+    /// Index in `map` of the page that matched last.
+    last: AtomicUsize,
+}
+
+impl Clone for Memory {
+    fn clone(&self) -> Self {
+        Self {
+            bytes: self.bytes.clone(),
+            io: self.io.clone(),
+            map: self.map.clone(),
+            last: AtomicUsize::new(self.last.load(Ordering::Relaxed)),
+        }
+    }
 }
 
 impl Memory {
@@ -112,6 +125,7 @@ impl Memory {
             bytes: vec![0; size],
             io: None,
             map: Vec::new(),
+            last: AtomicUsize::new(0),
         }
     }
 
@@ -121,6 +135,7 @@ impl Memory {
             bytes,
             io: None,
             map: Vec::new(),
+            last: AtomicUsize::new(0),
         }
     }
 
@@ -147,12 +162,24 @@ impl Memory {
 
     #[inline(never)]
     fn mapped(&self, vaddr: u32) -> u32 {
-        self.map
+        self.page(vaddr).map_or(vaddr, |(base, _, phys)| {
+            0x8000_0000 | (phys + (vaddr - base))
+        })
+    }
+
+    /// The TLB page that covers `vaddr`, if any; the one that matched last
+    /// is tried first, since most accesses fall in it.
+    pub fn page(&self, vaddr: u32) -> Option<(u32, u32, u32)> {
+        let k = self.last.load(Ordering::Relaxed);
+        if let Some(&p) = self.map.get(k).filter(|p| vaddr.wrapping_sub(p.0) < p.1) {
+            return Some(p);
+        }
+        let k = self
+            .map
             .iter()
-            .find(|&&(base, len, _)| vaddr.wrapping_sub(base) < len)
-            .map_or(vaddr, |&(base, _, phys)| {
-                0x8000_0000 | (phys + (vaddr - base))
-            })
+            .position(|&(base, len, _)| vaddr.wrapping_sub(base) < len)?;
+        self.last.store(k, Ordering::Relaxed);
+        Some(self.map[k])
     }
 
     /// Maps the space outside RAM. Without this, such accesses panic.

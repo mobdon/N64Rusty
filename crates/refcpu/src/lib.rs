@@ -30,6 +30,8 @@ pub struct Cpu {
     /// TLB pages as (virtual base, length, physical base): addresses
     /// outside KSEG0/KSEG1 that one covers are reached through it.
     pub map: Vec<(u32, u32, u32)>,
+    /// The page of `map` that matched last: most accesses fall in it.
+    last: std::cell::Cell<(u32, u32, u32)>,
 }
 
 /// Why [`Cpu::run`] stopped early.
@@ -60,6 +62,7 @@ impl Cpu {
             fr: true,
             mem,
             map: Vec::new(),
+            last: std::cell::Cell::new((0, 0, 0)),
         }
     }
 
@@ -68,12 +71,27 @@ impl Cpu {
         if addr.wrapping_sub(0x8000_0000) < 0x4000_0000 {
             return addr;
         }
-        self.map
+        let (base, len, phys) = self.last.get();
+        if addr.wrapping_sub(base) < len {
+            return 0x8000_0000 | (phys + (addr - base));
+        }
+        match self
+            .map
             .iter()
             .find(|&&(base, len, _)| addr.wrapping_sub(base) < len)
-            .map_or(addr, |&(base, _, phys)| {
+        {
+            Some(&(base, len, phys)) => {
+                self.last.set((base, len, phys));
                 0x8000_0000 | (phys + (addr - base))
-            })
+            }
+            None => addr,
+        }
+    }
+
+    /// Replaces the TLB pages (and forgets the page that matched last).
+    pub fn set_map(&mut self, map: Vec<(u32, u32, u32)>) {
+        self.map = map;
+        self.last.set((0, 0, 0));
     }
 
     fn phys(mem: &[u8], addr: u32, size: u32, pc: u32) -> Result<usize, Stop> {

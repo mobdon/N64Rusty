@@ -58,7 +58,7 @@ fn load(cpu: &mut Cpu, c: &Ctx) {
     (cpu.r, cpu.hi, cpu.lo, cpu.f, cpu.fcr31, cpu.fr) = (c.r, c.hi, c.lo, c.f, c.fcr31, c.fr);
     // The callee may have written the TLB.
     if cpu.map != c.mem.map() {
-        cpu.map = c.mem.map().to_vec();
+        cpu.set_map(c.mem.map().to_vec());
     }
 }
 
@@ -89,21 +89,28 @@ fn run(ctx: &mut Ctx, entry: u32) {
     // The function is done when it returns to its caller.
     let stop = ctx.r[31] as u32;
     cpu.jump_to(entry);
+    // The 4 KiB page of code known to be mapped. Forgotten after anything
+    // that can run game code or bring pages in (and so push others out).
+    let mut known = u32::MAX;
     while cpu.pc != stop {
         let pc = cpu.pc;
-        if ctx.unmapped(pc) {
-            // Code in a page not loaded yet: the game's refill routine
-            // loads it, as on a TLB miss.
-            store(&cpu, ctx);
-            MISS_PC.store(pc, Ordering::Relaxed);
-            ctx.tlb_miss(pc);
-            load(&mut cpu, ctx);
+        if pc >> 12 != known {
+            if ctx.unmapped(pc) {
+                // Code in a page not loaded yet: the game's refill routine
+                // loads it, as on a TLB miss.
+                store(&cpu, ctx);
+                MISS_PC.store(pc, Ordering::Relaxed);
+                ctx.tlb_miss(pc);
+                load(&mut cpu, ctx);
+            }
+            known = pc >> 12;
         }
         if pc != entry && ctx.has_translation(pc) {
             // A call (or tail jump) into translated code: run it there, then
             // carry on at the return address it leaves.
             store(&cpu, ctx);
             ctx.call(pc);
+            known = u32::MAX;
             load(&mut cpu, ctx);
             cpu.jump_to(ctx.r[31] as u32);
             continue;
@@ -142,6 +149,7 @@ fn run(ctx: &mut Ctx, entry: u32) {
                     store(&cpu, ctx);
                     MISS_PC.store(cpu.pc, Ordering::Relaxed);
                     let mapped = ctx.tlb_miss(addr);
+                    known = u32::MAX;
                     load(&mut cpu, ctx);
                     if mapped {
                         // The instruction did nothing yet: run it again.
@@ -155,6 +163,8 @@ fn run(ctx: &mut Ctx, entry: u32) {
                 panic!("interpreting untranslated code from {entry:#010x}: {e:?}");
             }
             cpu.skip();
+            // It may have been a TLB write.
+            known = u32::MAX;
         }
         if calls {
             // A call inside untranslated code costs what a translated call
@@ -162,6 +172,7 @@ fn run(ctx: &mut Ctx, entry: u32) {
             // registers go through `ctx`.
             store(&cpu, ctx);
             ctx.tick(pc);
+            known = u32::MAX;
             load(&mut cpu, ctx);
         }
     }

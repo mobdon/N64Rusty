@@ -457,11 +457,7 @@ impl Ctx {
     pub fn unmapped(&self, vaddr: u32) -> bool {
         self.tlb_refill != 0
             && vaddr.wrapping_sub(0x8000_0000) >= 0x4000_0000
-            && !self
-                .mem
-                .map()
-                .iter()
-                .any(|&(base, len, _)| vaddr.wrapping_sub(base) < len)
+            && self.mem.page(vaddr).is_none()
     }
 
     /// What the TLB miss exception does for `vaddr`: sets BadVAddr, Context
