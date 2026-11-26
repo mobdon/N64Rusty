@@ -1867,7 +1867,7 @@ pub const HOOKS: &[(&str, GuestFn)] = &[
     ("osSpTaskYielded", ret_zero),
     ("osDpSetStatus", nothing),
     ("osDpGetStatus", ret_zero),
-    ("osSpGetStatus", os_sp_get_status),
+    ("__osSpGetStatus", os_sp_get_status),
     ("osAiSetFrequency", os_ai_set_frequency),
     ("osAiSetNextBuffer", os_ai_set_next_buffer),
     ("osAiGetLength", os_ai_get_length),
