@@ -21,7 +21,8 @@ param(
 )
 $ErrorActionPreference = "Stop"
 
-$work = Join-Path ([System.IO.Path]::GetTempPath()) "n64rusty-compare"
+# One folder per run (this process), so two comparisons at once keep apart.
+$work = Join-Path ([System.IO.Path]::GetTempPath()) "n64rusty-compare-$PID"
 Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
 # Each build runs from its own folder: the player reads games\ and
 # routines.txt next to itself and writes saves there.
@@ -59,4 +60,6 @@ foreach ($g in $games) {
     $verdict = if ($same) { "SAME" } else { "DIFF" }
     Write-Host ("{0,-4} {1}  old {2} s, new {3} s" -f $verdict, $g.Name, $times["old"], $times["new"])
 }
+# Kept when a game differs or fails, for its log.txt and ram.bin.
+if ($bad -eq 0) { Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue }
 exit $bad
