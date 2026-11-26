@@ -316,6 +316,12 @@ impl<G: Guest> ApplicationHandler for App<G> {
             event_loop.exit();
             return;
         }
+        // The game asked for another one: stopped as a menu choice stops it.
+        if let (Some(n), Some(w)) = (crate::one_window::take_request(), self.window.clone()) {
+            crate::one_window::switch(w, n);
+            event_loop.exit();
+            return;
+        }
         while let Some(a) = self.menu.as_ref().and_then(Menu::poll) {
             self.act(a, event_loop);
         }

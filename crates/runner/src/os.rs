@@ -268,7 +268,9 @@ pub fn stop() {
         st.done = Some(Outcome::Stopped);
     }
     os.cv.notify_all();
-    if running {
+    // A guest thread (a mod's hook) stopping its own run halts after it
+    // returns: waiting here would only wait out the two seconds.
+    if running && MINE.get().is_none() {
         let _ = os
             .cv
             .wait_timeout_while(st, std::time::Duration::from_secs(2), |s| !s.halted)

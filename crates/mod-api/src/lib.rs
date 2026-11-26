@@ -22,7 +22,8 @@ pub type Ctx = *mut c_void;
 pub type Hook = extern "C" fn(Ctx);
 
 /// Changes whenever [`Api`]'s layout does; the player only loads mods built
-/// against the same version.
+/// against the same version. Fields only appended keep it: a mod built
+/// before never reads past the fields it knows.
 pub const VERSION: u32 = 1;
 /// The name of a mod's install function.
 pub const INSTALL: &[u8] = b"n64rusty_mod_install";
@@ -63,6 +64,15 @@ pub struct Api {
     pub call_original: extern "C" fn(ctx: Ctx, addr: u32),
     /// The 32 general registers of `ctx`.
     pub regs: extern "C" fn(ctx: Ctx) -> *mut u64,
+    // Fields are only appended; bump VERSION when one changes.
+    /// Ends this game and plays the ROM with this SHA-256 hex next, in the
+    /// same window; that game's mods get `data` from [`Api::handoff`].
+    /// False if the player has no such ROM.
+    pub switch_game:
+        extern "C" fn(sha: *const u8, sha_len: usize, data: *const u8, data_len: usize) -> bool,
+    /// What the game played before passed to [`Api::switch_game`]; null if
+    /// nothing.
+    pub handoff: extern "C" fn(len: *mut usize) -> *const u8,
 }
 
 // SAFETY: the player hands mods one Api for the whole run, and runs the game
@@ -94,6 +104,19 @@ impl Api {
         let mut len = 0;
         let p = (self.find_rom)(sha256.as_ptr(), sha256.len(), &mut len);
         // SAFETY: the player keeps found ROMs for the whole run.
+        (!p.is_null()).then(|| unsafe { std::slice::from_raw_parts(p, len) })
+    }
+    /// See [`Api::switch_game`]; `data` is at most 4096 bytes (false if
+    /// longer).
+    pub fn switch_game(&self, sha256: &str, data: &[u8]) -> bool {
+        data.len() <= 4096
+            && (self.switch_game)(sha256.as_ptr(), sha256.len(), data.as_ptr(), data.len())
+    }
+    /// See [`Api::handoff`].
+    pub fn handoff(&self) -> Option<&'static [u8]> {
+        let mut len = 0;
+        let p = (self.handoff)(&mut len);
+        // SAFETY: the player keeps the handoff for the whole run.
         (!p.is_null()).then(|| unsafe { std::slice::from_raw_parts(p, len) })
     }
     pub fn reg(&self, ctx: Ctx, i: usize) -> u64 {

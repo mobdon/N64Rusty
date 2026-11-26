@@ -310,12 +310,20 @@ static INTERPRET: Mutex<Option<(u32, u32)>> = Mutex::new(None);
 static NAMES: Mutex<BTreeMap<u32, String>> = Mutex::new(BTreeMap::new());
 /// The ROM file this run plays, for [`find_rom`].
 static ROM_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
+/// Whether this run plays in a window, which ends the game when a mod asks
+/// for another one; a headless run stops itself.
+static WINDOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Another ROM the player owns, by the SHA-256 of its big-endian bytes, in
 /// big-endian order: for mods that use a second game's data. Looks in the
 /// played ROM's folder, the folders beside it and the current folder; reads
 /// only files of a cartridge's size.
 pub fn find_rom(sha256: &str) -> Option<Vec<u8>> {
+    find_rom_path(sha256).map(|(_, rom)| rom)
+}
+
+/// [`find_rom`] with the file the ROM is in.
+pub fn find_rom_path(sha256: &str) -> Option<(PathBuf, Vec<u8>)> {
     let played = ROM_PATH.lock().unwrap().clone()?;
     let here = played.parent()?.to_path_buf();
     let mut dirs = vec![here.clone(), PathBuf::from(".")];
@@ -336,7 +344,7 @@ pub fn find_rom(sha256: &str) -> Option<Vec<u8>> {
             let rom = fits.then(|| std::fs::read(&p).ok()).flatten();
             if let Some(Ok(r)) = rom.map(Rom::from_bytes) {
                 if r.sha256 == sha256 {
-                    return Some(r.bytes().to_vec());
+                    return Some((p, r.bytes().to_vec()));
                 }
             }
         }
@@ -684,6 +692,10 @@ pub fn main_args(
         .with_between(between)
         .with_hud(run_config.window.hud.clone(), run_config.window.hud_when);
     let entry = game.entry;
+    WINDOW.store(
+        window && !run_config.headless,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     if window {
         return live::play(&run_config, media, move |devices| {
             run_and_report(ctx, entry, rom_bytes, frames, devices, save, &local)

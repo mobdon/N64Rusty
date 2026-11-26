@@ -40,6 +40,20 @@ pub(crate) fn take_over() -> Option<String> {
     OVER.lock().unwrap_or_else(|e| e.into_inner()).take()
 }
 
+/// Set by the game's own thread (a mod) to leave the game for `Next`, as a
+/// menu choice would.
+static REQUEST: std::sync::Mutex<Option<Next>> = std::sync::Mutex::new(None);
+
+/// Asks the window to end the game and go to `next`.
+pub fn request(next: Next) {
+    *REQUEST.lock().unwrap_or_else(|e| e.into_inner()) = Some(next);
+}
+
+/// Where the game asked to go, if it did (the window takes it).
+pub fn take_request() -> Option<Next> {
+    REQUEST.lock().unwrap_or_else(|e| e.into_inner()).take()
+}
+
 thread_local! {
     static LOOP: RefCell<Option<EventLoop<()>>> = const { RefCell::new(None) };
     static KEPT: RefCell<Option<Arc<Window>>> = const { RefCell::new(None) };
