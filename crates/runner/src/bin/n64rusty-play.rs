@@ -108,6 +108,12 @@ fn error_box(text: &str) {
 }
 
 fn play(args: &mut Vec<String>, dir: &Path, plain: bool) -> ExitCode {
+    // A new copy of the player starts from the built-in window settings,
+    // so the start screen and every game show them from the first run.
+    let settings = dir.join("settings.toml");
+    if let (false, Some(built)) = (settings.exists(), built::get("settings.toml")) {
+        let _ = std::fs::write(&settings, built);
+    }
     // Its Game menu can go back to the start screen.
     n64rusty_host::menu::START_SCREEN.store(true, std::sync::atomic::Ordering::Relaxed);
     if args.first().is_none_or(|a| a.starts_with("--")) {
@@ -167,10 +173,15 @@ fn play_on(args: &mut Vec<String>, dir: &Path, mut plain: bool) -> ExitCode {
     }
 }
 
-/// The start screen's games: those played before, then one in `dir`.
+/// The start screen's games: those played before, then every ROM in `dir`
+/// (the player's folder), so a friend only drops ROMs next to it.
 fn games(dir: &Path) -> Vec<PathBuf> {
     let mut games = n64rusty_host::menu::recent_roms();
-    games.extend(find_rom(dir).filter(|r| !games.contains(r)));
+    for rom in find_roms(dir) {
+        if !games.contains(&rom) {
+            games.push(rom);
+        }
+    }
     games
 }
 
@@ -330,8 +341,15 @@ fn recent_list_moves_a_rom_to_the_top() {
 
 /// The first ROM file in `dir`, by name.
 fn find_rom(dir: &Path) -> Option<PathBuf> {
-    let mut roms: Vec<PathBuf> = std::fs::read_dir(dir)
-        .ok()?
+    find_roms(dir).into_iter().next()
+}
+
+/// The ROM files in `dir`, by name.
+fn find_roms(dir: &Path) -> Vec<PathBuf> {
+    let Ok(files) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut roms: Vec<PathBuf> = files
         .flatten()
         .map(|e| e.path())
         .filter(|p| {
@@ -341,7 +359,22 @@ fn find_rom(dir: &Path) -> Option<PathBuf> {
         })
         .collect();
     roms.sort();
-    roms.into_iter().next()
+    roms
+}
+
+#[test]
+fn every_rom_in_the_folder_is_found() {
+    let dir = std::env::temp_dir().join(format!("n64rusty-roms-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in ["b.Z64", "a.n64", "c.v64", "notes.txt"] {
+        std::fs::write(dir.join(f), "").unwrap();
+    }
+    let names: Vec<String> = find_roms(&dir)
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(names, ["a.n64", "b.Z64", "c.v64"]);
 }
 
 #[cfg(windows)]

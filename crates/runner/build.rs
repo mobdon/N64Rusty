@@ -1,5 +1,6 @@
 //! Builds the player's private data into it: with `N64RUSTY_PLAYER_DATA`
-//! set to a folder (its `routines.txt` and `games/<sha256>/` routine lists and run.toml settings), the
+//! set to a folder (its `routines.txt`, `settings.toml` window settings
+//! and `games/<sha256>/` routine lists and run.toml settings), the
 //! player carries them, so a friend needs only the program and a ROM.
 //! Without it the player carries nothing. The folder never goes in git.
 
@@ -12,7 +13,7 @@ fn main() {
     if let Some(dir) = std::env::var_os("N64RUSTY_PLAYER_DATA") {
         let dir = Path::new(&dir);
         println!("cargo:rerun-if-changed={}", dir.display());
-        let mut files = vec!["routines.txt".to_string()];
+        let mut files = vec!["routines.txt".to_string(), "settings.toml".to_string()];
         let games =
             std::fs::read_dir(dir.join("games")).expect("N64RUSTY_PLAYER_DATA has no games folder");
         for game in games.flatten() {
