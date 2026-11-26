@@ -1580,10 +1580,15 @@ fn post_event_at(c: &mut Ctx, st: &mut State, e: u32, at: u64, key: u32) {
 fn os_ai_set_next_buffer(c: &mut Ctx) {
     let (addr, len) = (arg(c, 0), arg(c, 1));
     let mut st = lock();
+    // Both slots taken: refused, as the system library does, so at most one
+    // buffer waits to start (and one AI event, key 4, is pending).
+    if st.ai.status(c.clock) >> 31 != 0 {
+        drop(st);
+        ret(c, u32::MAX);
+        return;
+    }
     // The AI interrupt comes as the buffer starts playing, which frees its
     // slot for the next one.
-    // shortcut: one pending start (key 4); a third buffer queued past the
-    // two the hardware holds would drop the second's event.
     match st.ai.push(c.clock, len) {
         Some(at) if at > c.clock => post_event_at(c, &mut st, event::AI, at, 4),
         Some(_) => post_event(c, &mut st, event::AI),
