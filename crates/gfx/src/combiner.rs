@@ -108,7 +108,8 @@ fn color_input(slot: usize, code: u8) -> &'static str {
         (2, 11) => "vec3f(shade.a)",
         (2, 12) => "vec3f(u.env.a)",
         (2, 14) => "vec3f(u.misc.x)",
-        // Chroma key, YUV conversion and LOD fraction: zero.
+        (2, 15) => "vec3f(u.misc.y)",
+        // Chroma key, K4 and LOD fraction: zero.
         // shortcut: LOD fraction is zero (no mipmapping); add it with mipmaps.
         _ => "vec3f(0.0)",
     }
@@ -249,5 +250,13 @@ mod tests {
         let s = fragment_shader(raw, false);
         assert!(s.contains("(t0.rgb - vec3f(0.0)) * shade.rgb + vec3f(0.0)"));
         assert!(s.contains("(t0.a - 0.0) * shade.a + 0.0"));
+    }
+
+    #[test]
+    fn k5_is_a_factor_from_the_uniforms() {
+        // (SHADE - ENV) * K5 + PRIM.
+        let raw = Combiner::both([4, 5, 15, 3], [7, 7, 7, 4]).to_raw();
+        let s = fragment_shader(raw, false);
+        assert!(s.contains("(shade.rgb - u.env.rgb) * vec3f(u.misc.y) + u.prim.rgb"));
     }
 }

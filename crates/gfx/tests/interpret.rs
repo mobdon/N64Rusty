@@ -319,6 +319,25 @@ fn a_named_microcode_reads_normals_from_their_own_table() {
 }
 
 #[test]
+fn the_convert_command_sets_k5() {
+    let mut ram = Ram::default();
+    let verts = ram.vertices(&[v(0, 0, 0, [255; 4]); 3]);
+    let mut dl = Dl::default();
+    setup(&mut ram, &mut dl);
+    // K5 is the low nine bits, signed: 255 is about one, 0x1FF is minus 1.
+    dl.raw(0xEC << 24, 255)
+        .vtx(verts, 3, 0)
+        .tri(0, 1, 2)
+        .raw(0xEC << 24, 0x1FF)
+        .tri(0, 1, 2)
+        .end();
+    let addr = ram.dl(&dl);
+    let f = run(&ram, addr);
+    let k5: Vec<f32> = f.draws().map(|d| d.state.k5).collect();
+    assert_eq!(k5, [1.0, -1.0 / 255.0]);
+}
+
+#[test]
 fn lights_vertices_from_normals() {
     let mut ram = Ram::default();
     // Normal pointing at +z, stored in the colour bytes; alpha 200.

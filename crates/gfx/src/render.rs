@@ -807,7 +807,7 @@ impl Renderer {
         let mut uniforms = vec![0u8; (draws.len().max(1) as u64 * UNIFORM_STRIDE) as usize];
         for (i, d) in draws.iter().enumerate() {
             let s = &d.state;
-            let misc = [s.prim_lod, 0.0, 0.0, 0.0];
+            let misc = [s.prim_lod, s.k5, 0.0, 0.0];
             let vals: Vec<f32> = [s.prim, s.env, s.blend, misc].concat();
             let at = i * UNIFORM_STRIDE as usize;
             uniforms[at..at + 64].copy_from_slice(&floats(&vals));
@@ -1612,6 +1612,7 @@ mod tests {
             geometry: 0,
             prim: [1.0; 4],
             prim_lod: 0.0,
+            k5: 0.0,
             env: [1.0; 4],
             blend: [0.0; 4],
             fog: [0.0; 4],

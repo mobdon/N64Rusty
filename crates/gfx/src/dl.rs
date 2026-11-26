@@ -206,6 +206,7 @@ impl Interpreter {
                 geometry: 0,
                 prim: [1.0; 4],
                 prim_lod: 0.0,
+                k5: 0.0,
                 env: [1.0; 4],
                 blend: [0.0; 4],
                 fog: [0.0; 4],
@@ -361,6 +362,9 @@ impl Interpreter {
                 // G_SPNOOP, G_CULLDL (drawing everything is always safe),
                 // syncs, scissor and the coprocessor-only commands.
                 0x00 | 0x03 | 0xE0 | 0xE6..=0xE9 | 0xF1 => {}
+                // SETCONVERT: only K5 (a signed 9-bit value) is a colour
+                // combiner input; the rest convert YUV textures.
+                0xEC => self.state.k5 = ((w1 << 23) as i32 >> 23) as f32 / 255.0,
                 0x04 => {
                     // shortcut: G_BRANCH_Z always takes the branch (the
                     // nearer, more detailed level); compare depth when a

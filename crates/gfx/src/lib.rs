@@ -102,6 +102,9 @@ pub struct RenderState {
     pub prim: [f32; 4],
     /// Primitive LOD fraction, set with the primitive colour.
     pub prim_lod: f32,
+    /// K5 of the colour conversion constants (`SETCONVERT`), 0 to 1: a
+    /// colour combiner input, which games also use as a constant factor.
+    pub k5: f32,
     pub env: [f32; 4],
     pub blend: [f32; 4],
     pub fog: [f32; 4],
