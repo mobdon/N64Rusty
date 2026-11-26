@@ -22,7 +22,13 @@ param(
 $ErrorActionPreference = "Stop"
 
 # One folder per run (this process), so two comparisons at once keep apart.
-$work = Join-Path ([System.IO.Path]::GetTempPath()) "n64rusty-compare-$PID"
+# Folders of runs whose process has ended (kept after a DIFF, or left by an
+# error) go now.
+$tmp = [System.IO.Path]::GetTempPath()
+Get-ChildItem -LiteralPath $tmp -Directory -Filter "n64rusty-compare-*" | Where-Object {
+    $_.Name -match '-(\d+)$' -and -not (Get-Process -Id $Matches[1] -ErrorAction SilentlyContinue)
+} | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+$work = Join-Path $tmp "n64rusty-compare-$PID"
 Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
 # Each build runs from its own folder: the player reads games\ and
 # routines.txt next to itself and writes saves there.
@@ -51,15 +57,28 @@ foreach ($g in $games) {
             -ArgumentList "`"$($g.FullName)`"", "--frames", $Frames, "--ram-out", "`"$ram`"" `
             -RedirectStandardOutput (Join-Path $dir "log.txt") -RedirectStandardError (Join-Path $dir "err.txt")
         $times[$b] = [math]::Round($t.Elapsed.TotalSeconds, 1)
-        if (-not (Test-Path -LiteralPath $ram)) { $times[$b] = "no RAM (see $dir\log.txt)" }
+        if (-not (Test-Path -LiteralPath $ram)) { $times[$b] = "no RAM" }
     }
     $a = Get-FileHash (Join-Path $work "old\ram.bin") -ErrorAction SilentlyContinue
     $n = Get-FileHash (Join-Path $work "new\ram.bin") -ErrorAction SilentlyContinue
     $same = $a -and $n -and $a.Hash -eq $n.Hash
-    if (-not $same) { $bad++ }
     $verdict = if ($same) { "SAME" } else { "DIFF" }
     Write-Host ("{0,-4} {1}  old {2} s, new {3} s" -f $verdict, $g.Name, $times["old"], $times["new"])
+    if (-not $same) {
+        $bad++
+        # This game's logs and RAM, before the next game's run replaces them.
+        $keep = Join-Path $work ("game" + $bad)
+        foreach ($b in "old", "new") {
+            $to = Join-Path $keep $b
+            New-Item -ItemType Directory -Force $to | Out-Null
+            foreach ($f in "log.txt", "err.txt", "ram.bin") {
+                Copy-Item -LiteralPath (Join-Path (Join-Path $work $b) $f) $to -ErrorAction SilentlyContinue
+            }
+        }
+        Write-Host "     logs and RAM: $keep"
+    }
 }
-# Kept when a game differs or fails, for its log.txt and ram.bin.
+# Kept when a game differs or fails (see the paths above); the next run
+# removes it.
 if ($bad -eq 0) { Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue }
 exit $bad
