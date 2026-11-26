@@ -14,6 +14,7 @@
 //! - `--only A-B` or `--skip A-B`: keep or drop draws A to B (numbers as
 //!   printed), to find which draws make a part of the picture.
 //! - `--textures DIR`: also save each texture the frame uses as a PNG.
+//! - `--soft`: the console's soft texture filtering instead of crisp texels.
 //!
 //! It prints each draw's number, triangle count, textures, combiner and
 //! geometry mode.
@@ -41,8 +42,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     };
     let (mut ucode, mut scale, mut keep, mut drop, mut textures) = (None, 2, None, None, None);
+    let mut soft = false;
     let mut it = rest.iter();
     while let Some(a) = it.next() {
+        if a == "--soft" {
+            soft = true;
+            continue;
+        }
         let mut val = || it.next().ok_or(format!("{a} needs a value"));
         match a.as_str() {
             "--ucode" => ucode = Some(hex(val()?)? & 0x00FF_FFFF),
@@ -82,7 +88,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 hi[c] = hi[c].max(v.uv[0][c]);
             }
         }
-        let uv = format!("uv {:.2}..{:.2} x {:.2}..{:.2}", lo[0], hi[0], lo[1], hi[1]);
+        let tex = s.textures[0]
+            .and_then(|t| frame.textures.get(t as usize))
+            .map_or(String::new(), |t| {
+                format!(" tex0 {}x{} {:?}", t.width, t.height, t.wrap)
+            });
+        let uv = format!(
+            "uv {:.2}..{:.2} x {:.2}..{:.2}{tex}",
+            lo[0], hi[0], lo[1], hi[1]
+        );
         println!(
             "draw {k:4}: {:4} tris, textures {:?}, combine {:016x}, geometry {:#08x}, shade {avg:?}, {uv}{}",
             d.count / 3,
@@ -95,6 +109,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         keep.is_none_or(|_| inside(keep)) && !inside(drop)
     });
     let mut renderer = Renderer::new()?;
+    renderer.set_sharp_textures(!soft);
     let image = renderer.render(&frame, frame.width * scale, frame.height() * scale)?;
     write_png(out.as_ref(), &image)?;
     println!("{out}: {n} draws via {}", renderer.adapter_name());
