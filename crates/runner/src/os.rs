@@ -18,7 +18,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicPtr, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use n64rusty_runtime::{sx32, Ctx, Flash, FlashOp, GuestFn};
 
@@ -58,6 +58,8 @@ pub enum Outcome {
     /// No retrace for [`HANG_WALL`] of host time: a guest loop that makes
     /// no calls, so virtual time cannot move. Threads and recent calls.
     Hang(String),
+    /// Ended from outside by [`stop`]: the player went to another game.
+    Stopped,
 }
 
 /// Host time without a single retrace after which a run counts as hung.
@@ -181,6 +183,8 @@ pub struct State {
     flash_page: [u8; 128],
     /// The audio interface's buffers, played on the guest clock.
     ai: Ai,
+    /// The baton holder saw the run end and will never run guest code again.
+    halted: bool,
 }
 
 /// The audio interface's two-buffer queue, timed by the guest clock, so a
@@ -237,7 +241,50 @@ struct Os {
     ctx: AtomicPtr<Ctx>,
 }
 
-static OS: OnceLock<Os> = OnceLock::new();
+thread_local! {
+    /// The run this host thread belongs to. Each run has its own state, so
+    /// threads of a stopped run, parked forever, never touch the next one.
+    static MINE: std::cell::Cell<Option<&'static Os>> = const { std::cell::Cell::new(None) };
+}
+
+/// The newest run, for [`stop`] and [`release`] from outside its threads.
+static LAST: AtomicPtr<Os> = AtomicPtr::new(std::ptr::null_mut());
+
+fn last() -> Option<&'static Os> {
+    // SAFETY: set only from a leaked box, never freed.
+    unsafe { LAST.load(Ordering::Acquire).as_ref() }
+}
+
+/// Ends the newest run, as the player does to go to another game: the
+/// thread on the CPU stops at its next system call or interrupt and no
+/// guest thread runs again; [`run`] returns [`Outcome::Stopped`]. Returns
+/// once that thread has stopped, or after two seconds of host time (a
+/// guest loop that makes no calls cannot be stopped).
+pub fn stop() {
+    let Some(os) = last() else { return };
+    let mut st = os.state.lock().unwrap_or_else(|e| e.into_inner());
+    let running = st.done.is_none();
+    if running {
+        st.done = Some(Outcome::Stopped);
+    }
+    os.cv.notify_all();
+    if running {
+        let _ = os
+            .cv
+            .wait_timeout_while(st, std::time::Duration::from_secs(2), |s| !s.halted)
+            .unwrap_or_else(|e| e.into_inner());
+    }
+}
+
+/// Closes the newest run's devices (sound, window side) once it has ended:
+/// its state is never freed, as parked threads keep using its lock.
+pub fn release() {
+    if let Some(os) = last() {
+        let mut st = os.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.devices = Box::new(crate::devices::Headless);
+        st.save = Save::in_memory();
+    }
+}
 
 /// A memory write a run makes at each retrace from `from` to `to` (see
 /// `--poke`): a debugging aid, for example to start a game somewhere else.
@@ -340,7 +387,7 @@ fn apply_pokes(c: &mut Ctx, frame: u64) {
 pub static PANIC_MESSAGE: Mutex<String> = Mutex::new(String::new());
 
 fn os() -> &'static Os {
-    OS.get().expect("system library state not set up")
+    MINE.get().expect("system library state not set up")
 }
 
 fn lock() -> MutexGuard<'static, State> {
@@ -597,6 +644,8 @@ fn reschedule(c: &mut Ctx, mut st: MutexGuard<'static, State>) -> MutexGuard<'st
     let me = st.me();
     loop {
         if st.done.is_some() {
+            st.halted = true;
+            os().cv.notify_all();
             park(st);
         }
         deliver_due(c, &mut st);
@@ -672,10 +721,12 @@ fn wait_turn(st: MutexGuard<'static, State>, id: u32) -> MutexGuard<'static, Sta
 }
 
 fn spawn_thread(id: u32, generation: u64) {
+    let run = os();
     std::thread::Builder::new()
         .name(format!("guest-{id:08x}"))
         .stack_size(256 << 20)
         .spawn(move || {
+            MINE.set(Some(run));
             GENERATION.with(|g| g.set(generation));
             let st = lock();
             let st = wait_turn(st, id);
@@ -735,35 +786,36 @@ pub fn run(
     ctx.on_deadline = Some(interrupt);
     ctx.cop0[12] = STATUS_BOOT;
     ctx.deadline = TICKS_PER_FRAME;
-    let ok = OS
-        .set(Os {
-            state: Mutex::new(State {
-                threads: BTreeMap::new(),
-                current: Some(0),
-                seq: 0,
-                events: HashMap::new(),
-                vi: None,
-                timers: BTreeMap::new(),
-                next_vi: TICKS_PER_FRAME,
-                time_offset: 0,
-                frames: 0,
-                frame_limit,
-                done: None,
-                rom,
-                framebuffer: 0,
-                devices,
-                save,
-                dma_log: Vec::new(),
-                pif: [0; 64],
-                report: String::new(),
-                flash_page: [0xFF; 128],
-                ai: Ai::default(),
-            }),
-            cv: Condvar::new(),
-            ctx: AtomicPtr::new(ctx as *mut Ctx),
-        })
-        .is_ok();
-    assert!(ok, "run can only be called once per process");
+    // Never freed: a stopped run's parked threads keep waiting on its lock.
+    let this: &'static Os = Box::leak(Box::new(Os {
+        state: Mutex::new(State {
+            threads: BTreeMap::new(),
+            current: Some(0),
+            seq: 0,
+            events: HashMap::new(),
+            vi: None,
+            timers: BTreeMap::new(),
+            next_vi: TICKS_PER_FRAME,
+            time_offset: 0,
+            frames: 0,
+            frame_limit,
+            done: None,
+            rom,
+            framebuffer: 0,
+            devices,
+            save,
+            dma_log: Vec::new(),
+            pif: [0; 64],
+            report: String::new(),
+            flash_page: [0xFF; 128],
+            ai: Ai::default(),
+            halted: false,
+        }),
+        cv: Condvar::new(),
+        ctx: AtomicPtr::new(ctx as *mut Ctx),
+    }));
+    MINE.set(Some(this));
+    LAST.store(this as *const Os as *mut Os, Ordering::Release);
     // The boot code runs on its own host thread like every guest thread,
     // as thread 0 at the highest priority.
     lock().threads.insert(

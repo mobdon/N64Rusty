@@ -405,6 +405,12 @@ pub fn main_args(
     let mut save = None;
     let mut wide = false;
     let mut between = false;
+    // A player plays one game after another in the same program: nothing a
+    // flag set for the last game carries over.
+    *RAM_OUT.lock().unwrap() = None;
+    *INTERPRET.lock().unwrap() = None;
+    os::set_pokes(Vec::new());
+    EXPANSION.store(false, std::sync::atomic::Ordering::Relaxed);
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let flag = a.as_str();
@@ -668,6 +674,10 @@ fn run_and_report(
         }
         os::Outcome::Returned => {
             println!("the boot code returned");
+            0
+        }
+        os::Outcome::Stopped => {
+            println!("stopped for another game");
             0
         }
         os::Outcome::Deadlock(d) => {

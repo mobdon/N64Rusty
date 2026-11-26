@@ -498,7 +498,7 @@ impl ApplicationHandler for Screens {
                     .with_theme(Some(Theme::Dark))
                     .with_window_icon(icon())
                     .with_inner_size(LogicalSize::new(W as f64 * 3.0, H as f64 * 3.0));
-                match event_loop.create_window(crate::one_window::placed(attrs)) {
+                match event_loop.create_window(attrs) {
                     Ok(w) => Arc::new(w),
                     Err(_) => {
                         event_loop.exit();

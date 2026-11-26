@@ -284,7 +284,9 @@ fn profile_window(renderer: &mut n64rusty_gfx::Renderer) {
 /// Runs the game in a window (or headless, as the config says). `run` runs
 /// the game to its end with the given devices and returns the exit code;
 /// it runs on its own thread, and the process exits when it returns or
-/// when the window is closed.
+/// when the window is closed. When the window's menu asks for another game
+/// or screen (see [`n64rusty_host::one_window`]), the game is stopped
+/// instead and this returns, so the program goes on in the same window.
 pub fn play(
     cfg: &RunConfig,
     media: Media,
@@ -302,14 +304,31 @@ pub fn play(
     let (live, mut screen) = pair(media);
     screen.widescreen = cfg.window.widescreen;
     screen.sharp = !cfg.window.console_filter;
-    std::thread::Builder::new()
+    let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stopped = stopping.clone();
+    let game = std::thread::Builder::new()
         .name("game".into())
-        .spawn(move || std::process::exit(run(Box::new(live)).into()))
+        .spawn(move || {
+            let code = run(Box::new(live));
+            if !stopped.load(std::sync::atomic::Ordering::Acquire) {
+                std::process::exit(code.into());
+            }
+        })
         .expect("starting the game thread");
     match n64rusty_host::run_windowed(screen, cfg) {
         Ok(s) => {
-            println!("window closed");
+            // Dropping the host side first lets a retrace waiting for the
+            // next host frame return, so the game can see it is stopped.
             drop(s);
+            if n64rusty_host::one_window::switching() {
+                stopping.store(true, std::sync::atomic::Ordering::Release);
+                crate::os::stop();
+                let _ = game.join();
+                crate::os::release();
+                println!("game stopped");
+            } else {
+                println!("window closed");
+            }
             ExitCode::SUCCESS
         }
         Err(e) => {

@@ -150,6 +150,9 @@ pub fn install(
     cart: &mut Vec<u8>,
     sha256: &'static str,
 ) {
+    // Hooks of the game played before in this program are not this game's.
+    *HOOKS.lock().unwrap() = None;
+    *REPLACED.lock().unwrap() = None;
     if libs.is_empty() {
         return;
     }

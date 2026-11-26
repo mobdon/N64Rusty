@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use n64rusty_host::launcher::Page;
+use n64rusty_host::one_window::Next;
 use n64rusty_rom::{signature, Rom};
 use n64rusty_runner::{main_args, os, read_names, routine_list, Game};
 
@@ -117,15 +118,13 @@ fn play(args: &mut Vec<String>, dir: &Path, plain: bool) -> ExitCode {
             _ => None,
         };
         if let Some(page) = page {
-            let mut games = recent.clone();
-            games.extend(find_rom(dir).filter(|r| !recent.contains(r)));
             // The game plays in the start screen's window, as a double-click
             // on that ROM would.
-            let Some(rom) = n64rusty_host::launcher::pick(&games, page) else {
+            let Some(rom) = n64rusty_host::launcher::pick(&games(dir), page) else {
                 return ExitCode::SUCCESS;
             };
             *args = vec![rom.display().to_string()];
-            return played(args, dir, true);
+            return play_on(args, dir, true);
         }
         let remembered = recent.into_iter().next();
         let Some(rom) = remembered.or_else(|| find_rom(dir)).or_else(pick_rom) else {
@@ -137,7 +136,42 @@ fn play(args: &mut Vec<String>, dir: &Path, plain: bool) -> ExitCode {
         };
         args.insert(0, rom.display().to_string());
     }
-    played(args, dir, plain)
+    play_on(args, dir, plain)
+}
+
+/// Plays the ROM `args` starts with, then wherever its menu goes next: the
+/// program goes on in the same window, so screen capture never loses it.
+fn play_on(args: &mut Vec<String>, dir: &Path, mut plain: bool) -> ExitCode {
+    loop {
+        let this = args.clone();
+        let code = played(args, dir, plain);
+        let rom = match n64rusty_host::one_window::take_next() {
+            None => return code,
+            Some(Next::Again) => {
+                *args = this;
+                continue;
+            }
+            Some(Next::Rom(rom)) => rom,
+            Some(Next::Screen(page)) => {
+                let Some(page) = Page::parse(page) else {
+                    return code;
+                };
+                let Some(rom) = n64rusty_host::launcher::pick(&games(dir), page) else {
+                    return ExitCode::SUCCESS;
+                };
+                rom
+            }
+        };
+        *args = vec![rom.display().to_string()];
+        plain = true;
+    }
+}
+
+/// The start screen's games: those played before, then one in `dir`.
+fn games(dir: &Path) -> Vec<PathBuf> {
+    let mut games = n64rusty_host::menu::recent_roms();
+    games.extend(find_rom(dir).filter(|r| !games.contains(r)));
+    games
 }
 
 /// Plays the ROM `args` starts with.

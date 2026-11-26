@@ -95,20 +95,19 @@ impl<G: Guest> App<G> {
         };
         let w = &mut self.cfg.window;
         match action {
-            Action::OpenRom(_) | Action::Screen(_) => {
-                let rom: Vec<std::ffi::OsString> = match &action {
-                    Action::OpenRom(rom) => vec![rom.into()],
-                    Action::Screen(page) => vec!["--screen".into(), page.into()],
-                    _ => Vec::new(),
-                };
-                match crate::one_window::hand_over(&window, rom) {
-                    Ok(()) => event_loop.exit(),
-                    Err(e) => eprintln!("warning: starting the other ROM: {e}"),
-                }
+            // The game ends and the program goes on in this same window.
+            Action::OpenRom(rom) => {
+                crate::one_window::switch(window, crate::one_window::Next::Rom(rom));
+                event_loop.exit();
+                return;
+            }
+            Action::Screen(page) => {
+                crate::one_window::switch(window, crate::one_window::Next::Screen(page));
+                event_loop.exit();
                 return;
             }
             Action::ToggleMod(_) | Action::ToggleModOption(..) => {
-                // Mods install at start, so the program starts again.
+                // Mods install at start, so the game starts again.
                 let (change, path) = match &action {
                     Action::ToggleMod(p) => (std::fs::rename(p, crate::menu::toggled(p)), p),
                     Action::ToggleModOption(p, name) => (
@@ -119,12 +118,11 @@ impl<G: Guest> App<G> {
                     ),
                     _ => unreachable!(),
                 };
-                let restart = change.map_err(|e| e.to_string()).and_then(|_| {
-                    crate::one_window::hand_over(&window, std::env::args_os().skip(1))
-                        .map_err(|e| e.to_string())
-                });
-                match restart {
-                    Ok(_) => event_loop.exit(),
+                match change {
+                    Ok(()) => {
+                        crate::one_window::switch(window, crate::one_window::Next::Again);
+                        event_loop.exit();
+                    }
                     Err(e) => eprintln!("warning: turning mod {} on or off: {e}", path.display()),
                 }
                 return;
@@ -215,9 +213,7 @@ impl<G: Guest> ApplicationHandler for App<G> {
                     .with_theme(Some(winit::window::Theme::Dark))
                     .with_window_icon(crate::launcher::icon())
                     .with_inner_size(size);
-                event_loop
-                    .create_window(crate::one_window::placed(attrs))
-                    .map(Arc::new)
+                event_loop.create_window(attrs).map(Arc::new)
             }
         };
         match window {

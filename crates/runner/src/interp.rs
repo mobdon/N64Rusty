@@ -26,6 +26,8 @@ static REGION: Mutex<Option<Snapshot>> = Mutex::new(None);
 /// range to save for a function it runs.
 pub(crate) fn install(ctx: &mut Ctx, region: Snapshot) {
     *REGION.lock().unwrap() = Some(region);
+    // Saved for this game's run log only, not the one played before.
+    SEEN.lock().unwrap().clear();
     ctx.on_missing = Some(run);
 }
 

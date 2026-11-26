@@ -10,7 +10,7 @@ pub mod debug;
 pub mod launcher;
 pub mod mapping;
 pub mod menu;
-mod one_window;
+pub mod one_window;
 pub mod pad;
 pub mod script;
 pub mod session;
