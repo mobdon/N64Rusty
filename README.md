@@ -83,9 +83,9 @@ A run stops after `--frames` retraces, on a deadlock, at the first
 panic, or on a hang (no retrace for 5 seconds of host time: a guest loop
 that makes no calls, so game time cannot move), and prints the threads,
 the cartridge copies and the most recent calls. Any access past RAM that is
-not through the KSEG0/KSEG1 windows (a wild pointer, or TLB-mapped memory,
-which is not modelled yet) panics there; an address starting `0x27BD` is
-also named as code read as a pointer. It also writes two files next to `out/`:
+not through the KSEG0/KSEG1 windows or a TLB page the game has written (a
+wild pointer) panics there; an address starting `0x27BD` is also named as
+code read as a pointer. It also writes two files next to `out/`:
 
 - `dma.txt`: every cartridge copy seen (ROM offset, RAM address, length).
 - `missing.txt`: each call into code that was never translated, with the
@@ -146,6 +146,7 @@ Two debugging aids, in headless and window runs alike:
   other than the beginning. Keep poke scripts in the per-game folder: they
   hold game addresses.
 - `--ram-out file` saves guest RAM when the run ends, to read state back.
+- `N64RUSTY_WATCH=addr` (environment, hex) prints each change the interpreter sees of the RAM word there, with the instruction it was at: finds what wrote a bad value.
 - `--hash-out file` writes `frame hash` of guest RAM at every retrace. Two runs with the same input script should give the same lines; the first line that differs is where they part.
 - `--interpret lo-hi` (hex addresses) runs calls into that range in the reference interpreter even where a translation exists. With `--hash-out`, this checks translated code against the interpreter.
 - `N64RUSTY_PROFILE=n` (environment) prints a profile line every n frames: host time per frame in the guest, display lists, audio, capture rendering and PNG writing, and the renderer's split (recording, texture uploads, submit and wait, draws and textures uploaded per picture). In a window it prints the window's drawing. Measure with it before and after any speed change.
@@ -345,9 +346,23 @@ every 32-bit result is sign-extended, as on the VR4300.
   FPU exceptions and cause/flag bits are not modelled; an invalid conversion
   gives the largest positive integer, the MIPS default result.
 - **Not modelled yet.** COP0 (system control), overflow exceptions (ADD, ADDI, SUB and their
-  64-bit forms behave like the unsigned forms), traps (BREAK, SYSCALL), LL/SC and
-  the TLB. These emit a call that panics with the address,
+  64-bit forms behave like the unsigned forms), traps (BREAK, SYSCALL) and LL/SC.
+  These emit a call that panics with the address,
   so the first one a game reaches is easy to find.
+- **TLB.** Entries the game writes (TLBWI, TLBWR) map addresses outside
+  KSEG0/KSEG1 onto RAM, for data and for calls: a call through a page runs
+  the translation or replaced routine at the same bytes in KSEG0, and code
+  with neither runs in the interpreter at the address called. A game that
+  loads pages on demand names its own refill routine (the one its exception
+  handler calls) in the per-game config as `tlb_refill = 0xADDR`: for an
+  address no page maps, the runtime sets BadVAddr, Context and EntryHi and
+  runs that routine with every register kept and no thread switch, as the
+  exception would. Its cartridge copies made with the PI registers
+  themselves are done at once. Only the interpreter takes a miss on a data
+  access so far; translated code takes them on calls. Address space ids are
+  ignored. `thread_status = 0xVALUE` in the same config gives the Status
+  word a game's library starts threads with, when it sets FR (64-bit
+  floating-point registers).
 
 ### Audio
 

@@ -92,13 +92,17 @@ impl Flash {
 ///
 /// Virtual addresses are mapped by dropping the top three bits, which covers
 /// the cached (KSEG0, `0x8000_0000`) and uncached (KSEG1, `0xA000_0000`)
-/// windows. The TLB is not modelled yet. Accesses outside RAM and misaligned
+/// windows; other addresses go through the TLB pages the game has written, if
+/// one covers them. Accesses outside RAM and misaligned
 /// accesses panic with the address, since on hardware they raise exceptions
 /// that recompiled code is not expected to rely on.
 #[derive(Clone)]
 pub struct Memory {
     bytes: Vec<u8>,
     io: Option<Box<Io>>,
+    /// Valid TLB pages as (virtual base, length, physical base); see
+    /// [`Memory::set_map`].
+    map: Vec<(u32, u32, u32)>,
 }
 
 impl Memory {
@@ -107,12 +111,48 @@ impl Memory {
         Self {
             bytes: vec![0; size],
             io: None,
+            map: Vec::new(),
         }
     }
 
     /// RAM with the given contents, in big-endian order.
     pub fn from_bytes(bytes: Vec<u8>) -> Self {
-        Self { bytes, io: None }
+        Self {
+            bytes,
+            io: None,
+            map: Vec::new(),
+        }
+    }
+
+    /// Sets the TLB pages addresses outside KSEG0/KSEG1 go through, as
+    /// (virtual base, length, physical base).
+    pub fn set_map(&mut self, map: Vec<(u32, u32, u32)>) {
+        self.map = map;
+    }
+
+    /// The pages given to [`Memory::set_map`].
+    pub fn map(&self) -> &[(u32, u32, u32)] {
+        &self.map
+    }
+
+    /// The KSEG0 address of the same byte as `vaddr` when a TLB page maps
+    /// it; any other address unchanged.
+    #[inline(always)]
+    pub fn kseg0(&self, vaddr: u32) -> u32 {
+        if self.map.is_empty() || vaddr.wrapping_sub(0x8000_0000) < 0x4000_0000 {
+            return vaddr;
+        }
+        self.mapped(vaddr)
+    }
+
+    #[inline(never)]
+    fn mapped(&self, vaddr: u32) -> u32 {
+        self.map
+            .iter()
+            .find(|&&(base, len, _)| vaddr.wrapping_sub(base) < len)
+            .map_or(vaddr, |&(base, _, phys)| {
+                0x8000_0000 | (phys + (vaddr - base))
+            })
     }
 
     /// Maps the space outside RAM. Without this, such accesses panic.
@@ -157,6 +197,19 @@ impl Memory {
         if let Ok(w) = <[u8; 4]>::try_from(data) {
             let w = u32::from_be_bytes(w);
             match p {
+                // PI_WR_LEN: a cartridge copy started with the registers
+                // themselves, from PI_CART_ADDR to PI_DRAM_ADDR. Done at once.
+                0x0460_000C => {
+                    let reg = |a: u32| io.regs.get(&a).copied().unwrap_or(0) as usize;
+                    let (ram, cart) = (reg(0x0460_0000) & 0xFF_FFFF, reg(0x0460_0004));
+                    let src = (cart & 0x1FFF_FFFF).wrapping_sub(0x1000_0000);
+                    let n = (w as usize & 0xFF_FFFF) + 1;
+                    if let (Some(s), Some(d)) =
+                        (io.rom.get(src..src + n), self.bytes.get_mut(ram..ram + n))
+                    {
+                        d.copy_from_slice(s);
+                    }
+                }
                 FLASH_COMMAND => io.flash.command(w),
                 // Clearing the status.
                 FLASH_STATUS if io.flash.used => io.flash.status = 0,
@@ -167,6 +220,9 @@ impl Memory {
             let a = p + k;
             match a {
                 0x0400_0000..=0x0400_1FFF => io.sp_mem[a - 0x0400_0000] = b,
+                // PI_STATUS: a write resets or clears the interrupt; it
+                // reads as idle, since copies are done at once.
+                0x0460_0010..=0x0460_0013 => {}
                 0x1000_0000..=0x1FBF_FFFF => {}
                 _ => {
                     let w = io.regs.entry(a as u32 & !3).or_insert(0);
@@ -188,8 +244,8 @@ impl Memory {
     }
 
     #[inline(always)]
-    fn phys(vaddr: u32, len: usize) -> usize {
-        let p = (vaddr & 0x1FFF_FFFF) as usize;
+    fn phys(&self, vaddr: u32, len: usize) -> usize {
+        let p = (self.kseg0(vaddr) & 0x1FFF_FFFF) as usize;
         if p & (len - 1) != 0 {
             misaligned(vaddr, len);
         }
@@ -198,7 +254,7 @@ impl Memory {
 
     #[inline(always)]
     fn get<const N: usize>(&self, vaddr: u32) -> [u8; N] {
-        let p = Self::phys(vaddr, N);
+        let p = self.phys(vaddr, N);
         let mut b = [0; N];
         if p + N <= self.bytes.len() {
             b.copy_from_slice(&self.bytes[p..p + N]);
@@ -210,7 +266,7 @@ impl Memory {
 
     #[inline(always)]
     fn put<const N: usize>(&mut self, vaddr: u32, b: [u8; N]) {
-        let p = Self::phys(vaddr, N);
+        let p = self.phys(vaddr, N);
         if p + N <= self.bytes.len() {
             self.bytes[p..p + N].copy_from_slice(&b);
         } else {

@@ -73,7 +73,10 @@ pub fn boot(rom: &Rom, game: &Game) -> Ctx {
     let cic_id = match rom.cic {
         Cic::Cic6101 | Cic::Cic6102 => 2,
         Cic::Cic6103 => 3,
-        Cic::Cic6105 => 5,
+        // The number itself: a game compares it with 6105 before it starts
+        // its main thread. shortcut: the other codes keep short ids nothing
+        // has read yet; give them their numbers too if a game checks one.
+        Cic::Cic6105 => 6105,
         Cic::Cic6106 => 6,
         Cic::Unknown(_) => 2,
     };
@@ -313,6 +316,19 @@ pub fn crash_report(ctx: &Ctx) -> String {
     );
     for a in ctx.recent_calls() {
         out.push_str(&format!("  {}\n", label(&names, a)));
+    }
+    let pc = interp::LAST_PC.load(std::sync::atomic::Ordering::Relaxed);
+    if pc != 0 {
+        out.push_str(&format!(
+            "interpreter last outside plain RAM at {pc:#010x}\n"
+        ));
+    }
+    if ctx.tlb_refill != 0 {
+        out.push_str(&format!(
+            "last TLB miss at {:#010x}, interpreter then at {:#010x}\n",
+            ctx.cop0[8],
+            interp::MISS_PC.load(std::sync::atomic::Ordering::Relaxed)
+        ));
     }
     out.push_str("registers:\n");
     for row in 0..8 {

@@ -8,9 +8,10 @@
 //! `record_run`), so the next translate covers it.
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Mutex, OnceLock};
 
-use n64rusty_refcpu::Cpu;
+use n64rusty_refcpu::{Cpu, Stop};
 use n64rusty_runtime::Ctx;
 
 /// First-run snapshots of the RAM around each interpreted function: entry
@@ -21,6 +22,23 @@ static SEEN: Mutex<BTreeMap<u32, (u32, Vec<u8>)>> = Mutex::new(BTreeMap::new());
 pub(crate) type Snapshot = Box<dyn Fn(&[u8], u32) -> Option<(u32, u32)> + Send>;
 
 static REGION: Mutex<Option<Snapshot>> = Mutex::new(None);
+
+/// Where the interpreter last left its own RAM path (a device register, a
+/// TLB address, a bad pointer): the instruction a crash there is at.
+pub(crate) static LAST_PC: AtomicU32 = AtomicU32::new(0);
+/// The instruction at the interpreter's last TLB miss.
+pub(crate) static MISS_PC: AtomicU32 = AtomicU32::new(0);
+
+/// `N64RUSTY_WATCH=addr` (hex): the interpreter prints each change of the
+/// RAM word there with the instruction it noticed it before. A debugging aid.
+static WATCH: OnceLock<Option<usize>> = OnceLock::new();
+static WATCHED: AtomicU32 = AtomicU32::new(0);
+
+fn watch_addr() -> Option<usize> {
+    let v = std::env::var("N64RUSTY_WATCH").ok()?;
+    let a = u32::from_str_radix(v.trim_start_matches("0x"), 16).ok()?;
+    Some((a & 0x1FFF_FFFC) as usize)
+}
 
 /// Makes `ctx` interpret calls to untranslated code; `region` gives the RAM
 /// range to save for a function it runs.
@@ -38,6 +56,10 @@ pub(crate) fn seen() -> BTreeMap<u32, (u32, Vec<u8>)> {
 
 fn load(cpu: &mut Cpu, c: &Ctx) {
     (cpu.r, cpu.hi, cpu.lo, cpu.f, cpu.fcr31, cpu.fr) = (c.r, c.hi, c.lo, c.f, c.fcr31, c.fr);
+    // The callee may have written the TLB.
+    if cpu.map != c.mem.map() {
+        cpu.map = c.mem.map().to_vec();
+    }
 }
 
 fn store(cpu: &Cpu, c: &mut Ctx) {
@@ -56,7 +78,7 @@ fn run(ctx: &mut Ctx, entry: u32) {
                 .as_ref()
                 .and_then(|f| f(ctx.mem.bytes(), entry));
             let (lo, hi) = region.unwrap_or((entry, entry));
-            let at = |a: u32| (a & 0x1FFF_FFFF) as usize;
+            let at = |a: u32| (ctx.mem.kseg0(a) & 0x1FFF_FFFF) as usize;
             let bytes = ctx.mem.bytes().get(at(lo)..at(hi)).unwrap_or_default();
             (lo, bytes.to_vec())
         });
@@ -69,6 +91,14 @@ fn run(ctx: &mut Ctx, entry: u32) {
     cpu.jump_to(entry);
     while cpu.pc != stop {
         let pc = cpu.pc;
+        if ctx.unmapped(pc) {
+            // Code in a page not loaded yet: the game's refill routine
+            // loads it, as on a TLB miss.
+            store(&cpu, ctx);
+            MISS_PC.store(pc, Ordering::Relaxed);
+            ctx.tlb_miss(pc);
+            load(&mut cpu, ctx);
+        }
         if pc != entry && ctx.has_translation(pc) {
             // A call (or tail jump) into translated code: run it there, then
             // carry on at the return address it leaves.
@@ -79,6 +109,21 @@ fn run(ctx: &mut Ctx, entry: u32) {
             continue;
         }
         let word = ctx.mem.read_u32(pc);
+        if let Some(at) = *WATCH.get_or_init(watch_addr) {
+            let now = ctx
+                .mem
+                .bytes()
+                .get(at..at + 4)
+                .map(|b| u32::from_be_bytes(b.try_into().unwrap()));
+            let last = WATCHED.swap(now.unwrap_or(0), Ordering::Relaxed);
+            if now.is_some_and(|n| n != last) {
+                eprintln!(
+                    "watch: {last:#010x} -> {:#010x} before {pc:#010x} (ra {:#010x})",
+                    now.unwrap(),
+                    cpu.r[31] as u32
+                );
+            }
+        }
         let target = match word >> 26 {
             3 => Some((pc & 0xF000_0000) | (word & 0x03FF_FFFF) << 2),
             // JALR links into rd: with rd = 0 it is a plain jump.
@@ -92,6 +137,18 @@ fn run(ctx: &mut Ctx, entry: u32) {
         // here.
         let calls = target.is_some_and(|t| t == entry || !ctx.has_translation(t));
         if let Err(e) = cpu.step_on(ctx.mem.bytes_mut()) {
+            if let Stop::BadAccess { addr, .. } = e {
+                if ctx.unmapped(addr) {
+                    store(&cpu, ctx);
+                    MISS_PC.store(cpu.pc, Ordering::Relaxed);
+                    let mapped = ctx.tlb_miss(addr);
+                    load(&mut cpu, ctx);
+                    if mapped {
+                        // The instruction did nothing yet: run it again.
+                        continue;
+                    }
+                }
+            }
             // The reference CPU knows plain RAM only: COP0 and device
             // registers go through the runtime, as translated code does.
             if !outside(&mut cpu, ctx, word) {
@@ -115,6 +172,9 @@ fn run(ctx: &mut Ctx, entry: u32) {
 /// instruction or a load or store the reference CPU cannot reach; returns
 /// whether it did.
 fn outside(cpu: &mut Cpu, ctx: &mut Ctx, word: u32) -> bool {
+    // A crash from here reports this instruction and its registers.
+    LAST_PC.store(cpu.pc, Ordering::Relaxed);
+    store(cpu, ctx);
     let (rs, rt, rd) = (
         (word >> 21) & 31,
         (word >> 16) as usize & 31,

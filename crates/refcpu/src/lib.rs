@@ -27,6 +27,9 @@ pub struct Cpu {
     /// Big-endian RAM, addressed by virtual address with the top 3 bits
     /// dropped.
     pub mem: Vec<u8>,
+    /// TLB pages as (virtual base, length, physical base): addresses
+    /// outside KSEG0/KSEG1 that one covers are reached through it.
+    pub map: Vec<(u32, u32, u32)>,
 }
 
 /// Why [`Cpu::run`] stopped early.
@@ -56,7 +59,21 @@ impl Cpu {
             fcr31: 0,
             fr: true,
             mem,
+            map: Vec::new(),
         }
+    }
+
+    /// `addr` as a KSEG0 address when a TLB page covers it.
+    fn virt(&self, addr: u32) -> u32 {
+        if addr.wrapping_sub(0x8000_0000) < 0x4000_0000 {
+            return addr;
+        }
+        self.map
+            .iter()
+            .find(|&&(base, len, _)| addr.wrapping_sub(base) < len)
+            .map_or(addr, |&(base, _, phys)| {
+                0x8000_0000 | (phys + (addr - base))
+            })
     }
 
     fn phys(mem: &[u8], addr: u32, size: u32, pc: u32) -> Result<usize, Stop> {
@@ -301,7 +318,7 @@ impl Cpu {
     /// three bits dropped).
     pub fn step_on(&mut self, mem: &mut [u8]) -> Result<(), Stop> {
         let pc = self.pc;
-        let word = Self::load(mem, pc, 4, pc)? as u32;
+        let word = Self::load(mem, self.virt(pc), 4, pc)? as u32;
         // Default: the next instruction is the one in sequence.
         let mut npc = self.next_pc;
         let mut nnpc = self.next_pc.wrapping_add(4);
@@ -316,7 +333,7 @@ impl Cpu {
         let simm = i64::from(imm as u16 as i16);
         let s = self.r[rs as usize];
         let t = self.r[rt as usize];
-        let ea = (s as u32).wrapping_add(simm as u32);
+        let ea = self.virt((s as u32).wrapping_add(simm as u32));
         let link = se32(pc.wrapping_add(8));
         let btarget = pc.wrapping_add(4).wrapping_add((simm * 4) as u32);
         let unimpl = Stop::Unimplemented { pc, word };

@@ -77,9 +77,14 @@ pub struct Ctx {
     pub depth: u32,
     /// COP0 (system control) registers, as written by MTC0.
     pub cop0: [u32; 32],
-    /// TLB entries as PageMask, EntryHi, EntryLo0, EntryLo1. Stored for
-    /// TLBR and TLBP; addresses are not translated through them.
+    /// TLB entries as PageMask, EntryHi, EntryLo0, EntryLo1. A write also
+    /// gives the valid pages to [`Memory::set_map`].
     pub tlb: [[u32; 4]; 32],
+    /// The game's own TLB refill routine (the one its exception handler
+    /// calls), or 0: [`Ctx::tlb_miss`] runs it for an address no page maps.
+    pub tlb_refill: u32,
+    /// The slot the next TLBWR writes.
+    tlb_random: usize,
     /// Virtual time in COP0 Count ticks: advances by [`COUNT_PER_CALL`]
     /// per call, and hosts move it forward when the game waits.
     pub clock: u64,
@@ -103,6 +108,25 @@ struct Overlay {
     ram: u32,
     len: u32,
     funcs: HashMap<u32, GuestFn>,
+}
+
+/// The valid pages of `tlb` as (virtual base, length, physical base).
+/// shortcut: address space ids are ignored (every entry counts as global),
+/// compare EntryHi's id if a game ever uses more than one.
+fn tlb_pages(tlb: &[[u32; 4]; 32]) -> Vec<(u32, u32, u32)> {
+    let mut pages = Vec::new();
+    for e in tlb {
+        let mask = e[0] | 0x1FFF;
+        let len = (mask >> 1) + 1;
+        let base = e[1] & !mask;
+        for (k, lo) in [e[2], e[3]].into_iter().enumerate() {
+            // Bit 1 is Valid; the frame number starts at bit 6.
+            if lo & 2 != 0 {
+                pages.push((base + k as u32 * len, len, (lo >> 6) << 12));
+            }
+        }
+    }
+    pages
 }
 
 /// How far the virtual COP0 Count register advances per call.
@@ -134,6 +158,8 @@ impl Ctx {
             depth: 0,
             cop0: [0; 32],
             tlb: [[0; 4]; 32],
+            tlb_refill: 0,
+            tlb_random: 31,
             clock: 0,
             deadline: u64::MAX,
             on_deadline: None,
@@ -311,6 +337,14 @@ impl Ctx {
     }
 
     fn call_as(&mut self, addr: u32, overrides: bool) {
+        self.tlb_miss(addr);
+        // Translations and overrides are known by where the code's bytes are
+        // in RAM: a call through a TLB page finds the one at the same bytes
+        // in KSEG0. Code with none runs at the address called.
+        // shortcut: a translated function must lie in pages mapped in order;
+        // translate per page if a game ever scatters one.
+        let virt = addr;
+        let addr = self.mem.kseg0(addr);
         let overridden = overrides && self.overrides.contains_key(&addr);
         let forced = self
             .interpret
@@ -322,9 +356,9 @@ impl Ctx {
         } else {
             self.lookup_game(addr).or_else(|| self.verify_image(addr))
         };
-        self.tick(addr);
+        self.tick(virt);
         // Set after the tick: a deadline handler it runs makes calls too.
-        self.entering = addr;
+        self.entering = virt;
         match f {
             Some(f) => {
                 self.depth += 1;
@@ -334,7 +368,7 @@ impl Ctx {
             None if self.on_missing.is_some() => {
                 let run = self.on_missing.unwrap();
                 self.depth += 1;
-                run(self, addr);
+                run(self, virt);
                 self.depth -= 1;
             }
             None => panic!(
@@ -393,11 +427,16 @@ impl Ctx {
                 }
             }
             2 | 6 => {
-                // Random lies between Wired and 31, so slot 31 is always one it could pick.
-                let slot = if funct == 2 { index } else { 31 };
+                // Random counts down from 31 to Wired (COP0 6) and wraps.
+                let slot = if funct == 2 { index } else { self.tlb_random };
+                if funct == 6 {
+                    let wired = (self.cop0[6] & 31) as usize;
+                    self.tlb_random = if slot <= wired { 31 } else { slot - 1 };
+                }
                 for (k, &n) in REGS.iter().enumerate() {
                     self.tlb[slot][k] = self.cop0[n];
                 }
+                self.mem.set_map(tlb_pages(&self.tlb));
             }
             8 => {
                 let hi = self.cop0[10];
@@ -412,6 +451,41 @@ impl Ctx {
         }
     }
 
+    /// Whether `vaddr` is outside KSEG0/KSEG1 with no TLB page for it, in a
+    /// game that has a refill routine: [`Ctx::tlb_miss`] may map it.
+    #[inline(always)]
+    pub fn unmapped(&self, vaddr: u32) -> bool {
+        self.tlb_refill != 0
+            && vaddr.wrapping_sub(0x8000_0000) >= 0x4000_0000
+            && !self
+                .mem
+                .map()
+                .iter()
+                .any(|&(base, len, _)| vaddr.wrapping_sub(base) < len)
+    }
+
+    /// What the TLB miss exception does for `vaddr`: sets BadVAddr, Context
+    /// and EntryHi and runs the game's refill routine, with the integer and
+    /// floating-point registers kept as its exception handler keeps them in
+    /// the thread (a routine may use either as scratch). Returns whether a
+    /// page maps `vaddr` now.
+    pub fn tlb_miss(&mut self, vaddr: u32) -> bool {
+        if !self.unmapped(vaddr) {
+            return false;
+        }
+        let saved = (self.r, self.hi, self.lo, self.f, self.fcr31);
+        self.cop0[8] = vaddr;
+        self.cop0[4] = (self.cop0[4] & 0xFF80_0000) | ((vaddr >> 13) << 4);
+        self.cop0[10] = (vaddr & !0x1FFF) | (self.cop0[10] & 0xFF);
+        // An exception handler runs with interrupts off: no deadline (a
+        // thread switch, say) is taken until the routine is done.
+        let deadline = std::mem::replace(&mut self.deadline, u64::MAX);
+        self.call(self.tlb_refill);
+        self.deadline = deadline;
+        (self.r, self.hi, self.lo, self.f, self.fcr31) = saved;
+        !self.unmapped(vaddr)
+    }
+
     /// Whether a function is registered or overridden at `addr`.
     pub fn has_function(&self, addr: u32) -> bool {
         self.lookup(addr).is_some()
@@ -421,6 +495,7 @@ impl Ctx {
     /// overridden function, or a saved-image function whose bytes are in RAM
     /// now (checking it, as a call would).
     pub fn has_translation(&mut self, addr: u32) -> bool {
+        let addr = self.mem.kseg0(addr);
         self.lookup(addr).is_some() || self.verify_image(addr).is_some()
     }
 
@@ -785,5 +860,28 @@ mod interpret_tests {
         assert_eq!(c.r[2], 2);
         c.call(0x8000_0200);
         assert_eq!(c.r[2], 1, "the range's end is outside it");
+    }
+
+    #[test]
+    fn tlb_pages_map_data_and_calls() {
+        fn callee(c: &mut Ctx) {
+            c.r[2] = 7;
+        }
+        let mut c = Ctx::new(Memory::new(0x4000));
+        c.register(0x8000_2000, callee);
+        // One entry: 4 KiB pages at 0x1000_0000, even page to frame 2,
+        // odd page not valid.
+        (c.cop0[0], c.cop0[5], c.cop0[10]) = (3, 0, 0x1000_0000);
+        (c.cop0[2], c.cop0[3]) = (2 << 6 | 0x1F, 0);
+        c.tlb(2);
+        c.mem.write_u32(0x1000_0004, 0xDEAD_BEEF);
+        assert_eq!(c.mem.read_u32(0x8000_2004), 0xDEAD_BEEF);
+        c.call(0x1000_0000);
+        assert_eq!(c.r[2], 7);
+        assert_eq!(
+            c.mem.kseg0(0x1000_1000),
+            0x1000_1000,
+            "the odd page is not valid"
+        );
     }
 }

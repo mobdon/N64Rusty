@@ -17,7 +17,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use n64rusty_runtime::{sx32, Ctx, Flash, FlashOp, GuestFn};
@@ -602,6 +602,11 @@ fn deliver_due(c: &mut Ctx, st: &mut State) {
 
 /// COP0 Status for the boot code: CU1, CU0, FR, all interrupt lines, IE.
 const STATUS_BOOT: u32 = 0x3400_FF01;
+/// Status.FR: 64-bit floating-point registers.
+const STATUS_FR: u32 = 0x0400_0000;
+/// The Status word this game's library gives new threads (config name
+/// `thread_status`), or 0 for the usual one.
+static THREAD_STATUS: AtomicU32 = AtomicU32::new(0);
 /// COP0 Status a new thread starts with: CU1, all interrupt lines, IE.
 const STATUS_THREAD: u32 = 0x2000_FF01;
 
@@ -747,8 +752,13 @@ fn spawn_thread(id: u32, generation: u64) {
             // registers (Status.FR set). Threads start from the context the
             // system library builds, whose Status has FR clear: doubles
             // live in even/odd register pairs.
-            c.fr = id == 0;
-            c.cop0[12] = if id == 0 { STATUS_BOOT } else { STATUS_THREAD };
+            // A game whose library differs names its own status word.
+            let status = match THREAD_STATUS.load(Ordering::Relaxed) {
+                0 => STATUS_THREAD,
+                s => s,
+            };
+            c.fr = id == 0 || status & STATUS_FR != 0;
+            c.cop0[12] = if id == 0 { STATUS_BOOT } else { status };
             drop(st);
             let r = panic::catch_unwind(AssertUnwindSafe(|| c.call(entry)));
             let mut st = lock();
@@ -1713,6 +1723,10 @@ pub const HOOKS: &[(&str, GuestFn)] = &[
     ("osUnmapTLBAll", nothing),
 ];
 
+/// Config name of a game's own TLB refill routine: not replaced, but run
+/// for addresses no TLB page maps (see `Ctx::tlb_miss`).
+pub const TLB_REFILL: &str = "tlb_refill";
+
 /// Installs the replacements over the routines found in `addrs`
 /// (role name and guest address). A name may come more than once: a game can
 /// link a library routine into two segments. Returns the names installed.
@@ -1721,9 +1735,16 @@ pub fn install<'a>(
     addrs: impl IntoIterator<Item = (&'a String, &'a u32)>,
 ) -> Vec<String> {
     let mut done = Vec::new();
+    THREAD_STATUS.store(0, Ordering::Relaxed);
     for (name, &a) in addrs {
         if let Some((_, f)) = HOOKS.iter().find(|(h, _)| h == name) {
             ctx.set_override(a, *f);
+            done.push(name.clone());
+        } else if name == TLB_REFILL {
+            ctx.tlb_refill = a;
+            done.push(name.clone());
+        } else if name == "thread_status" {
+            THREAD_STATUS.store(a, Ordering::Relaxed);
             done.push(name.clone());
         }
     }
