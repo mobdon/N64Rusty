@@ -33,6 +33,8 @@ const A_SMALL: u8 = 0x04;
 /// volumes and the ADPCM codebook between tasks.
 pub struct AudioRsp {
     n_audio: bool,
+    /// Skip the stream commands one game's `n_audio` microcode adds.
+    streams: bool,
     dmem: Box<[u8; DMEM]>,
     segments: [u32; 16],
     inp: u16,
@@ -75,6 +77,7 @@ impl AudioRsp {
     pub fn new() -> Self {
         Self {
             n_audio: false,
+            streams: false,
             dmem: Box::new([0; DMEM]),
             segments: [0; 16],
             inp: 0,
@@ -100,6 +103,17 @@ impl AudioRsp {
         Self {
             n_audio: true,
             ..Self::new()
+        }
+    }
+
+    /// The `n_audio` set as one game's own microcode extends it, with
+    /// commands 7 and 8 (its compressed-stream decoder) skipped. Only a
+    /// game that asks for it gets this; for any other, 7 and 8 stay
+    /// unknown commands.
+    pub fn n_audio_streams() -> Self {
+        Self {
+            streams: true,
+            ..Self::n_audio()
         }
     }
 
@@ -214,6 +228,9 @@ impl AudioRsp {
                 self.pole_filter(ram, flags, lo0, (buf, buf, N_COUNT), a1);
             }
             15 => self.loop_addr = a1,
+            // shortcut: the stream decoder is skipped, so its streams (that
+            // game's speech and music) stay silent; decode them to hear them.
+            7 | 8 if self.streams => {}
             op => panic!("n_audio command {op:#x} not implemented ({w0:08x} {w1:08x})"),
         }
     }

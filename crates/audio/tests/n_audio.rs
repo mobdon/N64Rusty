@@ -220,6 +220,24 @@ fn pole_filter_gain_from_a_real_command_shape() {
 }
 
 #[test]
+fn a_game_that_asks_skips_its_stream_commands() {
+    let mut rsp = AudioRsp::n_audio_streams();
+    let mut ram = Memory::new(8 << 20);
+    put(&mut ram, DATA, &[1, 2, 3, 4]);
+    run(
+        &mut rsp,
+        &mut ram,
+        &[
+            (8 << 24, STATE),
+            (7 << 24 | 0x1C, DATA + 0x100),
+            load(0, 8, DATA),
+            save(0, 8, OUT),
+        ],
+    );
+    assert_eq!(get(&ram, OUT, 4), [1, 2, 3, 4]);
+}
+
+#[test]
 #[should_panic(expected = "n_audio command 0x7 not implemented")]
 fn unknown_command_names_itself() {
     let (mut rsp, mut ram) = setup();

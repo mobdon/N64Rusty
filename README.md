@@ -133,7 +133,11 @@ resolution (the geometry is drawn again at that size, not stretched). Captures
 and recordings are game output: keep them in the git-ignored local folder.
 The audio command set follows the game's audio library: when the symbol map
 names the alternative library's routines (`n_alSynNew`, `n_alAudioFrame`),
-its command set is used. `--input script.txt` plays a controller script
+its command set is used. A game whose microcode adds a compressed-stream
+decoder to that set (commands 7 and 8) asks for it with `n_audio_streams =
+0x1` in its per-game config; no other game is affected. The decoder is not
+done yet, so those streams are silent. When an audio task fails, the report
+names its microcode and first commands. `--input script.txt` plays a controller script
 (`frame port buttons x y` lines, the format `n64rusty-host` records),
 matched against retrace numbers, so a headless run can press buttons.
 

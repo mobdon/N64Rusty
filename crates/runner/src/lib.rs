@@ -129,6 +129,10 @@ pub fn routine_list(names: &BTreeMap<u32, String>) -> String {
 /// Routines that tell the alternative audio library is in use.
 const N_AUDIO: [&str; 2] = ["n_alSynNew", "n_alAudioFrame"];
 
+/// Per-game config name: the `n_audio` command set with that game's stream
+/// commands skipped.
+const N_AUDIO_STREAMS: &str = "n_audio_streams";
+
 fn label(names: &BTreeMap<u32, String>, a: u32) -> String {
     match names.get(&a) {
         Some(n) => format!("{a:#010x} {n}"),
@@ -628,9 +632,13 @@ pub fn main_args(
         None => None,
     };
     // The alternative audio library has its own command set; tell them
-    // apart by the library's routine names in the local symbol map.
-    let n_audio = N_AUDIO.iter().any(|n| by_name.contains_key(*n));
+    // apart by the library's routine names in the local symbol map. A game
+    // whose microcode extends it with stream commands says so in its own
+    // config (`n_audio_streams = 0x1`).
+    let streams = by_name.contains_key(N_AUDIO_STREAMS);
+    let n_audio = streams || N_AUDIO.iter().any(|n| by_name.contains_key(*n));
     let media = media::Media::new(capture, every, wav, n_audio, script)
+        .with_audio_streams(streams)
         .with_scale(scale)
         .with_widescreen(wide)
         .with_between(between)

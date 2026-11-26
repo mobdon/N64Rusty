@@ -27,6 +27,20 @@ const TASK_JPEG: u32 = 4;
 const TASK_DATA_PTR: u32 = 0x30;
 /// Offset of the microcode data pointer in the task.
 const TASK_UCODE_DATA: u32 = 0x18;
+
+/// The name a microcode carries in its data at `data` ("RSP ... ucode"
+/// text), if there is one in its first 2 KiB.
+fn ucode_name(mem: &n64rusty_runtime::Memory, data: u32) -> Option<String> {
+    let at = (mem.kseg0(data) & 0x00FF_FFFF) as usize;
+    let d = mem.bytes().get(at..(at + 0x800).min(mem.bytes().len()))?;
+    let k = d.windows(4).position(|w| w == b"RSP ")?;
+    let text: String = d[k..]
+        .iter()
+        .take_while(|b| (0x20..0x7F).contains(*b))
+        .map(|&b| b as char)
+        .collect();
+    Some(text.trim_end().to_string())
+}
 /// Offset of `OSTask.t.data_size`.
 const TASK_DATA_SIZE: u32 = 0x34;
 
@@ -196,6 +210,15 @@ impl Media {
         self
     }
 
+    /// Uses the `n_audio` command set with one game's stream commands
+    /// skipped (see `AudioRsp::n_audio_streams`).
+    pub fn with_audio_streams(mut self, on: bool) -> Self {
+        if on {
+            self.sound = AudioRsp::n_audio_streams();
+        }
+        self
+    }
+
     /// Also saves `frame_<n>_half.png`: half-way from frame n-1 to frame n.
     pub fn with_between(mut self, on: bool) -> Self {
         self.between = on;
@@ -359,7 +382,19 @@ impl Devices for Media {
             let (sound, mem) = (&mut self.sound, &mut ctx.mem);
             let t0 = Instant::now();
             if let Err(e) = panic::catch_unwind(AssertUnwindSafe(|| sound.run(mem, list, len))) {
-                self.audio_failed = Some(panic_text(&*e));
+                // The task's microcode name and first commands, to tell
+                // which command set the game uses.
+                let data = ctx.mem.read_u32(task + TASK_UCODE_DATA);
+                let name = ucode_name(&ctx.mem, data).unwrap_or_default();
+                let words: Vec<String> = (0..len.min(64) / 4)
+                    .map(|k| format!("{:08x}", ctx.mem.read_u32(list + 4 * k)))
+                    .collect();
+                self.audio_failed = Some(format!(
+                    "{}\n    task {task:#010x}, microcode data {data:#010x} {name:?}, \
+                     list {list:#010x} ({len} bytes): {}",
+                    panic_text(&*e),
+                    words.join(" ")
+                ));
             }
             if let Some(p) = &mut self.profile {
                 p.audio_us += t0.elapsed().as_micros() as u64;
