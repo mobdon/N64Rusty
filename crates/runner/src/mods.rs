@@ -51,22 +51,37 @@ pub fn load() -> Vec<(String, libloading::Library)> {
     libs
 }
 
-/// Where the mod at `path` can be loaded from. On Android code cannot run
-/// from the shared folder the mods are put in, so it runs from a copy in
-/// the app's own folder.
+/// Where the mod at `path` is loaded from: a fresh copy for each game the
+/// program plays. Loading the same file again would hand back the copy
+/// already loaded, with its statics still set up for the game before
+/// (its RAM among them), and writing over a loaded file breaks its code.
+/// On Android the copy also has to be in the app's own folder: code cannot
+/// run from the shared folder the mods are put in.
 fn runnable(path: &std::path::Path) -> std::path::PathBuf {
+    static LOADS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     #[cfg(target_os = "android")]
-    if let (Some(dir), Some(name)) = (n64rusty_host::android::private_dir(), path.file_name()) {
-        let dir = dir.join("mods");
-        let copy = dir.join(name);
-        if std::fs::create_dir_all(&dir)
-            .and_then(|()| std::fs::copy(path, &copy))
-            .is_ok()
-        {
-            return copy;
+    let dir = n64rusty_host::android::private_dir().map(|d| d.join("mods"));
+    #[cfg(not(target_os = "android"))]
+    let dir = Some(std::env::temp_dir().join("n64rusty-mods"));
+    let (Some(dir), Some(name)) = (dir, path.file_name()) else {
+        return path.to_path_buf();
+    };
+    let n = LOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n == 0 {
+        // Copies from earlier runs; any still loaded somewhere stay.
+        for old in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let _ = std::fs::remove_file(old.path());
         }
     }
-    path.to_path_buf()
+    let copy = dir.join(format!(
+        "{}-{n}-{}",
+        std::process::id(),
+        name.to_string_lossy()
+    ));
+    match std::fs::create_dir_all(&dir).and_then(|()| std::fs::copy(path, &copy)) {
+        Ok(_) => copy,
+        Err(_) => path.to_path_buf(),
+    }
 }
 
 extern "C" fn find_rom(sha: *const u8, sha_len: usize, len: *mut usize) -> *const u8 {
