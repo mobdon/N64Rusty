@@ -39,7 +39,6 @@ pub(crate) fn home() -> Option<PathBuf> {
 }
 
 // Android key codes (android.view.KeyEvent).
-const BACK: u32 = 4;
 const DPAD_UP: u32 = 19;
 const DPAD_DOWN: u32 = 20;
 const DPAD_LEFT: u32 = 21;
@@ -111,13 +110,13 @@ pub struct Controller {
     hat: (f64, f64),
     /// The direction last turned into a start screen key.
     menu_dir: Option<KeyCode>,
-    /// The View button or Back was pressed: the start screen, in place of
+    /// The View button was pressed: the start screen, in place of
     /// the menu bar a computer has.
     start_screen: bool,
 }
 
 impl Controller {
-    /// Whether View or Back asked for the start screen since last asked.
+    /// Whether View asked for the start screen since last asked.
     pub fn wants_start_screen(&mut self) -> bool {
         std::mem::take(&mut self.start_screen)
     }
@@ -137,7 +136,8 @@ impl Controller {
                 let Some(code) = android_code(physical_key) else {
                     return false;
                 };
-                if matches!(code, BUTTON_SELECT | BACK) && *state == ElementState::Pressed {
+                // Not Back: Android also sends it for a controller's B.
+                if code == BUTTON_SELECT && *state == ElementState::Pressed {
                     self.start_screen = true;
                 }
                 let b = n64_button(code);
