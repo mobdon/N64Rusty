@@ -1265,6 +1265,11 @@ fn os_epi_start_dma(c: &mut Ctx) {
     let ram = c.mem.read_u32(mb + 8);
     let dev = c.mem.read_u32(mb + 0x0C);
     let len = c.mem.read_u32(mb + 0x10);
+    // As the system library does: the message type, and the handle.
+    const OS_MESG_TYPE_EDMAREAD: u16 = 15;
+    c.mem
+        .write_u16(mb, OS_MESG_TYPE_EDMAREAD + u16::from(dir != 0));
+    c.mem.write_u32(mb + 0x14, handle);
     let mut st = lock();
     // The system library ORs the handle base with the device address: a
     // handle may give the full address in either.
