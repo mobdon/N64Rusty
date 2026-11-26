@@ -169,8 +169,9 @@ in a file: `--save file`, and window runs default to `save.sra` in the
 per-game folder. The file is read at start and rewritten after every write
 the game makes, so closing the window or a crash loses nothing. Headless
 runs without `--save` start from blank save memory and keep nothing, so
-repeated runs stay identical. EEPROM, flash and controller pak saves are
-not done yet.
+repeated runs stay identical. An EEPROM is answered only for a game whose
+config asks for one (`eeprom`, see Per-game files). Flash and controller
+pak saves are not done yet.
 
 Guest threads start with the floating-point register mode the system
 library gives them (32-bit registers, doubles in even/odd pairs); the boot
@@ -480,6 +481,11 @@ two names with the same value keep only the first: give each its own.
 - `int_mask = 0x2`: `osSetIntMask` sets the running thread's interrupt
   lines, and retrace and timer interrupts wait while both are masked, as
   on the console. Without it the mask is reported as all enabled.
+- `eeprom = 0x200` or `0x800`: the cartridge has a 4 Kbit or 16 Kbit
+  EEPROM, answered on controller channel 4 (status, 8-byte block reads and
+  writes). It is kept in the file beside the SRAM one, with the extension
+  `eep`; headless runs without `--save` keep it for the run only. Without
+  it channel 4 does not answer, as before.
 - `readback_frames = 0xN`: a picture the game drew is forgotten once it
   has not been drawn into for N frames. Without it a picture stays ready to
   be read back for good, and a game that later reuses that memory and loads

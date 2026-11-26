@@ -1,10 +1,13 @@
-//! Cartridge save memory (battery-backed SRAM), kept in a file.
+//! Cartridge save memory (battery-backed SRAM, and an EEPROM for a game
+//! that asks for one), kept in files.
 //!
 //! The game reaches SRAM with PI DMA at physical addresses 0x0800_0000 and
 //! up. The file holds the bytes as the game sees them, in order; it is read
 //! once at start and rewritten after every write, so nothing is lost when
 //! the window closes or the run panics. Without a file the memory only
-//! lives for the run, which keeps headless runs repeatable.
+//! lives for the run, which keeps headless runs repeatable. An EEPROM (8-byte
+//! blocks through the controller port) is kept the same way, in the file
+//! beside the SRAM one with the extension `eep`.
 
 use std::path::{Path, PathBuf};
 
@@ -22,6 +25,8 @@ const SRAM_MAX: usize = 0x10_0000;
 pub struct Save {
     file: Option<PathBuf>,
     sram: Vec<u8>,
+    /// The EEPROM's bytes; empty when the game has none.
+    eeprom: Vec<u8>,
 }
 
 impl Save {
@@ -30,6 +35,7 @@ impl Save {
         Save {
             file: None,
             sram: vec![0; SRAM_SIZE],
+            eeprom: Vec::new(),
         }
     }
 
@@ -46,7 +52,41 @@ impl Save {
         Ok(Save {
             file: Some(file.to_path_buf()),
             sram,
+            eeprom: Vec::new(),
         })
+    }
+
+    /// Fits an EEPROM of `size` bytes (512 or 2048), read from its file if
+    /// there is one; bytes never written read as 0xFF.
+    pub fn set_eeprom(&mut self, size: usize) {
+        let mut data = self
+            .eep_file()
+            .and_then(|f| std::fs::read(f).ok())
+            .unwrap_or_default();
+        data.resize(size, 0xFF);
+        self.eeprom = data;
+    }
+
+    /// The EEPROM's bytes, empty if there is none.
+    pub fn eeprom(&self) -> &[u8] {
+        &self.eeprom
+    }
+
+    /// Writes an EEPROM block at `off` and rewrites its file.
+    pub fn eeprom_write(&mut self, off: usize, data: &[u8]) {
+        let Some(d) = self.eeprom.get_mut(off..off + data.len()) else {
+            return;
+        };
+        d.copy_from_slice(data);
+        if let Some(f) = self.eep_file() {
+            if let Err(e) = write_file(&f, &self.eeprom) {
+                eprintln!("warning: EEPROM not written to {}: {e}", f.display());
+            }
+        }
+    }
+
+    fn eep_file(&self) -> Option<PathBuf> {
+        self.file.as_ref().map(|f| f.with_extension("eep"))
     }
 
     /// The SRAM offset of physical PI address `phys`, if it is in SRAM.
@@ -101,6 +141,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn an_eeprom_keeps_its_blocks_in_its_own_file() {
+        let f = dir("eep").join("save.sra");
+        let mut s = Save::open(&f).unwrap();
+        assert!(s.eeprom().is_empty(), "none unless asked for");
+        s.set_eeprom(0x200);
+        assert_eq!(s.eeprom()[..2], [0xFF, 0xFF]);
+        s.eeprom_write(8, &[1, 2, 3, 4, 5, 6, 7, 8]);
+        let mut again = Save::open(&f).unwrap();
+        again.set_eeprom(0x200);
+        assert_eq!(again.eeprom()[8..16], [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert!(!f.exists(), "SRAM untouched");
     }
 
     #[test]

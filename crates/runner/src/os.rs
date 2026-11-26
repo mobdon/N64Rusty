@@ -1356,7 +1356,8 @@ fn os_si_raw_start_dma(c: &mut Ctx) {
             *b = c.mem.read_u8(buf + k as u32);
         }
         let pads = st.devices.pads();
-        run_pif(&mut st.pif, &pads);
+        let st = &mut *st;
+        run_pif(&mut st.pif, &pads, &mut st.save);
     } else {
         for (k, &b) in st.pif.iter().enumerate() {
             c.mem.write_u8(buf + k as u32, b);
@@ -1370,8 +1371,9 @@ fn os_si_raw_start_dma(c: &mut Ctx) {
 /// Answers the controller commands in a PIF command block: per channel a
 /// send length, a reply length, the command and room for the reply. No
 /// pak is plugged in: pak reads and writes answer with a bad data CRC, as an
-/// empty slot does, and the status says no pak.
-fn run_pif(pif: &mut [u8; 64], pads: &[Pad; 4]) {
+/// empty slot does, and the status says no pak. Channel 4 is the cartridge
+/// EEPROM, when the game has one (see `Save::set_eeprom`).
+fn run_pif(pif: &mut [u8; 64], pads: &[Pad; 4], save: &mut Save) {
     const NO_REPLY: u8 = 0x80;
     let (mut i, mut ch) = (0, 0);
     while i < 63 {
@@ -1389,18 +1391,38 @@ fn run_pif(pif: &mut [u8; 64], pads: &[Pad; 4]) {
                     break;
                 }
                 let pad = pads.get(ch).filter(|p| p.connected);
-                let reply: Option<Vec<u8>> = pad.and_then(|p| match pif[cmd] {
-                    0x00 | 0xFF => Some(vec![0x05, 0x00, 0x00]),
-                    0x01 => Some(vec![
-                        (p.buttons >> 8) as u8,
-                        p.buttons as u8,
-                        p.stick_x as u8,
-                        p.stick_y as u8,
-                    ]),
-                    0x02 => Some([vec![0; 32], vec![0xFF]].concat()),
-                    0x03 => Some(vec![0xFF]),
-                    _ => None,
-                });
+                let eeprom = save.eeprom().len();
+                let reply: Option<Vec<u8>> = if ch == 4 && eeprom > 0 {
+                    // Status (16 Kbit or 4 Kbit), read or write one 8-byte block.
+                    let block = usize::from(pif[cmd + 1]) * 8;
+                    match pif[cmd] {
+                        0x00 | 0xFF => {
+                            Some(vec![0x00, if eeprom > 512 { 0xC0 } else { 0x80 }, 0x00])
+                        }
+                        0x04 if block + 8 <= eeprom => {
+                            Some(save.eeprom()[block..block + 8].to_vec())
+                        }
+                        0x05 if block + 8 <= eeprom && tx >= 10 => {
+                            let data = pif[cmd + 2..cmd + 10].to_vec();
+                            save.eeprom_write(block, &data);
+                            Some(vec![0x00])
+                        }
+                        _ => None,
+                    }
+                } else {
+                    pad.and_then(|p| match pif[cmd] {
+                        0x00 | 0xFF => Some(vec![0x05, 0x00, 0x00]),
+                        0x01 => Some(vec![
+                            (p.buttons >> 8) as u8,
+                            p.buttons as u8,
+                            p.stick_x as u8,
+                            p.stick_y as u8,
+                        ]),
+                        0x02 => Some([vec![0; 32], vec![0xFF]].concat()),
+                        0x03 => Some(vec![0xFF]),
+                        _ => None,
+                    })
+                };
                 match reply {
                     Some(r) => {
                         let n = r.len().min(rx);
@@ -1832,6 +1854,34 @@ mod tests {
     }
 
     #[test]
+    fn channel_4_is_an_eeprom_only_when_the_game_has_one() {
+        let pads = [Pad::default(); 4];
+        // Four empty channels, then channel 4: status (1 out, 3 back).
+        let status = |save: &mut Save| {
+            let mut pif = [0u8; 64];
+            pif[..10].copy_from_slice(&[0, 0, 0, 0, 1, 3, 0x00, 0xFF, 0xFF, 0xFF]);
+            pif[10] = 0xFE;
+            run_pif(&mut pif, &pads, save);
+            pif
+        };
+        assert_eq!(status(&mut Save::in_memory())[5] & 0x80, 0x80, "no reply");
+        let mut save = Save::in_memory();
+        save.set_eeprom(0x800);
+        assert_eq!(status(&mut save)[7..10], [0x00, 0xC0, 0x00]);
+        // Write block 3 (10 out, 1 back), then read it (2 out, 8 back).
+        let mut pif = [0u8; 64];
+        pif[..4].copy_from_slice(&[0, 0, 0, 0]);
+        pif[4..18].copy_from_slice(&[10, 1, 0x05, 3, 1, 2, 3, 4, 5, 6, 7, 8, 0xFF, 0xFE]);
+        run_pif(&mut pif, &pads, &mut save);
+        let mut pif = [0u8; 64];
+        pif[..4].copy_from_slice(&[0, 0, 0, 0]);
+        pif[4..8].copy_from_slice(&[2, 8, 0x04, 3]);
+        pif[16] = 0xFE;
+        run_pif(&mut pif, &pads, &mut save);
+        assert_eq!(pif[8..16], [1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    #[test]
     fn ram_hash_sees_one_changed_byte() {
         let mut ram = vec![0u8; 0x1001];
         let h = ram_hash(&ram);
@@ -1921,19 +1971,19 @@ mod tests {
             1, 3, 0x00, 0xFF, 0xFF, 0xFF, 1, 4, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE,
         ];
         pif[..block.len()].copy_from_slice(&block);
-        run_pif(&mut pif, &pads);
+        run_pif(&mut pif, &pads, &mut Save::in_memory());
         assert_eq!(pif[3..6], [0x05, 0x00, 0x00]);
         assert_eq!(pif[7] & 0x80, 0x80);
         // Port 1: buttons.
         let mut pif = [0u8; 64];
         pif[..8].copy_from_slice(&[1, 4, 0x01, 0, 0, 0, 0, 0xFE]);
-        run_pif(&mut pif, &pads);
+        run_pif(&mut pif, &pads, &mut Save::in_memory());
         assert_eq!(pif[3..7], [0x10, 0x00, 5, 0xFD]);
         // Port 1: pak read (3 out, 33 back) answers with a bad CRC.
         let mut pif = [0u8; 64];
         pif[..5].copy_from_slice(&[3, 33, 0x02, 0x00, 0x00]);
         pif[38] = 0xFE;
-        run_pif(&mut pif, &pads);
+        run_pif(&mut pif, &pads, &mut Save::in_memory());
         assert_eq!(pif[37], 0xFF);
     }
 }

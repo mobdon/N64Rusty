@@ -609,6 +609,12 @@ pub fn main_args(
     };
     let names = read_names(&symbols);
     let by_name: BTreeMap<String, u32> = names.iter().map(|(a, n)| (n.clone(), *a)).collect();
+    let mut save = save;
+    // A game with a cartridge EEPROM says so in its config, with the size
+    // in bytes: `eeprom = 0x200` (4 Kbit) or `0x800` (16 Kbit).
+    if let Some(&size) = by_name.get("eeprom") {
+        save.set_eeprom(size as usize);
+    }
 
     let libs = mods::load();
     WITH_MODS.store(!libs.is_empty(), std::sync::atomic::Ordering::Relaxed);
