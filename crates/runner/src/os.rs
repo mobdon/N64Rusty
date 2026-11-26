@@ -1316,11 +1316,21 @@ fn os_pi_read_io(c: &mut Ctx) {
 }
 
 fn os_cart_rom_init(c: &mut Ctx) {
-    // OSPiHandle: type 0 (cartridge), base address 0x1000_0000.
+    // OSPiHandle: type 0 (cartridge), base address 0xB000_0000 (the DMA
+    // routines keep only the low bits), and the bus timing the boot code
+    // set from the ROM header (latency, page size, release, pulse).
     for k in 0..0x74 / 4 {
         c.mem.write_u32(CART_HANDLE + 4 * k, 0);
     }
-    c.mem.write_u32(CART_HANDLE + 0x0C, 0x1000_0000);
+    let h = lock()
+        .rom
+        .get(..4)
+        .map_or([0; 4], |b| b.try_into().unwrap());
+    c.mem.write_u8(CART_HANDLE + 5, h[3]);
+    c.mem.write_u8(CART_HANDLE + 6, h[1] & 0x0F);
+    c.mem.write_u8(CART_HANDLE + 7, h[1] >> 4);
+    c.mem.write_u8(CART_HANDLE + 8, h[2]);
+    c.mem.write_u32(CART_HANDLE + 0x0C, 0xB000_0000);
     ret(c, CART_HANDLE);
 }
 
