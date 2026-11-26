@@ -50,7 +50,16 @@ thread_local! {
 pub(crate) fn run<A: ApplicationHandler>(app: &mut A) -> Result<(), String> {
     LOOP.with_borrow_mut(|l| {
         if l.is_none() {
-            *l = Some(EventLoop::new().map_err(|e| e.to_string())?);
+            #[cfg(target_os = "android")]
+            let new = {
+                use winit::platform::android::EventLoopBuilderExtAndroid;
+                EventLoop::builder()
+                    .with_android_app(crate::android::app())
+                    .build()
+            };
+            #[cfg(not(target_os = "android"))]
+            let new = EventLoop::new();
+            *l = Some(new.map_err(|e| e.to_string())?);
         }
         let l = l.as_mut().expect("just set");
         l.run_app_on_demand(app).map_err(|e| e.to_string())
@@ -60,6 +69,13 @@ pub(crate) fn run<A: ApplicationHandler>(app: &mut A) -> Result<(), String> {
 /// Keeps `window` open for the next screen, instead of closing it.
 pub(crate) fn keep(window: Arc<Window>) {
     KEPT.set(Some(window));
+}
+
+/// Whether a screen can open its window as its event loop starts. On
+/// Android the app's window only exists once winit says `resumed`, which
+/// comes on the first run only; later runs reuse the kept window.
+pub(crate) fn ready() -> bool {
+    !cfg!(target_os = "android") || kept()
 }
 
 /// Whether the last screen kept its window open for the next one.

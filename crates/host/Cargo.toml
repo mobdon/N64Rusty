@@ -14,6 +14,13 @@ softbuffer = "0.4"
 toml = "1"
 winit = { version = "0.30", features = ["serde"] }
 
+# The Android app's activity (see src/android.rs).
+[target.'cfg(target_os = "android")'.dependencies]
+winit = { version = "0.30", features = ["serde", "android-native-activity"] }
+# The start screen draws through the GPU there: the game's window must not
+# have been drawn into by the CPU.
+n64rusty-gfx = { path = "../gfx" }
+
 # The window's menu bar and its "open a ROM" file window.
 [target.'cfg(windows)'.dependencies]
 muda = { version = "0.17", default-features = false }

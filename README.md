@@ -267,6 +267,23 @@ game program (`--frames`, `--capture`, `--window`, and so on).
 CI builds `n64rusty-play.exe` on each push to `main` and keeps it as the
 `n64rusty-play-windows` artifact of the run.
 
+### Android
+
+`crates/android` builds the same player as an Android app (64-bit phones),
+to install by hand, not through a store. It needs the Android SDK and NDK
+(`ANDROID_HOME`, `ANDROID_NDK_ROOT`), `rustup target add
+aarch64-linux-android` and `cargo install cargo-apk`, then:
+
+    cargo apk build --release -p n64rusty-android
+
+with `CARGO_APK_RELEASE_KEYSTORE` and `CARGO_APK_RELEASE_KEYSTORE_PASSWORD`
+naming a signing key (the SDK's debug key will do). The APK lands in
+`target/release/apk/N64Rusty.apk`. ROMs go in the app's folder on the phone,
+`Android/data/dev.n64rusty.player/files` (for example with `adb push`). A
+controller plays: A is A, X is B, LT is Z, RB and RT are R, and the
+C-buttons are Y, B, LB and the right stick click; the left stick and D-pad
+are the console's. The right stick does not reach the app.
+
 ## Window and input
 
 `crates/host` runs the frame loop around a game. A game plugs in through the

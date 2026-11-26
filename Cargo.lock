@@ -1662,6 +1662,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "n64rusty-android"
+version = "0.0.0"
+dependencies = [
+ "n64rusty-host",
+ "n64rusty-rom",
+ "n64rusty-runner",
+]
+
+[[package]]
 name = "n64rusty-audio"
 version = "0.0.0"
 dependencies = [
@@ -1694,6 +1703,7 @@ dependencies = [
  "font8x8",
  "gilrs",
  "muda",
+ "n64rusty-gfx",
  "rfd",
  "serde",
  "softbuffer",

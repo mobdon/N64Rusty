@@ -41,11 +41,14 @@ mod built {
 const FROM_MAP: &str = "// from a symbol map";
 
 fn main() -> ExitCode {
-    let mut args: Vec<String> = std::env::args().skip(1).collect();
-    let dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(Path::to_path_buf))
-        .unwrap_or_default();
+    let args = std::env::args().skip(1).collect();
+    start(args, &n64rusty_host::home().unwrap_or_default())
+}
+
+/// The player with `args`, its files in `dir`. The Android app (which
+/// builds this file into itself) calls it with none.
+pub fn start(mut args: Vec<String>, dir: &Path) -> ExitCode {
+    let dir = dir.to_path_buf();
     // Only a ROM (or nothing): a friend's double-click or drop.
     let plain = args.len() <= 1;
     let log = console(&dir);

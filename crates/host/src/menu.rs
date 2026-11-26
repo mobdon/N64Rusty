@@ -34,7 +34,7 @@ pub static START_SCREEN: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 
 /// The `mods` folder next to the program.
 pub fn mods_dir() -> Option<std::path::PathBuf> {
-    Some(std::env::current_exe().ok()?.parent()?.join("mods"))
+    Some(crate::home()?.join("mods"))
 }
 
 /// Mod files in [`mods_dir`] with whether each is on (a name ending in
@@ -116,10 +116,7 @@ pub const REFRESH: [(&str, Option<f64>); 4] = [
 /// ROMs played before, newest first: `recent.txt` next to the program,
 /// one path per line (the player keeps it). Only files still there.
 pub fn recent_roms() -> Vec<std::path::PathBuf> {
-    let Some(dir) = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-    else {
+    let Some(dir) = crate::home() else {
         return Vec::new();
     };
     // last-rom.txt: the one ROM older players remembered.

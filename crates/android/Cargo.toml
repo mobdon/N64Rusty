@@ -1,0 +1,40 @@
+[package]
+name = "n64rusty-android"
+description = "The N64Rusty player as an Android app (an .apk built with cargo-apk)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version = "1.88"
+publish = false
+# The player's built-in data, as for n64rusty-play.
+build = "../runner/build.rs"
+
+[lib]
+name = "n64rusty"
+crate-type = ["cdylib"]
+
+# Empty on other systems, so the workspace still builds everywhere.
+[target.'cfg(target_os = "android")'.dependencies]
+n64rusty-host = { path = "../host" }
+n64rusty-rom = { path = "../rom" }
+n64rusty-runner = { path = "../runner" }
+
+# cargo apk build --release -p n64rusty-android (see README: Android).
+[package.metadata.android]
+package = "dev.n64rusty.player"
+apk_name = "N64Rusty"
+build_targets = ["aarch64-linux-android"]
+
+[package.metadata.android.sdk]
+min_sdk_version = 26
+target_sdk_version = 35
+
+[package.metadata.android.application]
+label = "N64Rusty"
+
+[package.metadata.android.application.activity]
+orientation = "sensorLandscape"
+# Folding, unfolding and turning the phone keep the game running instead
+# of starting the app again.
+config_changes = "orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density"

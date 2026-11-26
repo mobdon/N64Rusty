@@ -381,7 +381,7 @@ pub fn message(head: &str, body: &str) -> bool {
     let mut app = Screens::new(ui, true);
     let shown = crate::one_window::run(&mut app).is_ok() && app.shown;
     // Read and dismissed, not closed: the next screen uses this window.
-    app.surface = None;
+    app.let_go();
     if let (false, Some(w)) = (app.closed, app.window.take()) {
         crate::one_window::keep(w);
     }
@@ -393,7 +393,7 @@ fn run(ui: Ui) -> Option<PathBuf> {
     let mut app = Screens::new(ui, false);
     crate::one_window::run(&mut app).ok()?;
     let picked = app.picked.take()?;
-    app.surface = None;
+    app.let_go();
     if let Some(w) = app.window.take() {
         crate::one_window::keep(w);
     }
@@ -412,9 +412,24 @@ struct Screens {
     shown: bool,
     /// The player closed the window.
     closed: bool,
+    #[cfg(target_os = "android")]
+    pad: crate::android::Controller,
+    /// On Android the screen draws through the GPU, as the game does: a
+    /// window the CPU has drawn into cannot be the GPU's afterwards.
+    #[cfg(target_os = "android")]
+    gpu: Option<(n64rusty_gfx::Renderer, n64rusty_gfx::WindowTarget)>,
 }
 
 impl Screens {
+    /// Stops drawing into the window, so the next screen can.
+    fn let_go(&mut self) {
+        self.surface = None;
+        #[cfg(target_os = "android")]
+        {
+            self.gpu = None;
+        }
+    }
+
     fn new(ui: Ui, message_only: bool) -> Screens {
         Screens {
             ui,
@@ -425,6 +440,10 @@ impl Screens {
             picked: None,
             shown: false,
             closed: false,
+            #[cfg(target_os = "android")]
+            pad: Default::default(),
+            #[cfg(target_os = "android")]
+            gpu: None,
         }
     }
 
@@ -461,6 +480,28 @@ impl Screens {
 
     fn redraw(&mut self) {
         let (ww, wh, k, ox, oy) = self.fit();
+        #[cfg(target_os = "android")]
+        if let Some((renderer, target)) = self.gpu.as_mut() {
+            let rgba: Vec<u8> = self
+                .ui
+                .draw()
+                .iter()
+                .flat_map(|&p| [(p >> 16) as u8, (p >> 8) as u8, p as u8, 255])
+                .collect();
+            let rect = (ox as u32, oy as u32, (W * k) as u32, (H * k) as u32);
+            let r = renderer.present_pixels(
+                &rgba,
+                (W as u32, H as u32),
+                target,
+                ww as u32,
+                wh as u32,
+                rect,
+            );
+            if let Err(e) = r {
+                eprintln!("warning: start screen not shown: {e}");
+            }
+            return;
+        }
         let Some(surface) = self.surface.as_mut() else {
             return;
         };
@@ -490,12 +531,18 @@ impl ApplicationHandler for Screens {
     // Each run of the shared event loop starts here; `resumed` may not come
     // again on a later run.
     fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: winit::event::StartCause) {
-        if cause == winit::event::StartCause::Init {
+        if cause == winit::event::StartCause::Init && crate::one_window::ready() {
             self.resumed(event_loop);
         }
     }
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        // Back from the home screen on Android: draw on the new surface.
+        #[cfg(target_os = "android")]
+        if let Some(w) = self.window.take() {
+            self.let_go();
+            crate::one_window::keep(w);
+        }
         if self.window.is_some() {
             return;
         }
@@ -517,6 +564,27 @@ impl ApplicationHandler for Screens {
             }
         };
         window.set_title("N64Rusty");
+        #[cfg(target_os = "android")]
+        {
+            let gpu = n64rusty_gfx::Renderer::new().and_then(|r| {
+                let t = r.window_target(window.clone())?;
+                Ok((r, t))
+            });
+            match gpu {
+                Ok(g) => {
+                    self.gpu = Some(g);
+                    self.shown = true;
+                }
+                Err(e) => {
+                    eprintln!("error: the start screen cannot draw: {e}");
+                    event_loop.exit();
+                }
+            }
+            window.request_redraw();
+            self.window = Some(window);
+            return;
+        }
+        #[allow(unreachable_code)]
         let surface = softbuffer::Context::new(window.clone())
             .and_then(|c| softbuffer::Surface::new(&c, window.clone()));
         match surface {
@@ -534,15 +602,33 @@ impl ApplicationHandler for Screens {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
-        let mut changed = true;
-        match event {
+        // A phone: its controller drives the keys, a finger the mouse.
+        #[cfg(target_os = "android")]
+        if let Some(key) = self.pad.menu_key(&event) {
+            let changed = self.key(event_loop, key);
+            return self.changed(changed);
+        }
+        #[cfg(target_os = "android")]
+        if let WindowEvent::Touch(t) = &event {
+            let changed = match t.phase {
+                winit::event::TouchPhase::Started => self.point(t.location),
+                winit::event::TouchPhase::Ended => {
+                    self.point(t.location);
+                    self.click(event_loop, true)
+                }
+                _ => false,
+            };
+            return self.changed(changed);
+        }
+        let changed = match event {
             WindowEvent::CloseRequested => {
                 self.closed = true;
                 event_loop.exit();
+                true
             }
             WindowEvent::RedrawRequested | WindowEvent::Resized(_) => {
                 self.redraw();
-                changed = false;
+                false
             }
             WindowEvent::KeyboardInput {
                 event:
@@ -552,37 +638,63 @@ impl ApplicationHandler for Screens {
                         ..
                     },
                 ..
-            } => match key {
-                KeyCode::Escape if self.ui.message.is_some() => self.activate(event_loop),
-                KeyCode::Escape => event_loop.exit(),
-                KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Space => self.activate(event_loop),
-                _ if self.ui.message.is_none() => self.ui.key(key),
-                _ => changed = false,
-            },
-            WindowEvent::CursorMoved { position, .. } => {
-                let (_, _, k, ox, oy) = self.fit();
-                let x = (position.x as isize - ox as isize) / k as isize;
-                let y = (position.y as isize - oy as isize) / k as isize;
-                self.cursor = Some((x, y));
-                match self.ui.hit(x, y) {
-                    Some(Hit::Item(i)) if self.ui.message.is_none() && i != self.ui.sel => {
-                        self.ui.sel = i
-                    }
-                    _ => changed = false,
-                }
-            }
+            } => self.key(event_loop, key),
+            WindowEvent::CursorMoved { position, .. } => self.point(position),
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
                 button: MouseButton::Left,
                 ..
-            } => match self.cursor.and_then(|(x, y)| self.ui.hit(x, y)) {
-                _ if self.ui.message.is_some() => self.activate(event_loop),
-                Some(Hit::Tab(page)) => self.ui.switch(page),
-                Some(Hit::Item(i)) if i == self.ui.sel => self.activate(event_loop),
-                _ => changed = false,
-            },
-            _ => changed = false,
+            } => self.click(event_loop, false),
+            _ => false,
+        };
+        self.changed(changed);
+    }
+}
+
+impl Screens {
+    /// A key press; true if the screen changed.
+    fn key(&mut self, event_loop: &ActiveEventLoop, key: KeyCode) -> bool {
+        match key {
+            KeyCode::Escape if self.ui.message.is_some() => self.activate(event_loop),
+            KeyCode::Escape => event_loop.exit(),
+            KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Space => self.activate(event_loop),
+            _ if self.ui.message.is_none() => self.ui.key(key),
+            _ => return false,
         }
+        true
+    }
+
+    /// The pointer moved to `position`; true if the selection changed.
+    fn point(&mut self, position: winit::dpi::PhysicalPosition<f64>) -> bool {
+        let (_, _, k, ox, oy) = self.fit();
+        let x = (position.x as isize - ox as isize) / k as isize;
+        let y = (position.y as isize - oy as isize) / k as isize;
+        self.cursor = Some((x, y));
+        match self.ui.hit(x, y) {
+            Some(Hit::Item(i)) if self.ui.message.is_none() && i != self.ui.sel => {
+                self.ui.sel = i;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// A click (or a tap, which picks an item at once); true if the screen
+    /// changed.
+    fn click(&mut self, event_loop: &ActiveEventLoop, tap: bool) -> bool {
+        match self.cursor.and_then(|(x, y)| self.ui.hit(x, y)) {
+            _ if self.ui.message.is_some() => self.activate(event_loop),
+            Some(Hit::Tab(page)) => self.ui.switch(page),
+            Some(Hit::Item(i)) if i == self.ui.sel || tap => {
+                self.ui.sel = i;
+                self.activate(event_loop)
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn changed(&self, changed: bool) {
         if changed {
             if let Some(w) = &self.window {
                 w.request_redraw();
@@ -617,12 +729,7 @@ fn item_rect(page: Page, i: usize) -> (usize, usize, usize, usize) {
 
 /// Settings next to the program, shared by every game.
 fn settings_path() -> Option<PathBuf> {
-    Some(
-        std::env::current_exe()
-            .ok()?
-            .parent()?
-            .join("settings.toml"),
-    )
+    Some(crate::home()?.join("settings.toml"))
 }
 
 fn load_settings() -> RunConfig {

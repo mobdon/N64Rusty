@@ -1495,9 +1495,87 @@ impl Renderer {
         width: u32,
         height: u32,
     ) -> Result<(), RenderError> {
+        let Some(texture) = self.surface_texture(win, width, height) else {
+            return Ok(());
+        };
+        let blit = win
+            .blit
+            .get_or_insert_with(|| Blit::new(&self.device, win.view_format));
+        let view = texture.texture.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(win.view_format),
+            ..Default::default()
+        });
+        let rect = self.place(frame, width, height);
+        let (src, mut encoder) = self.draw(frame, transforms, rect.2, rect.3);
+        blit.record(&self.device, &mut encoder, &src, &view, rect);
+        let t0 = std::time::Instant::now();
+        self.queue.submit([encoder.finish()]);
+        self.queue.present(texture);
+        self.stats.submit_us += t0.elapsed().as_micros() as u64;
+        Ok(())
+    }
+
+    /// Shows `w` x `h` pixels (RGBA bytes) in a window of `width` x
+    /// `height` at `rect` (x, y, width, height), black elsewhere: a screen
+    /// drawn on the CPU, where the window must stay the GPU's (Android).
+    #[allow(clippy::too_many_arguments)]
+    pub fn present_pixels(
+        &mut self,
+        rgba: &[u8],
+        (w, h): (u32, u32),
+        win: &mut WindowTarget,
+        width: u32,
+        height: u32,
+        rect: (u32, u32, u32, u32),
+    ) -> Result<(), RenderError> {
+        let Some(texture) = self.surface_texture(win, width, height) else {
+            return Ok(());
+        };
+        let size = wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        };
+        let src = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("pixels"),
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            ..target_desc(size)
+        });
+        self.queue.write_texture(
+            src.as_image_copy(),
+            rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * w),
+                rows_per_image: Some(h),
+            },
+            size,
+        );
+        let blit = win
+            .blit
+            .get_or_insert_with(|| Blit::new(&self.device, win.view_format));
+        let view = texture.texture.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(win.view_format),
+            ..Default::default()
+        });
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        blit.record(&self.device, &mut encoder, &src, &view, rect);
+        self.queue.submit([encoder.finish()]);
+        self.queue.present(texture);
+        Ok(())
+    }
+
+    /// The window's next picture to draw into, at `width` x `height`; none
+    /// while the window cannot take one (minimised, being resized).
+    fn surface_texture(
+        &self,
+        win: &mut WindowTarget,
+        width: u32,
+        height: u32,
+    ) -> Option<wgpu::SurfaceTexture> {
         let max = self.device.limits().max_texture_dimension_2d;
         if width == 0 || height == 0 || width > max || height > max {
-            return Ok(());
+            return None;
         }
         if win.size != Some((width, height)) {
             win.surface.configure(
@@ -1516,33 +1594,18 @@ impl Renderer {
             );
             win.size = Some((width, height));
         }
-        let texture = match win.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(t) => t,
+        match win.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(t) => Some(t),
             wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
                 win.size = None; // configure again next frame
-                t
+                Some(t)
             }
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 win.size = None;
-                return Ok(());
+                None
             }
-            _ => return Ok(()),
-        };
-        let blit = win
-            .blit
-            .get_or_insert_with(|| Blit::new(&self.device, win.view_format));
-        let view = texture.texture.create_view(&wgpu::TextureViewDescriptor {
-            format: Some(win.view_format),
-            ..Default::default()
-        });
-        let rect = self.place(frame, width, height);
-        let (src, mut encoder) = self.draw(frame, transforms, rect.2, rect.3);
-        blit.record(&self.device, &mut encoder, &src, &view, rect);
-        let t0 = std::time::Instant::now();
-        self.queue.submit([encoder.finish()]);
-        self.queue.present(texture);
-        self.stats.submit_us += t0.elapsed().as_micros() as u64;
-        Ok(())
+            _ => None,
+        }
     }
 
     /// Like [`Renderer::present`], into an off-screen image of `width` x

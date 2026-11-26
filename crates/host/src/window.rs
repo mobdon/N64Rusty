@@ -44,6 +44,8 @@ pub fn run_windowed<G: Guest>(guest: G, cfg: &RunConfig) -> Result<G, String> {
         gilrs,
         named: Vec::new(),
         error: None,
+        #[cfg(target_os = "android")]
+        pad: Default::default(),
     };
     crate::one_window::run(&mut app)?;
     if let Some(e) = app.error {
@@ -73,6 +75,9 @@ struct App<G> {
     /// Controllers already named on the console.
     named: Vec<gilrs::GamepadId>,
     error: Option<String>,
+    /// A phone's controller, on the first port.
+    #[cfg(target_os = "android")]
+    pad: crate::android::Controller,
 }
 
 impl<G: Guest> App<G> {
@@ -169,6 +174,10 @@ impl<G: Guest> App<G> {
                 println!("controller gamepad{n}: {}", gp.name());
             }
         }
+        #[cfg(target_os = "android")]
+        {
+            pads[0] = pads[0].merge(self.pad.pad());
+        }
         for (pad, port) in pads.iter_mut().zip(&self.cfg.ports) {
             if let Some(map) = &port.keyboard {
                 *pad = pad.merge(map.pad(&self.keys));
@@ -187,13 +196,18 @@ impl<G: Guest> ApplicationHandler for App<G> {
     // Each run of the shared event loop starts here; `resumed` may not come
     // again on a later run.
     fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: winit::event::StartCause) {
-        if cause == winit::event::StartCause::Init {
+        if cause == winit::event::StartCause::Init && crate::one_window::ready() {
             self.resumed(event_loop);
         }
     }
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_some() {
+        if let Some(w) = &self.window {
+            // Back from the home screen on Android: a new surface to draw on.
+            if cfg!(target_os = "android") {
+                self.session.guest.attach_window(w.clone());
+                self.view();
+            }
             return;
         }
         let scale = self.cfg.window.scale as f64;
@@ -231,6 +245,10 @@ impl<G: Guest> ApplicationHandler for App<G> {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
+        #[cfg(target_os = "android")]
+        if self.pad.event(&event) {
+            return;
+        }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::KeyboardInput {

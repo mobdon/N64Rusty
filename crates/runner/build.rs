@@ -8,6 +8,11 @@ use std::fmt::Write;
 use std::path::Path;
 
 fn main() {
+    // On Android, sound (cpal through Oboe) is C++: link its runtime in.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("android") {
+        println!("cargo:rustc-link-lib=c++_static");
+        println!("cargo:rustc-link-lib=c++abi");
+    }
     println!("cargo:rerun-if-env-changed=N64RUSTY_PLAYER_DATA");
     let mut out = String::from("pub const FILES: &[(&str, &str)] = &[\n");
     if let Some(dir) = std::env::var_os("N64RUSTY_PLAYER_DATA") {
