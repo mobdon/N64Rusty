@@ -59,14 +59,13 @@ const RIGHT_STICK: u64 = u64::MAX;
 const TRIGGERS: u64 = u64::MAX - 1;
 const HAT: u64 = u64::MAX - 2;
 
-/// The console button for a controller button, as on a computer (see
-/// `mapping::PadMap::default`): A is A, B is B, X and Y are C-down and
-/// C-up, LT and RB are Z, LB is L, RT is R.
+/// The console button for a controller button: A is A, B is B, LT and RB
+/// are Z, LB is L, RT is R, Y is C-up (first-person view); X does nothing:
+/// the right stick is the C-buttons (the owner's choice).
 fn n64_button(code: u32) -> u16 {
     match code {
         BUTTON_A => button::A,
         BUTTON_B => button::B,
-        BUTTON_X => button::C_DOWN,
         BUTTON_Y => button::C_UP,
         BUTTON_L2 | BUTTON_R1 => button::Z,
         BUTTON_L1 => button::L,
@@ -264,7 +263,8 @@ mod tests {
     fn controller_buttons_map_as_on_a_computer() {
         assert_eq!(n64_button(BUTTON_A), button::A);
         assert_eq!(n64_button(BUTTON_B), button::B);
-        assert_eq!(n64_button(BUTTON_X), button::C_DOWN);
+        assert_eq!(n64_button(BUTTON_X), 0);
+        assert_eq!(n64_button(BUTTON_Y), button::C_UP);
         assert_eq!(n64_button(BUTTON_R1), button::Z);
         assert_eq!(n64_button(12345), 0);
     }
