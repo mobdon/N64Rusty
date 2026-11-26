@@ -89,6 +89,9 @@ pub(crate) struct ShaderKey {
     pub flat: bool,
     /// Magnified textures keep crisp texel edges (see [`shader`]).
     pub sharp: bool,
+    /// The first blender cycle mixes in the fog colour by shade alpha (the
+    /// fog factor), as the games' fogged surfaces do.
+    pub fog: bool,
 }
 
 fn color_input(slot: usize, code: u8) -> &'static str {
@@ -142,6 +145,7 @@ pub fn fragment_shader(combine: u64, two_cycle: bool) -> String {
         alpha_test: 0,
         flat: false,
         sharp: false,
+        fog: false,
     })
 }
 
@@ -150,7 +154,7 @@ pub(crate) fn shader(key: ShaderKey) -> String {
     let interp = if key.flat { "@interpolate(flat)" } else { "" };
     let sample = if key.sharp { "sharp" } else { "textureSample" };
     let mut s = format!(
-        "struct U {{ prim: vec4f, env: vec4f, blend: vec4f, misc: vec4f }}
+        "struct U {{ prim: vec4f, env: vec4f, blend: vec4f, misc: vec4f, fog: vec4f }}
 @group(0) @binding(0) var<uniform> u: U;
 @group(1) @binding(0) var tex0: texture_2d<f32>;
 @group(1) @binding(1) var smp0: sampler;
@@ -210,6 +214,9 @@ fn fs(v: VOut) -> @location(0) vec4f {{
         3 => s.push_str("    if (comb.a < max(u.blend.a, 0.5)) { discard; }\n"),
         _ => {}
     }
+    if key.fog {
+        s.push_str("    comb = vec4f(mix(comb.rgb, u.fog.rgb, shade.a), comb.a);\n");
+    }
     s.push_str("    return comb;\n}\n");
     s
 }
@@ -238,7 +245,8 @@ mod tests {
             two_cycle: false,
             alpha_test: 0,
             flat: false,
-            sharp: false
+            sharp: false,
+            fog: false,
         })
         .contains("(vec3f(0.0) - vec3f(0.0)) * vec3f(0.0) + u.prim.rgb"));
     }

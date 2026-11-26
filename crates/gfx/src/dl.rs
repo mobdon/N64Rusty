@@ -215,6 +215,7 @@ impl Interpreter {
                 env: [1.0; 4],
                 blend: [0.0; 4],
                 fog: [0.0; 4],
+                fog_factor: [0.0; 2],
                 textures: [None; 2],
                 rect: false,
                 texel_exact: false,
@@ -556,8 +557,11 @@ impl Interpreter {
         match index {
             0x02 => self.num_lights = (w1 / self.light_size()).min(7) as usize,
             0x06 => self.segments[(offset / 4) as usize & 0xF] = w1 & 0x00FF_FFFF,
-            // Fog factors, clip ratio, perspective norm: not
-            // needed by this renderer.
+            // Fog: multiplier and offset of the fog factor.
+            0x08 => {
+                self.state.fog_factor = [(w1 >> 16) as i16 as f32, w1 as i16 as f32];
+            }
+            // Clip ratio, perspective norm: not needed by this renderer.
             // Light colour (`gSPLightColor`): light n's two colour words
             // are at n * 24 and n * 24 + 4; the second is a copy.
             0x0A => {
@@ -590,7 +594,7 @@ impl Interpreter {
                 }
                 self.mvp = Some(m);
             }
-            0x04 | 0x08 | 0x0C | 0x0E => {}
+            0x04 | 0x0C | 0x0E => {}
             _ => self.warn(format!("moveword {index:#x} at {at:#010x}")),
         }
     }

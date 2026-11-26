@@ -55,15 +55,21 @@ impl std::error::Error for RenderError {}
 
 const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
-/// Bytes per draw in the uniform buffer (four vec4s, padded to the
+/// Bytes per draw in the uniform buffer (five vec4s, padded to the
 /// guaranteed dynamic-offset alignment).
 const UNIFORM_STRIDE: u64 = 256;
+/// The uniforms a draw uses: prim, env, blend, misc and fog colours.
+const UNIFORM_SIZE: u64 = 80;
 /// Floats per vertex: clip position, colour, two texture coordinates.
 const VERTEX_FLOATS: usize = 12;
 
 // Blender inputs: P and M pick a colour, A and B a factor.
 const BL_IN: u32 = 0;
 const BL_MEM: u32 = 1;
+const BL_FOG: u32 = 3;
+const BL_A_SHADE: u32 = 2;
+/// Geometry mode: the vertex shade alpha is the fog factor.
+const G_FOG: u32 = 0x0001_0000;
 
 /// Everything that needs its own pipeline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -109,6 +115,10 @@ fn pipe_key(s: &RenderState) -> PipeKey {
         };
         (src, dst)
     });
+    // Fogged surfaces: in two-cycle mode the first blender cycle is
+    // "FOG * SHADE_A + IN * (1 - A)", the second writes the pixel as usual.
+    let first = |k: u32| (s.other_l >> (18 + k * 4)) & 3;
+    let fog = two_cycle && !s.rect && first(3) == BL_FOG && first(2) == BL_A_SHADE;
     let zbuf = if s.rect {
         s.other_l & 4 != 0 // rectangles compare only with the primitive depth
     } else {
@@ -131,6 +141,7 @@ fn pipe_key(s: &RenderState) -> PipeKey {
             alpha_test,
             flat: !s.rect && s.geometry & 0x0020_0000 == 0,
             sharp: false,
+            fog,
         },
         blend,
         depth_test: depth && s.other_l & 0x10 != 0,
@@ -275,7 +286,7 @@ impl Renderer {
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: true,
-                    min_binding_size: wgpu::BufferSize::new(64),
+                    min_binding_size: wgpu::BufferSize::new(UNIFORM_SIZE),
                 },
                 count: None,
             }],
@@ -769,15 +780,30 @@ impl Renderer {
             }
         }
         let shift = hud_shift(frame, transforms, &clip, wide);
+        // Fog on: the vertex's shade alpha becomes its fog factor, from its
+        // depth, as the microcode computes it.
+        let mut fog = vec![None; frame.vertices.len()];
+        for d in frame.draws().filter(|d| !d.state.rect && d.state.geometry & G_FOG != 0) {
+            fog[d.first as usize..(d.first + d.count) as usize].fill(Some(d.state.fog_factor));
+        }
         let mut verts = Vec::with_capacity(frame.vertices.len() * VERTEX_FLOATS);
-        for (((v, stretch), backdrop), shift) in frame
+        for ((((v, stretch), backdrop), shift), fog) in frame
             .vertices
             .iter()
             .zip(stretch)
             .zip(backdrop)
             .zip(shift.iter().copied())
+            .zip(fog)
         {
             let mut p = at(v);
+            let mut color = v.color;
+            if let Some([mul, off]) = fog {
+                if p[3] > 0.0 {
+                    // Back from wgpu's 0 to 1 depth to the console's -1 to 1.
+                    let z = 2.0 * p[2] / p[3] - 1.0;
+                    color[3] = (z * mul + off).clamp(0.0, 255.0) / 255.0;
+                }
+            }
             match stretch {
                 // Rectangles are in pixels with w = 1.
                 Some((x0, x1)) => p[0] = 2.0 * (v.pos[0] - x0) / (x1 - x0) - 1.0,
@@ -785,7 +811,7 @@ impl Renderer {
                 None => p[0] = p[0] / wide + shift * p[3],
             }
             verts.extend_from_slice(&p);
-            verts.extend_from_slice(&v.color);
+            verts.extend_from_slice(&color);
             verts.extend_from_slice(&v.uv[0]);
             verts.extend_from_slice(&v.uv[1]);
         }
@@ -808,9 +834,9 @@ impl Renderer {
         for (i, d) in draws.iter().enumerate() {
             let s = &d.state;
             let misc = [s.prim_lod, s.k5, 0.0, 0.0];
-            let vals: Vec<f32> = [s.prim, s.env, s.blend, misc].concat();
+            let vals: Vec<f32> = [s.prim, s.env, s.blend, misc, s.fog].concat();
             let at = i * UNIFORM_STRIDE as usize;
-            uniforms[at..at + 64].copy_from_slice(&floats(&vals));
+            uniforms[at..at + UNIFORM_SIZE as usize].copy_from_slice(&floats(&vals));
         }
         let ubuf = kept_buffer(
             &self.device,
@@ -827,7 +853,7 @@ impl Renderer {
                 resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                     buffer: &ubuf,
                     offset: 0,
-                    size: wgpu::BufferSize::new(64),
+                    size: wgpu::BufferSize::new(UNIFORM_SIZE),
                 }),
             }],
         });
@@ -1679,6 +1705,7 @@ mod tests {
             env: [1.0; 4],
             blend: [0.0; 4],
             fog: [0.0; 4],
+            fog_factor: [0.0; 2],
             textures: [None; 2],
             rect: false,
             texel_exact: false,

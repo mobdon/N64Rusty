@@ -108,6 +108,9 @@ pub struct RenderState {
     pub env: [f32; 4],
     pub blend: [f32; 4],
     pub fog: [f32; 4],
+    /// The microcode's fog multiplier and offset (`G_MW_FOG`): with fog on in
+    /// the geometry mode a vertex's shade alpha is `ndc z * mul + off`, 0 to 255.
+    pub fog_factor: [f32; 2],
     /// Indices into [`Frame::textures`] for tile 0 and tile 1 of the draw.
     pub textures: [Option<u32>; 2],
     /// Screen-space rectangle (fill or texture rectangle), not a triangle.
