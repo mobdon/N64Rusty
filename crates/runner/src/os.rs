@@ -648,7 +648,8 @@ fn deliver_due(c: &mut Ctx, st: &mut State) {
             st.timers.insert(
                 k,
                 Timer {
-                    at: due_at(t.at, t.interval),
+                    // libultra __osTimerInterrupt: value = interval from the count read at service time.
+                    at: due_at(c.clock, t.interval),
                     ..t
                 },
             );
@@ -2497,7 +2498,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "bug: a late periodic timer re-arms from its due time, not from when it is serviced as libultra does"]
     fn a_late_periodic_timer_re_arms_one_interval_after_it_is_serviced() {
         // libultra __osTimerInterrupt sets value = interval relative to the
         // count it read, so a late timer fires once, not once per lost period.
