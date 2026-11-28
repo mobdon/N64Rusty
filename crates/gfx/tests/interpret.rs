@@ -1300,3 +1300,48 @@ fn interpret_frame_time() {
         );
     }
 }
+
+#[test]
+fn texture_reads_and_image_writes_past_ram_are_warnings() {
+    const CYCLE_COPY: u32 = 2 << 20;
+    let end = RAM_SIZE as u32;
+    let mut ram = Ram::default();
+    let tex = ram.put(&[0x07, 0xC1].repeat(16));
+    // An 8-wide 16-bit image whose second row lies just past RAM.
+    let image = end - 8 * 2;
+    let mut dl = Dl::default();
+    setup(&mut ram, &mut dl);
+    dl.cimg(image, 8)
+        .other_modes(CYCLE_FILL, 0)
+        .fill_color(0xF801_F801)
+        .fill_rect(0, 0, 7, 1)
+        // 16 texels of 2 bytes from 8 bytes before the end of RAM.
+        .timg(0, 2, 1, end - 8)
+        .tile(0, 2, 0, 0, 7)
+        .load_block(7, 16)
+        .other_modes(CYCLE_COPY, 0)
+        .timg(0, 2, 1, tex)
+        .load_block(7, 16)
+        .tile(0, 2, 1, 0, 0)
+        .tile_size(0, 4, 4)
+        .tex_rect(0, [0, 1, 3, 1], [0, 0], [4 << 10, 1 << 10])
+        .end();
+    let addr = ram.dl(&dl);
+    let mut it = Interpreter::new();
+    let mut rb = Solid { asked: Vec::new() };
+    it.run_readback(&mut ram.bytes, addr, &mut rb).unwrap();
+    let f = it.take_frame();
+    // The part inside RAM is still written.
+    assert_eq!(ram.bytes[image as usize..image as usize + 2], [0xF8, 0x01]);
+    let has = |what: &str| f.warnings.iter().any(|w| w.contains(what));
+    assert!(has("fill rectangle into image"), "{:?}", f.warnings);
+    assert!(
+        has(&format!("reads {end:#010x}, past the end of RAM")),
+        "{:?}",
+        f.warnings
+    );
+    assert!(has("copy rectangle into image"), "{:?}", f.warnings);
+    // The fill counts as drawn, so the load reads it back over the end too.
+    assert!(has("read back past the end of RAM"), "{:?}", f.warnings);
+    assert_eq!(f.warnings.len(), 4, "{:?}", f.warnings);
+}

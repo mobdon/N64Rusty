@@ -627,16 +627,10 @@ impl Interpreter {
                     if let (Some(rb), Some(m)) = (rb.as_deref_mut(), ram.w()) {
                         self.read_back(m, rb);
                     }
-                    match w0 >> 24 {
-                        G_LOADTLUT => self.tmem.load_tlut(ram.r(), w1),
-                        G_LOADBLOCK => self.tmem.load_block(ram.r(), w0, w1),
-                        _ => self.tmem.load_tile(ram.r(), w0, w1),
-                    }
+                    self.load_texture(ram.r(), w0, w1, at);
                 }
-                G_LOADTLUT => self.tmem.load_tlut(ram.r(), w1),
+                G_LOADTLUT | G_LOADBLOCK | G_LOADTILE => self.load_texture(ram.r(), w0, w1, at),
                 G_SETTILESIZE => self.tmem.set_tile_size(w0, w1),
-                G_LOADBLOCK => self.tmem.load_block(ram.r(), w0, w1),
-                G_LOADTILE => self.tmem.load_tile(ram.r(), w0, w1),
                 G_SETTILE => self.tmem.set_tile(w0, w1),
                 G_FILLRECT => self.fill_rect(w0, w1, ram.w()),
                 G_SETFILLCOLOR => self.fill_color = w1,
@@ -711,6 +705,21 @@ impl Interpreter {
         if self.frame.width != self.cimg.1 {
             self.frame.width = self.cimg.1;
             self.rect_transform = None;
+        }
+    }
+
+    /// `G_LOADTLUT`, `G_LOADBLOCK` or `G_LOADTILE` (the opcode in `w0`) at
+    /// `at`, with a warning when it reads past the end of RAM.
+    fn load_texture(&mut self, rdram: &[u8], w0: u32, w1: u32, at: u32) {
+        let loaded = match w0 >> 24 {
+            G_LOADTLUT => self.tmem.load_tlut(rdram, w1),
+            G_LOADBLOCK => self.tmem.load_block(rdram, w0, w1),
+            _ => self.tmem.load_tile(rdram, w0, w1),
+        };
+        if let Err(addr) = loaded {
+            self.warn(format!(
+                "texture load at {at:#010x} reads {addr:#010x}, past the end of RAM: read as 0"
+            ));
         }
     }
 
@@ -1231,7 +1240,11 @@ impl Interpreter {
             ));
             return;
         }
-        put_pixels(ram, a, siz, &px);
+        if !put_pixels(ram, a, siz, &px) {
+            self.warn(format!(
+                "drawn image {a:#010x} read back past the end of RAM: those pixels dropped"
+            ));
+        }
     }
 
     /// Pixels (`x0..x1`, `y0..y1`) of the colour image inside the scissor.
@@ -1305,23 +1318,30 @@ impl Interpreter {
             // one 32-bit pixel per word.
             let (ax, ay, bx, by) = self.cpu_area(x0, y0, x1 + 1.0, y1 + 1.0);
             let (a, w, siz) = self.cimg;
+            let mut dropped = false;
             for y in ay..by {
                 for x in ax..bx {
                     let i = y * w + x;
-                    if siz == 3 {
-                        put_raw(ram, a + 4 * i, &self.fill_color.to_be_bytes());
+                    let written = if siz == 3 {
+                        put_raw(ram, a + 4 * i, &self.fill_color.to_be_bytes())
                     } else if siz == 1 {
                         // Four 8-bit pixels per word.
-                        put_raw(ram, a + i, &[self.fill_color.to_be_bytes()[x as usize % 4]]);
+                        put_raw(ram, a + i, &[self.fill_color.to_be_bytes()[x as usize % 4]])
                     } else {
                         let c = if x % 2 == 0 {
                             self.fill_color >> 16
                         } else {
                             self.fill_color
                         };
-                        put_raw(ram, a + 2 * i, &(c as u16).to_be_bytes());
-                    }
+                        put_raw(ram, a + 2 * i, &(c as u16).to_be_bytes())
+                    };
+                    dropped |= !written;
                 }
+            }
+            if dropped {
+                self.warn(format!(
+                    "fill rectangle into image {a:#010x} runs past the end of RAM: those pixels dropped"
+                ));
             }
         }
         if fill && self.cimg.0 == self.zimg {
@@ -1436,15 +1456,21 @@ impl Interpreter {
             let alpha_test = self.state.other_l & 3 != 0;
             let (ax, ay, bx, by) = self.cpu_area(x0, y0, x1, y1);
             let (a, w, siz) = self.cimg;
+            let mut dropped = false;
             for y in ay..by {
                 for x in ax..bx {
                     let ss = s + (x as f32 - x0) * dsdx;
                     let tt = t + (y as f32 - y0) * dtdy;
                     let c = self.tmem.texel_at(tile, ss, tt, tlut);
                     if !(alpha_test && c[3] == 0) {
-                        put_pixel(ram, a, siz, y * w + x, c);
+                        dropped |= !put_pixel(ram, a, siz, y * w + x, c);
                     }
                 }
+            }
+            if dropped {
+                self.warn(format!(
+                    "copy rectangle into image {a:#010x} runs past the end of RAM: those pixels dropped"
+                ));
             }
         }
         let (w, h) = if flip {
@@ -1511,11 +1537,13 @@ fn tri_indices(w: u32) -> [u32; 3] {
     [(w >> 16) & 0xFF, (w >> 8) & 0xFF, w & 0xFF]
 }
 
-/// Writes `bytes` at physical `at`, if it is in RAM.
-fn put_raw(ram: &mut [u8], at: u32, bytes: &[u8]) {
-    if let Some(d) = ram.get_mut(at as usize..at as usize + bytes.len()) {
-        d.copy_from_slice(bytes);
-    }
+/// Writes `bytes` at physical `at`, if it is in RAM; returns whether it was.
+fn put_raw(ram: &mut [u8], at: u32, bytes: &[u8]) -> bool {
+    let Some(d) = ram.get_mut(at as usize..at as usize + bytes.len()) else {
+        return false;
+    };
+    d.copy_from_slice(bytes);
+    true
 }
 
 /// Bytes per pixel of a colour image with pixel size code `siz`.
@@ -1529,14 +1557,14 @@ fn pixel_bytes(siz: u32) -> u32 {
 
 /// Writes RGBA8 `c` as pixel `i` of the colour image at `image` with pixel
 /// size code `siz` (3: 32-bit, 1: 8-bit, which keeps the red channel, else
-/// 16-bit RGBA5551).
-fn put_pixel(ram: &mut [u8], image: u32, siz: u32, i: u32, c: [u8; 4]) {
+/// 16-bit RGBA5551). Returns whether the pixel was in RAM.
+fn put_pixel(ram: &mut [u8], image: u32, siz: u32, i: u32, c: [u8; 4]) -> bool {
     if siz == 3 {
-        put_raw(ram, image + 4 * i, &c);
+        put_raw(ram, image + 4 * i, &c)
     } else if siz == 1 {
-        put_raw(ram, image + i, &c[..1]);
+        put_raw(ram, image + i, &c[..1])
     } else {
-        put_raw(ram, image + 2 * i, &to_rgba5551(c).to_be_bytes());
+        put_raw(ram, image + 2 * i, &to_rgba5551(c).to_be_bytes())
     }
 }
 
@@ -1548,12 +1576,13 @@ fn to_rgba5551(c: [u8; 4]) -> u16 {
 
 /// Writes the RGBA8 pixels `px` as the colour image at `image` with pixel
 /// size code `siz`, as [`put_pixel`] does each one, into one slice of RAM:
-/// pixels past the end of RAM are dropped.
-fn put_pixels(ram: &mut [u8], image: u32, siz: u32, px: &[u8]) {
-    let Some(dst) = ram.get_mut(image as usize..) else {
-        return;
-    };
+/// pixels past the end of RAM are dropped. Returns whether all were in RAM.
+fn put_pixels(ram: &mut [u8], image: u32, siz: u32, px: &[u8]) -> bool {
     let px = px.as_chunks::<4>().0;
+    let fits = image as usize + px.len() * pixel_bytes(siz) as usize <= ram.len();
+    let Some(dst) = ram.get_mut(image as usize..) else {
+        return fits;
+    };
     match siz {
         3 => {
             let n = px.len().min(dst.len() / 4) * 4;
@@ -1564,6 +1593,7 @@ fn put_pixels(ram: &mut [u8], image: u32, siz: u32, px: &[u8]) {
             .zip(px)
             .for_each(|(d, c)| *d = to_rgba5551(*c).to_be_bytes()),
     }
+    fits
 }
 
 pub(crate) fn rgba5551(c: u16) -> [f32; 4] {
@@ -1604,10 +1634,13 @@ mod tests {
     }
 
     /// The per-pixel writes `put_pixels` stands in for: the reference.
-    fn put_each(ram: &mut [u8], image: u32, siz: u32, px: &[u8]) {
+    /// Returns whether every pixel was in RAM.
+    fn put_each(ram: &mut [u8], image: u32, siz: u32, px: &[u8]) -> bool {
+        let mut all = true;
         for (i, p) in px.as_chunks::<4>().0.iter().enumerate() {
-            put_pixel(ram, image, siz, i as u32, *p);
+            all &= put_pixel(ram, image, siz, i as u32, *p);
         }
+        all
     }
 
     #[test]
@@ -1618,9 +1651,10 @@ mod tests {
             for image in [0, 3, 1000, 1023, 1024, 2000] {
                 let mut want = vec![0xA5; 1024];
                 let mut got = want.clone();
-                put_each(&mut want, image, siz, &px);
-                put_pixels(&mut got, image, siz, &px);
+                let fit = put_each(&mut want, image, siz, &px);
+                assert_eq!(put_pixels(&mut got, image, siz, &px), fit, "siz {siz} image {image}");
                 assert_eq!(got, want, "siz {siz} image {image}");
+                assert_eq!(fit, image <= 3, "siz {siz} image {image}");
             }
         }
     }
@@ -1632,7 +1666,7 @@ mod tests {
     fn put_pixels_timing() {
         let px: Vec<u8> = (0..640 * 480 * 4).map(|k| k as u8).collect();
         let mut ram = vec![0; 8 << 20];
-        let mut time = |put: fn(&mut [u8], u32, u32, &[u8]), siz| {
+        let mut time = |put: fn(&mut [u8], u32, u32, &[u8]) -> bool, siz| {
             let t = std::time::Instant::now();
             for _ in 0..100 {
                 put(std::hint::black_box(&mut ram), 0x10_0000, siz, &px);

@@ -94,22 +94,16 @@ fn explore(img: &Image, s: u32, known: &BTreeSet<u32>) -> Explored {
             let cti = |x: u32| Inst::decode(x).flow() != Flow::Next;
             ex.bad |= (i.op == Op::Unknown && w >> 26 != 0x10)
                 || (cti(w) && img.word(a + 4).is_some_and(cti));
-            // Track constants built with lui/addiu/ori, for function
-            // pointers and for register jumps to a known address.
-            let known_value = match i.op {
-                Op::Lui => Some((i.uimm() as u32) << 16),
-                Op::Addiu => lui[i.rs as usize].map(|hi| {
-                    let v = hi.wrapping_add(i.simm() as u32);
-                    ex.pointers.push(v);
-                    v
-                }),
-                Op::Ori => lui[i.rs as usize].map(|hi| hi | i.uimm() as u32),
-                _ => None,
-            };
-            if let Some(d) = i.dest() {
-                lui[d as usize] = known_value;
-            }
+            track_constant(i, &mut lui, &mut ex.pointers);
             let delay = a + 4;
+            // A register jump reads its register before the delay slot runs.
+            let jump_reg = lui[i.rs as usize];
+            if i.flow() != Flow::Next {
+                // The delay slot runs before the target. A likely branch's
+                // runs only on the taken path, which starts a fresh tracker.
+                let likely = matches!(i.flow(), Flow::Branch { likely: true, .. });
+                track_delay_slot(img, delay, likely, &mut lui, &mut ex.pointers);
+            }
             match i.flow() {
                 Flow::Next => {
                     a += 4;
@@ -139,7 +133,7 @@ fn explore(img: &Image, s: u32, known: &BTreeSet<u32>) -> Explored {
                     a += 8;
                 }
                 Flow::JumpReg { link: true } => {
-                    if let Some(t) = lui[i.rs as usize] {
+                    if let Some(t) = jump_reg {
                         ex.calls.push(t);
                     }
                     a += 8;
@@ -156,7 +150,7 @@ fn explore(img: &Image, s: u32, known: &BTreeSet<u32>) -> Explored {
                 }
                 Flow::JumpReg { link: false } => {
                     touch(delay, &mut ex.end);
-                    if let Some(t) = lui[i.rs as usize].filter(|_| i.rs != 31) {
+                    if let Some(t) = jump_reg.filter(|_| i.rs != 31) {
                         // Jump to a constant address: a tail call.
                         ex.calls.push(t);
                     } else if i.rs != 31 {
@@ -175,9 +169,47 @@ fn explore(img: &Image, s: u32, known: &BTreeSet<u32>) -> Explored {
     ex
 }
 
+/// Tracks constants built with lui/addiu/ori, for function pointers and
+/// for register jumps to a known address: `lui` holds each register's
+/// known value, and every `addiu` from a known `lui` is a candidate pointer.
+fn track_constant(i: Inst, lui: &mut [Option<u32>; 32], pointers: &mut Vec<u32>) {
+    let known_value = match i.op {
+        Op::Lui => Some((i.uimm() as u32) << 16),
+        Op::Addiu => lui[i.rs as usize].map(|hi| {
+            let v = hi.wrapping_add(i.simm() as u32);
+            pointers.push(v);
+            v
+        }),
+        Op::Ori => lui[i.rs as usize].map(|hi| hi | i.uimm() as u32),
+        _ => None,
+    };
+    if let Some(d) = i.dest() {
+        lui[d as usize] = known_value;
+    }
+}
+
+/// Tracks the delay slot at `delay`, which explore steps over. A likely
+/// branch's slot is skipped on the fall-through path that continues here, so
+/// its pointer is kept but the register keeps its old value.
+fn track_delay_slot(
+    img: &Image,
+    delay: u32,
+    likely: bool,
+    lui: &mut [Option<u32>; 32],
+    pointers: &mut Vec<u32>,
+) {
+    let Some(w) = img.word(delay) else { return };
+    let before = *lui;
+    track_constant(Inst::decode(w), lui, pointers);
+    if likely {
+        *lui = before;
+    }
+}
+
 /// Resolves the table used by `jr $rx` at `a`, if it follows the usual
 /// pattern: `sltiu` bound check, `lui base`, `addu base, base, index`,
-/// `lw rx, lo(base)`, `jr rx`.
+/// `lw rx, lo(base)`, `jr rx`. The bound is taken only from an `sltiu` on
+/// the index the `addu` adds (or the register it was shifted from).
 fn jump_table(img: &Image, a: u32, rx: u8, s: u32) -> Vec<u32> {
     let back = |k: u32| {
         a.checked_sub(4 * k)
@@ -197,12 +229,21 @@ fn jump_table(img: &Image, a: u32, rx: u8, s: u32) -> Vec<u32> {
     };
     let mut hi = None;
     let mut count = None;
+    // The index the `addu` adds to the base, then the register it was
+    // scaled from, found walking back.
+    let mut index: Vec<u8> = Vec::new();
     for k in k + 1..k + 32 {
         let Some(i) = back(k) else { break };
         if hi.is_none() && i.op == Op::Lui && i.rt == base {
             hi = Some((i.uimm() as u32) << 16);
         }
-        if count.is_none() && i.op == Op::Sltiu {
+        if index.is_empty() && i.op == Op::Addu && i.rd == base {
+            index.push(if i.rs == base { i.rt } else { i.rs });
+        } else if i.op == Op::Sll && index.contains(&i.rd) {
+            index.push(i.rt);
+        }
+        // An sltiu on another register bounds something else.
+        if count.is_none() && i.op == Op::Sltiu && index.contains(&i.rs) {
             count = Some(i.uimm() as u32);
         }
         if hi.is_some() && count.is_some() {
@@ -841,6 +882,70 @@ mod tests {
         assert_eq!(d.jump_tables, 1);
         assert_eq!(d.functions[0].jump_targets, vec![BASE + 28, BASE + 36]);
         assert_eq!(d.functions[0].words.len(), 11);
+    }
+
+    #[test]
+    fn a_jump_table_bound_must_test_its_index() {
+        // As resolves_a_jump_table, with an unrelated sltiu v0, a1, 1
+        // between the bound and the table lookup.
+        let table = BASE + 48;
+        let words = [
+            0x2C81_0002,
+            0x2CA2_0001,
+            0x3C08_0000 | (table >> 16),
+            0x0004_4880,
+            0x0109_4021,
+            0x8D0A_0000 | (table & 0xFFFF),
+            0x0140_0008,
+            NOP,
+            JR_RA,
+            NOP,
+            JR_RA,
+            NOP,
+            BASE + 32,
+            BASE + 40,
+        ];
+        let bytes = image(&words);
+        let img = Image {
+            base: BASE,
+            bytes: &bytes,
+        };
+        let d = discover(&img, &[BASE], &[], None);
+        assert_eq!(d.functions[0].jump_targets, vec![BASE + 32, BASE + 40]);
+    }
+
+    #[test]
+    fn delay_slots_update_the_constant_tracker() {
+        // lui t9, 0x8010 ; b?? a0, zero, +2 ; lui t9, 0x8020 (delay) ;
+        // jr t9 ; nop ; jr ra ; nop
+        let words = |branch: u32| {
+            image(&[
+                0x3C19_8010,
+                branch,
+                0x3C19_8020,
+                0x0320_0008,
+                NOP,
+                JR_RA,
+                NOP,
+            ])
+        };
+        let calls = |bytes: &[u8]| {
+            let img = Image { base: BASE, bytes };
+            explore(&img, BASE, &BTreeSet::new()).calls
+        };
+        // beq: the delay slot runs on both paths.
+        assert_eq!(calls(&words(0x1080_0002)), [0x8020_0000]);
+        // beql: on the fall-through path it does not run.
+        assert_eq!(calls(&words(0x5080_0002)), [0x8010_0000]);
+        // lui a0, 0x8020 ; jal 0 ; addiu a0, a0, 0x10 (delay) ; jr ra ; nop
+        let bytes = image(&[0x3C04_8020, 0x0C00_0000, 0x2484_0010, JR_RA, NOP]);
+        let img = Image {
+            base: BASE,
+            bytes: &bytes,
+        };
+        assert!(explore(&img, BASE, &BTreeSet::new())
+            .pointers
+            .contains(&0x8020_0010));
     }
 
     #[test]

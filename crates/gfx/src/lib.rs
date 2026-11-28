@@ -230,7 +230,7 @@ impl Frame {
 /// translation if that shows.
 pub fn interpolate(prev: &Frame, cur: &Frame, t: f32) -> Vec<Transform> {
     use std::collections::HashMap;
-    if prev.width != cur.width {
+    if (prev.width, prev.height()) != (cur.width, cur.height()) {
         return cur.transforms.clone();
     }
     let mut by_tag: HashMap<u32, Vec<&Transform>> = HashMap::new();
@@ -359,5 +359,12 @@ mod tests {
         let mut wider = frame(vec![tf(1, 400.0)]);
         wider.width = 640;
         assert_eq!(interpolate(&prev, &wider, 0.5), wider.transforms);
+        let mut taller = frame(vec![tf(1, 400.0)]);
+        taller.image_height = prev.height() + 8;
+        assert_eq!(interpolate(&prev, &taller, 0.5), taller.transforms);
+        // The usual shape given explicitly is the same size.
+        let mut same = frame(vec![tf(1, 400.0)]);
+        same.image_height = prev.height();
+        assert_eq!(interpolate(&prev, &same, 0.5)[0].modelview[3][0], 200.0);
     }
 }

@@ -38,6 +38,10 @@ pub(crate) fn direct(vaddr: u32) -> bool {
     vaddr.wrapping_sub(KSEG0) < DIRECT_LEN
 }
 
+/// End of the physical window RDRAM can fill (the RDRAM registers start
+/// here). Addresses below it but past the RAM installed are no memory.
+const RDRAM_WINDOW_END: usize = 0x03F0_0000;
+
 /// Physical address of the flash chip's status (read) on the PI bus.
 const FLASH_STATUS: usize = 0x0800_0000;
 /// Physical address of the flash chip's command register (write).
@@ -268,6 +272,13 @@ impl Memory {
         let Some(io) = self.io.as_deref().filter(|_| unmapped_ok(vaddr)) else {
             out_of_range(vaddr)
         };
+        // RDRAM past what is installed is not memory: libultra's
+        // osGetMemSize probes there and must not read back what it wrote.
+        if p < RDRAM_WINDOW_END {
+            past_ram(vaddr, "read as 0");
+            out.fill(0);
+            return;
+        }
         for (k, b) in out.iter_mut().enumerate() {
             let a = p + k;
             *b = match a {
@@ -295,6 +306,10 @@ impl Memory {
         let Some(io) = self.io.as_deref_mut().filter(|_| unmapped_ok(vaddr)) else {
             out_of_range(vaddr)
         };
+        if p < RDRAM_WINDOW_END {
+            past_ram(vaddr, "write dropped");
+            return;
+        }
         if let Ok(w) = <[u8; 4]>::try_from(data) {
             let w = u32::from_be_bytes(w);
             match p {
@@ -543,6 +558,13 @@ pub(crate) fn wild_hint(addr: u32) -> &'static str {
     }
 }
 
+/// Warns about an access to RDRAM addresses past the RAM installed. It is
+/// not an error, since the memory-size probe makes such accesses on purpose.
+#[cold]
+fn past_ram(vaddr: u32, what: &str) {
+    eprintln!("warning: guest access at {vaddr:#010x} is past the end of RAM, {what}");
+}
+
 #[cold]
 #[inline(never)]
 fn out_of_range(vaddr: u32) -> ! {
@@ -760,6 +782,21 @@ mod tests {
         assert_eq!(m.read_u32(0xB000_0000), 0x0102_0304);
         m.write_u16(0xA400_0010, 0xBEEF);
         assert_eq!(m.read_u16(0xA400_0010), 0xBEEF);
+    }
+
+    #[test]
+    fn rdram_past_the_end_is_not_memory() {
+        let mut m = ram();
+        m.set_io(io());
+        // Just past the 32 bytes of RAM, and the last word of the window.
+        for a in [0xA000_0020, 0x803E_FFFC] {
+            m.write_u32(a, 0x1234_5678);
+            assert_eq!(m.read_u32(a), 0, "{a:#x}");
+        }
+        assert!(m.io_mut().unwrap().regs.is_empty());
+        // The RDRAM registers just above the window are still registers.
+        m.write_u32(0xA3F0_0000, 0x1234_5678);
+        assert_eq!(m.read_u32(0xA3F0_0000), 0x1234_5678);
     }
 
     #[test]

@@ -169,14 +169,22 @@ impl Tmem {
         t.line as usize * if t.siz == 3 { 16 } else { 8 }
     }
 
-    fn copy(&mut self, rdram: &[u8], src: usize, dst: usize, len: usize) {
+    /// Copies `len` bytes of RDRAM from `src` to TMEM `dst`, stopping at the
+    /// end of TMEM. Bytes past the end of RAM read as 0, and the result is
+    /// `Err` with the first such address.
+    fn copy(&mut self, rdram: &[u8], src: usize, dst: usize, len: usize) -> Result<(), usize> {
+        let mut past = None;
         for k in 0..len {
             let d = dst + k;
             if d >= 4096 {
                 break;
             }
-            self.mem[d] = rdram.get(src + k).copied().unwrap_or(0);
+            self.mem[d] = rdram.get(src + k).copied().unwrap_or_else(|| {
+                past.get_or_insert(src + k);
+                0
+            });
         }
+        past.map_or(Ok(()), Err)
     }
 
     /// Swap the halves of each `2 * half` bytes in `len` bytes from `at`,
@@ -189,7 +197,9 @@ impl Tmem {
         }
     }
 
-    pub fn load_block(&mut self, rdram: &[u8], w0: u32, w1: u32) {
+    /// `G_LOADBLOCK`: loads a run of texels into TMEM. `Err` gives the
+    /// first RDRAM address past the end of RAM, read as 0.
+    pub fn load_block(&mut self, rdram: &[u8], w0: u32, w1: u32) -> Result<(), usize> {
         self.cache.clear();
         let tile = self.tiles[((w1 >> 24) & 7) as usize];
         let (addr, width, siz) = self.image;
@@ -199,7 +209,7 @@ impl Tmem {
         let start = ((ult * width + uls) * bits(siz) / 8) as usize;
         let len = (texels * bits(siz) as usize).div_ceil(8);
         let dst = tile.tmem as usize * 8;
-        self.copy(rdram, addr as usize + start, dst, len);
+        let copied = self.copy(rdram, addr as usize + start, dst, len);
         // The load counts rows with `dxt` (1.11 fixed point per 64-bit word)
         // and swaps the words of odd rows; with dxt 0 the game pre-swapped them.
         let (dxt, half) = (w1 & 0xFFF, odd_row_swap(siz));
@@ -208,37 +218,45 @@ impl Tmem {
                 self.swap_words(dst + g, 2 * half, half);
             }
         }
+        copied
     }
 
-    pub fn load_tile(&mut self, rdram: &[u8], w0: u32, w1: u32) {
+    /// `G_LOADTILE`: loads a rectangle of texels into TMEM. `Err` gives
+    /// the first RDRAM address past the end of RAM, read as 0.
+    pub fn load_tile(&mut self, rdram: &[u8], w0: u32, w1: u32) -> Result<(), usize> {
         self.cache.clear();
         let tile = self.tiles[((w1 >> 24) & 7) as usize];
         let (addr, width, siz) = self.image;
         let (uls, ult) = (((w0 >> 12) & 0xFFF) >> 2, (w0 & 0xFFF) >> 2);
         let (lrs, lrt) = (((w1 >> 12) & 0xFFF) >> 2, (w1 & 0xFFF) >> 2);
         let row_bytes = ((lrs.saturating_sub(uls) + 1) * bits(siz)).div_ceil(8) as usize;
+        let mut copied = Ok(());
         for (r, y) in (ult..=lrt).enumerate() {
             let src = addr + (y * width + uls) * bits(siz) / 8;
             let dst = tile.tmem as usize * 8 + r * Self::stride(&tile);
-            self.copy(rdram, src as usize, dst, row_bytes);
+            copied = copied.and(self.copy(rdram, src as usize, dst, row_bytes));
             if r % 2 == 1 {
                 self.swap_words(dst, row_bytes, odd_row_swap(siz));
             }
         }
+        copied
     }
 
     /// Palette loads write each 16-bit entry four times, one per bank.
-    pub fn load_tlut(&mut self, rdram: &[u8], w1: u32) {
+    /// `Err` gives the first RDRAM address past the end of RAM, read as 0.
+    pub fn load_tlut(&mut self, rdram: &[u8], w1: u32) -> Result<(), usize> {
         self.cache.clear();
         let tile = self.tiles[((w1 >> 24) & 7) as usize];
         let count = ((w1 >> 14) & 0x3FF) as usize + 1;
         let src = self.image.0 as usize;
+        let mut copied = Ok(());
         for i in 0..count {
             for copy in 0..4 {
                 let d = tile.tmem as usize * 8 + i * 8 + copy * 2;
-                self.copy(rdram, src + i * 2, d, 2);
+                copied = copied.and(self.copy(rdram, src + i * 2, d, 2));
             }
         }
+        copied
     }
 
     fn palette(&self, index: u32, tlut: u32) -> [u8; 4] {
@@ -682,10 +700,11 @@ mod tests {
                 let mut m = Tmem::default();
                 m.set_image(siz << 19 | 3, 0);
                 m.set_tile(fmt << 21 | siz << 19 | 1 << 9, 0);
-                match load {
+                let loaded = match load {
                     0xF4 => m.load_tile(ram, 0, 12 << 12 | 4),
                     _ => m.load_block(ram, 0, 7 << 12 | load),
-                }
+                };
+                assert_eq!(loaded, Ok(()));
                 let t = m.tiles[0];
                 let got: Vec<u8> = (0..8).map(|i| m.texel(&t, i % 4, i / 4, 0)[3]).collect();
                 assert_eq!(got, [1, 2, 3, 4, 5, 6, 7, 8], "siz {siz} load {load:#x}");

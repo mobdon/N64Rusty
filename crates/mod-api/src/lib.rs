@@ -99,20 +99,34 @@ pub struct Api {
 unsafe impl Sync for Api {}
 
 impl Api {
-    /// All of RAM; see [`Api::ram`].
+    /// All of RAM; see [`Api::ram`]. [`Api::read_u8`] and the other reads
+    /// and writes are the safe way in.
+    ///
+    /// # Safety
+    ///
+    /// While the slice is in use, nothing else may read or write RAM: no
+    /// other slice from this function, no [`Api::read_u8`]-style call, and
+    /// no call into the game ([`Api::call_original`]), which writes RAM too.
     #[allow(clippy::mut_from_ref)] // the player owns the memory; mods share it
-    pub fn ram(&self) -> &mut [u8] {
-        // SAFETY: the player's RAM lives for the whole run.
+    pub unsafe fn ram(&self) -> &mut [u8] {
+        // SAFETY: the player's RAM lives for the whole run; the caller keeps
+        // this the only access while it lives.
         unsafe { std::slice::from_raw_parts_mut(self.ram, self.ram_len) }
     }
     /// Physical address where the mods' RAM starts.
     pub fn mod_ram(&self) -> u32 {
         (self.ram_len - self.mod_ram_len) as u32
     }
-    /// The cartridge bytes; only during install, see [`Api::cart`].
+    /// The cartridge bytes; see [`Api::cart`].
+    ///
+    /// # Safety
+    ///
+    /// Only during install: the player drops the pointer afterwards. While
+    /// the slice is in use, no other slice from this function may be.
     #[allow(clippy::mut_from_ref)]
-    pub fn cart(&self) -> &mut [u8] {
-        // SAFETY: valid during install, as documented.
+    pub unsafe fn cart(&self) -> &mut [u8] {
+        // SAFETY: valid during install, and the only access, as the caller
+        // promises.
         unsafe { std::slice::from_raw_parts_mut(self.cart, self.cart_len) }
     }
     /// See [`Api::sha256`].
@@ -153,27 +167,51 @@ impl Api {
         // SAFETY: 32 registers.
         unsafe { *(self.regs)(ctx).add(i & 31) }
     }
-    fn at(&self, vaddr: u32) -> usize {
-        (vaddr & PHYS_MASK) as usize
+    /// A pointer to the `len` bytes of RAM at `vaddr` (KSEG0/KSEG1 or
+    /// physical). Panics if they run past the end of RAM.
+    fn at(&self, vaddr: u32, len: usize) -> *mut u8 {
+        let a = (vaddr & PHYS_MASK) as usize;
+        assert!(
+            a + len <= self.ram_len,
+            "mod access to {vaddr:#010x}+{len} is past the end of RAM ({:#x} bytes)",
+            self.ram_len
+        );
+        // SAFETY: inside RAM, just checked. Reads and writes go through raw
+        // pointers, never a slice, so they cannot alias one.
+        unsafe { self.ram.add(a) }
     }
-    /// The byte at `vaddr` (KSEG0/KSEG1 or physical). This and the other
-    /// reads and writes panic if the address is past the end of RAM.
+    /// Copies the bytes at `vaddr` into `out`. This and the other reads and
+    /// writes panic if the address is past the end of RAM.
+    pub fn read_bytes(&self, vaddr: u32, out: &mut [u8]) {
+        let p = self.at(vaddr, out.len());
+        // SAFETY: `at` checked the range; `out` is the mod's own memory.
+        unsafe { std::ptr::copy(p, out.as_mut_ptr(), out.len()) }
+    }
+    /// Copies `data` into RAM at `vaddr`.
+    pub fn write_bytes(&self, vaddr: u32, data: &[u8]) {
+        let p = self.at(vaddr, data.len());
+        // SAFETY: `at` checked the range; `data` may even be read from RAM.
+        unsafe { std::ptr::copy(data.as_ptr(), p, data.len()) }
+    }
+    /// The byte at `vaddr`.
     pub fn read_u8(&self, vaddr: u32) -> u8 {
-        self.ram()[self.at(vaddr)]
+        let mut b = [0; 1];
+        self.read_bytes(vaddr, &mut b);
+        b[0]
     }
     /// Writes the byte at `vaddr`.
     pub fn write_u8(&self, vaddr: u32, v: u8) {
-        self.ram()[self.at(vaddr)] = v;
+        self.write_bytes(vaddr, &[v]);
     }
     /// The big-endian word at `vaddr`.
     pub fn read_u32(&self, vaddr: u32) -> u32 {
-        let a = self.at(vaddr);
-        u32::from_be_bytes(self.ram()[a..a + 4].try_into().unwrap())
+        let mut b = [0; 4];
+        self.read_bytes(vaddr, &mut b);
+        u32::from_be_bytes(b)
     }
     /// Writes the big-endian word at `vaddr`.
     pub fn write_u32(&self, vaddr: u32, v: u32) {
-        let a = self.at(vaddr);
-        self.ram()[a..a + 4].copy_from_slice(&v.to_be_bytes());
+        self.write_bytes(vaddr, &v.to_be_bytes());
     }
 }
 
@@ -346,6 +384,25 @@ mod tests {
         let api = fake_api(&mut ram, 0);
         api.write_u32(KSEG1 | last, 0x0102_0304);
         assert_eq!(api.read_u32(last), 0x0102_0304);
+    }
+
+    #[test]
+    fn byte_runs_copy_in_and_out_through_kseg1() {
+        let mut ram = vec![0; 0x2000];
+        let api = fake_api(&mut ram, 0);
+        api.write_bytes(KSEG1 | PHYS, &[1, 2, 3]);
+        let mut back = [0; 3];
+        api.read_bytes(KSEG0 | PHYS, &mut back);
+        assert_eq!(back, [1, 2, 3]);
+        assert_eq!(ram[PHYS as usize..PHYS as usize + 3], [1, 2, 3]);
+    }
+
+    #[test]
+    #[should_panic(expected = "past the end of RAM")]
+    fn a_word_straddling_the_end_of_ram_panics_with_the_address() {
+        let mut ram = vec![0; 0x100];
+        let api = fake_api(&mut ram, 0);
+        api.read_u32(0xFE);
     }
 
     #[test]

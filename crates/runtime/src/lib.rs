@@ -111,6 +111,15 @@ struct Overlay {
     funcs: AddrMap<GuestFn>,
 }
 
+impl Overlay {
+    /// Whether a copy from ROM offset `rom` to `ram` puts this overlay's
+    /// own bytes where they belong: both offsets lie the same distance
+    /// from the overlay's start.
+    fn carries_own_bytes(&self, rom: u32, ram: u32) -> bool {
+        rom.wrapping_sub(self.rom) == ram.wrapping_sub(self.ram)
+    }
+}
+
 /// A map keyed by guest address. Every guest call looks its target up in
 /// these, so they hash with one multiply instead of SipHash (see the
 /// `addr_hash_timing` test). Addresses are not chosen by an attacker.
@@ -330,7 +339,9 @@ impl Ctx {
     /// An overlay that starts at exactly this copy is loaded. A copy over
     /// part of a loaded overlay (often data into its own data area) makes
     /// only the functions it covers unavailable; one over all of it
-    /// unloads it.
+    /// unloads it. A copy that carries the overlay's own bytes at that
+    /// offset (the next chunk of an overlay DMA'd in pieces) leaves it
+    /// loaded.
     pub fn overlay_loaded(&mut self, rom: u32, ram: u32, len: u32) {
         self.code_written(ram, len);
         let (lo, hi) = (ram, ram.wrapping_add(len));
@@ -340,6 +351,12 @@ impl Ctx {
             let (olo, ohi) = (o.ram, o.ram.wrapping_add(o.len));
             if ohi <= lo || olo >= hi {
                 return true;
+            }
+            // A copy from the overlay's own ROM range to the matching RAM
+            // offset writes the bytes already there; only an exact reload
+            // is dropped here, to be pushed again fresh below.
+            if o.carries_own_bytes(rom, ram) {
+                return !(rom == o.rom && ram == o.ram);
             }
             if lo <= olo && hi >= ohi {
                 return false;
@@ -841,6 +858,31 @@ mod tests {
         assert!(c.has_function(0x8010_0000));
         c.overlay_loaded(0x9000, 0x800F_0000, 0x10_0000);
         assert!(!c.has_function(0x8010_0000));
+    }
+
+    #[test]
+    fn an_overlay_copied_in_chunks_stays_loaded() {
+        fn a(c: &mut Ctx) {
+            c.r[2] = 0xA;
+        }
+        fn late(c: &mut Ctx) {
+            c.r[2] = 0xC;
+        }
+        let mut c = Ctx::new(Memory::new(16));
+        let funcs = [(0x8010_0000, a as GuestFn), (0x8010_00C0, late)];
+        c.register_overlay(0x1000, 0x8010_0000, 0x100, &funcs);
+        c.overlay_loaded(0x1000, 0x8010_0000, 0x80);
+        c.overlay_loaded(0x1080, 0x8010_0080, 0x80);
+        assert!(c.has_function(0x8010_0000));
+        assert!(c.has_function(0x8010_00C0));
+        // One chunk carrying the whole overlay again is a reload, not a
+        // foreign copy over all of it.
+        c.overlay_loaded(0x0F00, 0x800F_FF00, 0x300);
+        assert!(c.has_function(0x8010_00C0));
+        // A chunk from elsewhere in ROM still hides what it covers.
+        c.overlay_loaded(0x5080, 0x8010_0080, 0x80);
+        assert!(c.has_function(0x8010_0000));
+        assert!(!c.has_function(0x8010_00C0));
     }
 
     #[test]

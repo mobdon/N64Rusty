@@ -255,6 +255,27 @@ fn pole_filter_gain_from_a_real_command_shape() {
 }
 
 #[test]
+fn pole_filter_gain_is_signed() {
+    // Gain 0xC000 is -1.0 in Q14 (libultra's s16), not 3.0; 0x8000 is -2.0.
+    for (gain, want) in [(0xC000u32, -8000i16), (0x8000, -16000)] {
+        let (mut rsp, mut ram) = setup();
+        put(&mut ram, DATA, &[0; 16]);
+        put(&mut ram, DATA + 0x400, &[8000; SUBFRAME]);
+        run(
+            &mut rsp,
+            &mut ram,
+            &[
+                book(DATA),
+                load(MAIN2, 0x170, DATA + 0x400),
+                (0x0E01_0000 | gain, 1 << 24 | STATE),
+                save(MAIN2, 0x170, OUT),
+            ],
+        );
+        assert!(get(&ram, OUT, SUBFRAME).iter().all(|&v| v == want), "{gain:#x}");
+    }
+}
+
+#[test]
 fn a_game_that_asks_turns_its_stream_frames_into_sound() {
     const UCODE: u32 = 0x8030_0000;
     const BUF: u32 = 0x8031_0000;

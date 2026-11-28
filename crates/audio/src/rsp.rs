@@ -256,7 +256,7 @@ impl AudioRsp {
             op::LOADADPCM => self.load_book(ram, self.addr(w1), lo0),
             op::MIXER => self.mix(lo0 as i16, hi1, lo1, count),
             op::INTERLEAVE => self.interleave(out, hi1, lo1, count),
-            op::POLEF => self.pole_filter(ram, flags, lo0, (inp, out, count), self.addr(w1)),
+            op::POLEF => self.pole_filter(ram, flags, lo0 as i16, (inp, out, count), self.addr(w1)),
             op::SETLOOP => self.loop_addr = self.addr(w1),
             _ => self.unknown("audio", w0, w1),
         }
@@ -324,7 +324,7 @@ impl AudioRsp {
             }
             op::POLEF => {
                 let buf = if w1 >> 24 == 0 { N_MAIN } else { N_MAIN2 };
-                self.pole_filter(ram, flags, lo0, (buf, buf, N_COUNT), a1);
+                self.pole_filter(ram, flags, lo0 as i16, (buf, buf, N_COUNT), a1);
             }
             op::SETLOOP => self.loop_addr = a1,
             stream_op::FRAME if self.streams => self.stream_state.frame(ram, self.ucode_data, a1),
@@ -877,7 +877,8 @@ impl AudioRsp {
         &mut self,
         ram: &mut Memory,
         flags: u8,
-        gain: u16,
+        // libultra's aPoleFilter gain is s16 (Q14), so 0x8000 and up are negative.
+        gain: i16,
         (inp, out, count): (u16, u16, u16),
         state: u32,
     ) {
