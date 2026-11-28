@@ -16,7 +16,7 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Theme, Window, WindowId};
 
 use crate::config::RunConfig;
-use crate::menu::{flip_mod_option, mod_options, mod_options_file, mods, toggled, REFRESH};
+use crate::menu::{mod_options, mod_options_file, mods, toggle_mod_option, toggled, REFRESH};
 
 pub const W: usize = 320;
 pub const H: usize = 240;
@@ -212,8 +212,7 @@ impl Ui {
                 return None;
             }
             Act::ModOption(file, name) => {
-                let text = std::fs::read_to_string(&file).unwrap_or_default();
-                if let Err(e) = std::fs::write(&file, flip_mod_option(&text, &name)) {
+                if let Err(e) = toggle_mod_option(&file, &name) {
                     self.message = Some(("OPTION NOT CHANGED".into(), e.to_string()));
                 }
                 return None;

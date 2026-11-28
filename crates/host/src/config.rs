@@ -183,12 +183,17 @@ impl RunConfig {
     }
 
     /// Writes the window settings back into the file this config came from,
-    /// keeping its other keys (comments are lost).
+    /// keeping its other keys (comments are lost). A missing file is created;
+    /// a file that cannot be read is left alone and the error returned.
     pub fn save_window(&self) -> Result<(), String> {
         let Some(path) = &self.path else {
             return Ok(());
         };
-        let text = std::fs::read_to_string(path).unwrap_or_default();
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        };
         let mut doc: toml::Table = toml::from_str(&text).map_err(|e| e.to_string())?;
         let window = doc
             .entry("window")
@@ -458,5 +463,47 @@ mod tests {
         );
         assert_eq!(w(Some(0.0)).redraw_rate(NTSC_RATE, Some(60.0)), None);
         assert_eq!(w(None).redraw_rate(NTSC_RATE, Some(165.0)), None);
+    }
+
+    #[test]
+    fn saving_window_creates_a_missing_file() {
+        let path = std::env::temp_dir().join(format!("run-missing-{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let cfg = RunConfig {
+            path: Some(path.clone()),
+            ..RunConfig::default()
+        };
+        cfg.save_window().unwrap();
+        let back = RunConfig::load(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(back.window, cfg.window);
+    }
+
+    #[test]
+    fn saving_window_leaves_an_unreadable_file_alone() {
+        let path = std::env::temp_dir().join(format!("run-bad-utf8-{}.toml", std::process::id()));
+        let bytes = b"frames = 9\n\xff\n";
+        std::fs::write(&path, bytes).unwrap();
+        let cfg = RunConfig {
+            path: Some(path.clone()),
+            ..RunConfig::default()
+        };
+        let err = cfg.save_window().unwrap_err();
+        let kept = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(err.contains(&path.display().to_string()), "{err}");
+        assert_eq!(kept, bytes);
+
+        let dir = std::env::temp_dir().join(format!("run-dir-{}.toml", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = RunConfig {
+            path: Some(dir.clone()),
+            ..RunConfig::default()
+        };
+        let result = cfg.save_window();
+        let still_dir = dir.is_dir();
+        std::fs::remove_dir(&dir).unwrap();
+        assert!(result.is_err());
+        assert!(still_dir);
     }
 }

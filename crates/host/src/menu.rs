@@ -96,6 +96,18 @@ pub fn flip_mod_option(text: &str, name: &str) -> String {
         .collect()
 }
 
+/// Flips option `name` in the options file at `file`, keeping its other
+/// lines. A missing file counts as empty; any other read error leaves the
+/// file untouched and is returned, so a bad read never wipes the options.
+pub fn toggle_mod_option(file: &std::path::Path, name: &str) -> std::io::Result<()> {
+    let text = match std::fs::read_to_string(file) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
+    std::fs::write(file, flip_mod_option(&text, name))
+}
+
 /// The file name that turns the mod at `path` on or off.
 pub fn toggled(path: &std::path::Path) -> std::path::PathBuf {
     let n = path.file_name().unwrap_or_default().to_string_lossy();
@@ -358,8 +370,48 @@ mod imp {
 
 #[cfg(test)]
 mod tests {
-    use super::{flip_mod_option, mod_options, mod_options_file, toggled};
+    use super::{flip_mod_option, mod_options, mod_options_file, toggle_mod_option, toggled};
     use std::path::Path;
+
+    #[test]
+    fn toggling_an_option_keeps_other_lines() {
+        let file = std::env::temp_dir().join(format!("opts-{}.txt", std::process::id()));
+        std::fs::write(&file, "# comment\nbeam magic = on\nother = off\n").unwrap();
+        toggle_mod_option(&file, "beam magic").unwrap();
+        let back = std::fs::read_to_string(&file).unwrap();
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(back, "# comment\nbeam magic = off\nother = off\n");
+    }
+
+    #[test]
+    fn toggling_an_option_creates_a_missing_file() {
+        let file = std::env::temp_dir().join(format!("opts-missing-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        toggle_mod_option(&file, "beam magic").unwrap();
+        let created = file.is_file();
+        std::fs::remove_file(&file).unwrap();
+        assert!(created);
+    }
+
+    #[test]
+    fn toggling_an_option_leaves_an_unreadable_file_alone() {
+        let file = std::env::temp_dir().join(format!("opts-bad-utf8-{}.txt", std::process::id()));
+        let bytes = b"beam magic = on\n\xff\n";
+        std::fs::write(&file, bytes).unwrap();
+        let result = toggle_mod_option(&file, "beam magic");
+        let kept = std::fs::read(&file).unwrap();
+        std::fs::remove_file(&file).unwrap();
+        assert!(result.is_err());
+        assert_eq!(kept, bytes);
+
+        let dir = std::env::temp_dir().join(format!("opts-dir-{}.txt", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let result = toggle_mod_option(&dir, "beam magic");
+        let still_dir = dir.is_dir();
+        std::fs::remove_dir(&dir).unwrap();
+        assert!(result.is_err());
+        assert!(still_dir);
+    }
 
     #[test]
     fn mod_options_read_and_flip() {

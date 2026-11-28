@@ -127,12 +127,9 @@ impl<G: Guest> App<G> {
                 // Mods install at start, so the game starts again.
                 let (change, path) = match &action {
                     Action::ToggleMod(p) => (std::fs::rename(p, crate::menu::toggled(p)), p),
-                    Action::ToggleModOption(p, name) => (
-                        std::fs::read_to_string(p).and_then(|t| {
-                            std::fs::write(p, crate::menu::flip_mod_option(&t, name))
-                        }),
-                        p,
-                    ),
+                    Action::ToggleModOption(p, name) => {
+                        (crate::menu::toggle_mod_option(p, name), p)
+                    }
                     _ => unreachable!(),
                 };
                 match change {
