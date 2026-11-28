@@ -32,7 +32,7 @@ mod tmem;
 pub use capture::{write_png, Capture};
 pub use combiner::{fragment_shader, Combiner};
 pub use dl::{GfxError, Interpreter, Readback};
-pub use render::{fit, Image, RenderError, Renderer, Stats, WindowTarget};
+pub use render::{fit, Gpu, Image, RenderError, Renderer, Stats, WindowTarget};
 
 /// A 4x4 matrix in N64 layout: row vectors, so a point transforms as
 /// `p * m` and `m[3]` holds the translation.
@@ -84,8 +84,9 @@ pub struct Texture {
     pub width: u32,
     /// Height in texels.
     pub height: u32,
-    /// RGBA8, row-major.
-    pub rgba: Vec<u8>,
+    /// RGBA8, row-major. Shared, not copied, between the frames and caches
+    /// that hold the same texture; make a new one to change it.
+    pub rgba: std::sync::Arc<[u8]>,
     /// Wrap mode for s and t.
     pub wrap: [Wrap; 2],
 }

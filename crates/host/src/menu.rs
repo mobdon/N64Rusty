@@ -125,13 +125,25 @@ pub fn toggled(path: &std::path::Path) -> std::path::PathBuf {
     }
 }
 
-/// Refresh choices: label and setting.
-pub const REFRESH: [(&str, Option<f64>); 4] = [
-    ("Match display", Some(0.0)),
-    ("60 Hz", Some(60.0)),
-    ("120 Hz", Some(120.0)),
-    ("165 Hz", Some(165.0)),
-];
+/// Refresh choices: label and setting. Android also offers its default,
+/// one picture per game frame; on PC that setting could not be saved (a
+/// missing `refresh` loads as the PC default), so it is not offered there.
+pub const REFRESH: &[(&str, Option<f64>)] = if cfg!(target_os = "android") {
+    &[
+        ("Match display", Some(0.0)),
+        ("60 Hz", Some(60.0)),
+        ("120 Hz", Some(120.0)),
+        ("165 Hz", Some(165.0)),
+        ("Game rate", None),
+    ]
+} else {
+    &[
+        ("Match display", Some(0.0)),
+        ("60 Hz", Some(60.0)),
+        ("120 Hz", Some(120.0)),
+        ("165 Hz", Some(165.0)),
+    ]
+};
 
 /// ROMs played before, newest first: `recent.txt` next to the program,
 /// one path per line (the player keeps it). Only files still there.
@@ -370,7 +382,7 @@ mod imp {
         /// Ticks the choices `cfg` makes.
         pub fn show(&self, cfg: &WindowConfig) {
             for (item, (_, r)) in self.refresh.iter().zip(REFRESH) {
-                item.set_checked(cfg.refresh == r);
+                item.set_checked(cfg.refresh == *r);
             }
             self.wide.set_checked(cfg.widescreen);
             self.normal.set_checked(!cfg.widescreen);

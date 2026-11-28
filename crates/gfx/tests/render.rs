@@ -191,8 +191,13 @@ fn unchanged_textures_are_uploaded_once() {
     let again = r.render(&f, 320, 240).unwrap();
     assert_eq!(r.take_stats().textures_new, 0, "same texture kept");
     assert_eq!(first.rgba, again.rgba);
-    // New content under the same size is a new texture.
-    for px in f.textures[0].rgba.chunks_mut(4) {
+    // The same pixels in a new allocation are still the same texture.
+    f.textures[0].rgba = f.textures[0].rgba.to_vec().into();
+    assert_eq!(r.render(&f, 320, 240).unwrap().rgba, first.rgba);
+    assert_eq!(r.take_stats().textures_new, 0, "same pixels, copied");
+    // New content under the same size is a new texture. The renderer
+    // holds the pixels it knows, so changing them makes a copy.
+    for px in std::sync::Arc::make_mut(&mut f.textures[0].rgba).chunks_mut(4) {
         px.copy_from_slice(&[0, 255, 0, 255]);
     }
     let changed = r.render(&f, 320, 240).unwrap();
@@ -341,6 +346,68 @@ fn renderers_on_many_threads_at_once() {
     for t in threads {
         t.join().unwrap();
     }
+}
+
+/// A red triangle on blue, so pictures differ where edges fall.
+fn triangle_frame() -> Frame {
+    let mut ram = Ram::default();
+    let verts = ram.vertices(&[
+        v(-50, -50, 0, [255; 4]),
+        v(50, -50, 0, [255; 4]),
+        v(0, 50, 0, [255; 4]),
+    ]);
+    let dl = scene(&mut ram, |_, dl| {
+        dl.other_modes(CYCLE_1, 0)
+            .combine(pass(PRIM))
+            .prim(0xFF00_00FF)
+            .vtx(verts, 3, 0)
+            .tri(0, 1, 2);
+    });
+    frame(&mut ram, &dl)
+}
+
+/// Renderers on one shared device, on several threads at once, draw what
+/// renderers on devices of their own draw.
+#[test]
+fn renderers_sharing_one_device_draw_the_same_pixels() {
+    let Some(mut own) = renderer() else { return };
+    let f = triangle_frame();
+    let want = own.render(&f, 320, 240).unwrap().rgba;
+    let gpu = n64rusty_gfx::Gpu::open().unwrap();
+    std::thread::scope(|s| {
+        for _ in 0..4 {
+            s.spawn(|| {
+                let mut r = Renderer::on(&gpu);
+                for _ in 0..3 {
+                    assert_eq!(r.render(&f, 320, 240).unwrap().rgba, want);
+                }
+            });
+        }
+    });
+}
+
+/// A render height cap draws fewer lines and scales them up to the window;
+/// no cap, or one above the picture, changes nothing.
+#[test]
+fn max_height_draws_smaller_and_scales_up() {
+    let Some(mut r) = renderer() else { return };
+    let f = triangle_frame();
+    let full = r.render_letterboxed(&f, 1280, 960).unwrap();
+    let small = r.render_letterboxed(&f, 640, 480).unwrap();
+    r.set_max_height(Some(960));
+    assert_eq!(r.render_letterboxed(&f, 1280, 960).unwrap().rgba, full.rgba);
+    r.set_max_height(Some(480));
+    let capped = r.render_letterboxed(&f, 1280, 960).unwrap();
+    assert_eq!((capped.width, capped.height), (1280, 960));
+    assert_ne!(capped.rgba, full.rgba);
+    // Each drawn pixel covers 2 x 2 window pixels.
+    for y in 0..960 {
+        for x in 0..1280 {
+            assert_eq!(capped.pixel(x, y), small.pixel(x / 2, y / 2), "at {x}, {y}");
+        }
+    }
+    r.set_max_height(None);
+    assert_eq!(r.render_letterboxed(&f, 1280, 960).unwrap().rgba, full.rgba);
 }
 
 #[test]
@@ -707,4 +774,61 @@ fn fog_blends_the_fog_colour_by_depth_from_the_fog_position() {
     // Factor 128 of 255: red and green about half each.
     assert!(close(mid, [127, 128, 0]), "half fog: {mid:?}");
     assert!(close(far, [0, 255, 0]), "all fog: {far:?}");
+}
+
+/// Draws that do not read texel 1 no longer bind a second tile; they draw
+/// the same as with one bound, as every draw used to be.
+#[test]
+fn an_unread_second_texture_changes_nothing() {
+    let Some(mut r) = renderer() else { return };
+    let mut ram = Ram::default();
+    let addr = textured_scene(&mut ram, 20, 4);
+    let mut it = Interpreter::new();
+    it.run(&ram.bytes, addr).unwrap();
+    let f = it.take_frame();
+    assert!(f.draws().all(|d| d.state.textures[1].is_none()));
+    let mut bound = f.clone();
+    let noise: Vec<u8> = (0..16 * 16 * 4).map(|i| (i * 37 % 251) as u8).collect();
+    bound.textures.push(n64rusty_gfx::Texture {
+        width: 16,
+        height: 16,
+        rgba: noise.into(),
+        wrap: [n64rusty_gfx::Wrap::Repeat; 2],
+    });
+    let second = bound.textures.len() as u32 - 1;
+    for c in &mut bound.commands {
+        if let n64rusty_gfx::Command::Draw(d) = c {
+            d.state.textures[1] = Some(second);
+        }
+    }
+    let want = r.render(&bound, 320, 240).unwrap();
+    assert_eq!(r.render(&f, 320, 240).unwrap().rgba, want.rgba);
+}
+
+/// CPU time the renderer spends finding a busy frame's textures, all kept
+/// from the last picture. Run with `cargo test --release -p n64rusty-gfx
+/// --test render -- --ignored --nocapture texture_lookup_time`.
+#[test]
+#[ignore = "a measurement, not a check"]
+fn texture_lookup_time() {
+    const ROUNDS: u32 = 100;
+    let Some(mut r) = renderer() else { return };
+    let mut ram = Ram::default();
+    let addr = textured_scene(&mut ram, 300, 64);
+    let mut it = Interpreter::new();
+    it.run(&ram.bytes, addr).unwrap();
+    let f = it.take_frame();
+    r.render(&f, 320, 240).unwrap();
+    r.take_stats();
+    for _ in 0..ROUNDS {
+        r.render(&f, 320, 240).unwrap();
+    }
+    let s = r.take_stats();
+    eprintln!(
+        "upload step {:.1} us a picture, recording {:.0} us, {} textures ({} new)",
+        s.upload_us as f64 / f64::from(ROUNDS),
+        s.record_us as f64 / f64::from(ROUNDS),
+        f.textures.len(),
+        s.textures_new
+    );
 }

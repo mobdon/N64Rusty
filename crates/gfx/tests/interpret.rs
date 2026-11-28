@@ -1149,3 +1149,154 @@ fn a_flipped_texture_rectangle_steps_s_down_and_t_across() {
         assert!(corners.contains(&want), "{want:?} not in {corners:?}");
     }
 }
+
+/// Keeps a copy of each frame it is asked to read from.
+struct Recording {
+    frames: Vec<Frame>,
+}
+
+impl n64rusty_gfx::Readback for Recording {
+    fn read(&mut self, f: &Frame, _: u32, width: u32, height: u32) -> Option<Vec<u8>> {
+        self.frames.push(f.clone());
+        Some([255, 0, 0, 255].repeat((width * height) as usize))
+    }
+}
+
+/// The frame a read back of `image` used to be given before frames were
+/// lent: a copy of `from` with only the draws into it, named after it.
+fn copied_for_read(from: &Frame, image: u32, width: u32, height: u32) -> Frame {
+    let into = |c: &Command| match c {
+        Command::Draw(d) => d.state.color_image == image && d.state.color_width == width,
+        _ => true,
+    };
+    Frame {
+        commands: from.commands.iter().filter(|c| into(c)).cloned().collect(),
+        width,
+        color_image: image,
+        image_height: height,
+        warnings: Vec::new(),
+        ..from.clone()
+    }
+}
+
+#[test]
+fn a_read_back_gets_the_same_frame_as_a_copy_would_and_the_frame_is_put_back() {
+    let mut ram = Ram::default();
+    let tex = ram.put(&[0x07, 0xC1].repeat(16));
+    let (a, b) = (ram.put(&[0; 8 * 6 * 2]), ram.put(&[0; 8 * 6 * 2]));
+    let mut dl = Dl::default();
+    setup(&mut ram, &mut dl);
+    dl.other_modes(CYCLE_1, 0)
+        .timg(0, 2, 1, tex)
+        .tile(0, 2, 0, 0, 7)
+        .load_block(7, 16)
+        .tile(0, 2, 1, 0, 0)
+        .tile_size(0, 4, 4)
+        .cimg(a, 8)
+        .scissor(0, 0, 8, 6)
+        .tex_rect(0, [0, 0, 8, 6], [0, 0], [1 << 10, 1 << 10])
+        .cimg(b, 8)
+        .tex_rect(0, [0, 0, 4, 6], [0, 0], [1 << 10, 1 << 10])
+        .end();
+    let draw = ram.dl(&dl);
+    let load = |ram: &mut Ram, image: u32| {
+        let mut dl = Dl::default();
+        dl.timg(0, 2, 8, image).load_block(7, 16).end();
+        ram.dl(&dl)
+    };
+    let (load_a, load_b) = (load(&mut ram, a), load(&mut ram, b));
+    let mut it = Interpreter::new();
+    let mut rb = Recording { frames: Vec::new() };
+    it.run_readback(&mut ram.bytes, draw, &mut rb).unwrap();
+    // An image drawn in the frame being recorded.
+    let before = it.frame().clone();
+    it.run_readback(&mut ram.bytes, load_a, &mut rb).unwrap();
+    assert_eq!(rb.frames, [copied_for_read(&before, a, 8, 6)]);
+    assert_eq!(rb.frames[0].draws().count(), 1);
+    assert_eq!(it.frame(), &before, "the frame is put back as it was");
+    // An image drawn in a frame already handed over.
+    let handed = it.take_frame();
+    it.run_readback(&mut ram.bytes, load_b, &mut rb).unwrap();
+    assert_eq!(rb.frames[1], copied_for_read(&handed, b, 8, 6));
+    assert_eq!(rb.frames[1].draws().count(), 1);
+    assert_eq!(
+        rb.frames[1].textures[0].rgba.as_ptr(),
+        handed.textures[0].rgba.as_ptr(),
+        "texture pixels shared, not copied"
+    );
+}
+
+/// A draw binds the tile after its own only when its combiner reads
+/// texel 1.
+#[test]
+fn the_second_tile_is_bound_only_for_a_combiner_that_reads_it() {
+    let texel1 = pass(2); // outputs texel 1
+    for (combine, two) in [(pass(TEXEL0), false), (texel1, true)] {
+        let mut ram = Ram::default();
+        let tex = ram.put(&[0x07, 0xC1].repeat(16));
+        let verts = ram.vertices(&[v(0, 0, 0, [255; 4]); 3]);
+        let mut dl = Dl::default();
+        setup(&mut ram, &mut dl);
+        dl.other_modes(CYCLE_1, 0)
+            .combine(combine)
+            .texture(true, 0)
+            .timg(0, 2, 1, tex)
+            .tile(0, 2, 0, 0, 7)
+            .load_block(7, 16)
+            .tile(0, 2, 1, 0, 0)
+            .tile_size(0, 4, 4)
+            .vtx(verts, 3, 0)
+            .tri(0, 1, 2)
+            .tex_rect(0, [0, 0, 8, 6], [0, 0], [1 << 10, 1 << 10])
+            .end();
+        let addr = ram.dl(&dl);
+        let f = run(&ram, addr);
+        for d in f.draws() {
+            assert_eq!(d.state.textures[1].is_some(), two, "{combine:#x}");
+        }
+    }
+}
+
+/// Reads nothing back: the frames are still noted for a later read.
+struct Never;
+
+impl n64rusty_gfx::Readback for Never {
+    fn read(&mut self, _: &Frame, _: u32, _: u32, _: u32) -> Option<Vec<u8>> {
+        None
+    }
+}
+
+/// CPU time to interpret and hand over a busy textured frame on the
+/// read-back path. Run with `cargo test --release -p n64rusty-gfx --test
+/// interpret -- --ignored --nocapture interpret_frame_time`.
+#[test]
+#[ignore = "a measurement, not a check"]
+fn interpret_frame_time() {
+    const ROUNDS: u32 = 200;
+    let mut ram = Ram::default();
+    let addr = textured_scene(&mut ram, 300, 64);
+    for readback in [false, true] {
+        let mut it = Interpreter::new();
+        let mut frame = || {
+            match readback {
+                true => it.run_readback(&mut ram.bytes, addr, &mut Never),
+                false => it.run(&ram.bytes, addr),
+            }
+            .unwrap();
+            it.take_frame()
+        };
+        let f = frame();
+        let t0 = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            std::hint::black_box(frame());
+        }
+        let us = t0.elapsed().as_secs_f64() * 1e6 / f64::from(ROUNDS);
+        eprintln!(
+            "{}: {us:.0} us a frame of {} draws, {} textures, {} vertices",
+            if readback { "read-back path" } else { "plain" },
+            f.draws().count(),
+            f.textures.len(),
+            f.vertices.len()
+        );
+    }
+}

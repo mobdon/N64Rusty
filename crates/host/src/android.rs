@@ -39,6 +39,61 @@ pub fn private_dir() -> Option<PathBuf> {
     APP.get()?.internal_data_path()
 }
 
+/// `ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_DEFAULT`: the rate is what the
+/// pictures need; the display may run at a multiple of it.
+const FRAME_RATE_COMPATIBILITY_DEFAULT: i8 = 0;
+
+/// `ANativeWindow_setFrameRate(window, frameRate, compatibility)`, from
+/// Android 11 (API 30) on.
+type SetFrameRate = unsafe extern "C" fn(*mut std::ffi::c_void, f32, i8) -> i32;
+
+/// Asks the display to run at `rate` pictures a second (the game's rate,
+/// or the redraw rate when blending) while `window` is shown, so a 120 Hz
+/// screen can drop to 60 and save battery. Called after each attach of
+/// the window (its surface), as the request belongs to that surface. Older Android has no such call: it is
+/// looked up at run time, since linking it would stop the app loading
+/// there, and the request is then skipped.
+pub fn ask_frame_rate(window: &winit::window::Window, rate: f64) {
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let Ok(handle) = window.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::AndroidNdk(native) = handle.as_raw() else {
+        return;
+    };
+    // SAFETY: plain C strings. libandroid.so is already loaded (winit's
+    // activity needs it), so RTLD_NOLOAD only takes a reference to it,
+    // given back below.
+    let lib = unsafe {
+        libc::dlopen(
+            c"libandroid.so".as_ptr(),
+            libc::RTLD_NOW | libc::RTLD_NOLOAD,
+        )
+    };
+    if lib.is_null() {
+        return;
+    }
+    // SAFETY: `lib` is a live handle and the name a C string.
+    let sym = unsafe { libc::dlsym(lib, c"ANativeWindow_setFrameRate".as_ptr()) };
+    if !sym.is_null() {
+        // SAFETY: the symbol is ANativeWindow_setFrameRate, of this type;
+        // the window pointer stays valid while `handle` borrows the window.
+        let status = unsafe {
+            let set = std::mem::transmute::<*mut std::ffi::c_void, SetFrameRate>(sym);
+            set(
+                native.a_native_window.as_ptr(),
+                rate as f32,
+                FRAME_RATE_COMPATIBILITY_DEFAULT,
+            )
+        };
+        if status != 0 {
+            eprintln!("warning: asking the display for {rate} Hz failed: error {status}");
+        }
+    }
+    // SAFETY: the reference taken above; the library stays loaded.
+    unsafe { libc::dlclose(lib) };
+}
+
 pub(crate) fn app() -> AndroidApp {
     APP.get().expect("android_main sets the app first").clone()
 }

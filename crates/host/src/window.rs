@@ -99,10 +99,23 @@ struct App<G> {
 }
 
 impl<G: Guest> App<G> {
+    /// Hands the window (or, on Android, its new surface) to the guest.
+    /// `view` follows each attach.
+    fn attach(&mut self, window: Arc<Window>) {
+        self.session.guest.attach_window(window);
+    }
+
     /// Applies the window settings: redraw rate, and the guest's picture.
+    /// On Android it also asks the display for the rate pictures come at
+    /// (the game's, or the redraw rate when blending); the request belongs
+    /// to the surface, so it is made again after each attach.
     fn view(&mut self) {
         let display = self.window.as_deref().and_then(display_rate);
         let rate = self.cfg.window.redraw_rate(self.cfg.frame_rate, display);
+        #[cfg(target_os = "android")]
+        if let Some(window) = &self.window {
+            crate::android::ask_frame_rate(window, rate.unwrap_or(self.cfg.frame_rate));
+        }
         self.redraw = rate.map(|r| Pacer::new(r, Instant::now()));
         let blend = rate.map(|_| self.cfg.frame_rate);
         self.session.guest.view(&self.cfg.window, blend);
@@ -218,7 +231,7 @@ impl<G: Guest> ApplicationHandler for App<G> {
         if let Some(w) = &self.window {
             // Back from the home screen on Android: a new surface to draw on.
             if cfg!(target_os = "android") {
-                self.session.guest.attach_window(w.clone());
+                self.attach(w.clone());
                 self.view();
                 self.away = false;
             }
@@ -247,7 +260,7 @@ impl<G: Guest> ApplicationHandler for App<G> {
         match window {
             Ok(window) => {
                 self.menu = Menu::new(&window, &self.cfg.window);
-                self.session.guest.attach_window(window.clone());
+                self.attach(window.clone());
                 self.window = Some(window);
                 self.view();
             }

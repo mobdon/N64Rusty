@@ -20,6 +20,8 @@ winit = { version = "0.30", features = ["serde", "android-native-activity"] }
 # The start screen draws through the GPU there: the game's window must not
 # have been drawn into by the CPU.
 n64rusty-gfx = { path = "../gfx" }
+# Looking up ANativeWindow_setFrameRate at run time (Android 11 and later).
+libc = "0.2"
 
 # The window's menu bar and its "open a ROM" file window.
 [target.'cfg(windows)'.dependencies]

@@ -64,10 +64,24 @@ pub(crate) struct Tmem {
     /// Decoded textures by source key, kept across frames: most textures
     /// are the same from one frame to the next.
     decoded: HashMap<u64, Texture>,
+    /// Bytes of RGBA held in `decoded`.
+    decoded_bytes: usize,
 }
 
 /// Decoded textures kept across frames before the cache starts over.
 const DECODED_MAX: usize = 2048;
+/// Bytes of decoded RGBA kept across frames before the cache starts over.
+const DECODED_MAX_BYTES: usize = 64 << 20;
+/// Size of TMEM; addresses wrap at it.
+const TMEM_BYTES: usize = 4096;
+/// TMEM address of the palette (the upper half).
+const PALETTE_BASE: usize = 0x800;
+/// TMEM bytes per palette entry: each 16-bit entry is written four times.
+const PALETTE_ENTRY: usize = 8;
+/// Entries in one 4-bit palette.
+const PALETTE_4BIT: usize = 16;
+/// The odd-row swap moves bytes only within aligned blocks of this size.
+const SWAP_BLOCK: usize = 16;
 
 /// A fast hasher for TMEM contents (multiply and rotate over 8 bytes).
 pub(crate) struct Fx(pub u64);
@@ -95,6 +109,7 @@ impl Default for Tmem {
             cache: HashMap::new(),
             seen: HashMap::new(),
             decoded: HashMap::new(),
+            decoded_bytes: 0,
         }
     }
 }
@@ -336,36 +351,22 @@ impl Tmem {
                 s => (1 << (16 - s)) as f32,
             };
         }
-        // The texture follows from the tile, the palette type and TMEM.
-        let mut h = Fx(0);
-        (t, tlut).hash(&mut h);
-        h.write(&self.mem[..]);
-        let key = h.finish();
+        let key = self.content_key(&t, size, wrap, tlut);
         let texture = match self.seen.get(&key) {
             Some(&i) => i,
             None => {
-                if self.decoded.len() >= DECODED_MAX {
-                    self.decoded.clear();
-                }
                 let tex = match self.decoded.get(&key) {
                     Some(tex) => tex.clone(),
                     None => {
-                        let mut rgba = Vec::with_capacity((size[0] * size[1] * 4) as usize);
-                        for y in 0..size[1] {
-                            for x in 0..size[0] {
-                                let (x, y) = (
-                                    wrap_mask(x, t.mask[0], t.cm[0]),
-                                    wrap_mask(y, t.mask[1], t.cm[1]),
-                                );
-                                rgba.extend_from_slice(&self.texel(&t, x, y, tlut));
-                            }
+                        let tex = self.decode(&t, size, wrap, tlut);
+                        let bytes = tex.rgba.len();
+                        if self.decoded.len() >= DECODED_MAX
+                            || self.decoded_bytes + bytes > DECODED_MAX_BYTES
+                        {
+                            self.decoded.clear();
+                            self.decoded_bytes = 0;
                         }
-                        let tex = Texture {
-                            width: size[0],
-                            height: size[1],
-                            rgba,
-                            wrap,
-                        };
+                        self.decoded_bytes += bytes;
                         self.decoded.insert(key, tex.clone());
                         tex
                     }
@@ -384,6 +385,93 @@ impl Tmem {
         };
         self.cache.insert((tile, tlut), b);
         b
+    }
+
+    /// `t` decoded to a `size` texture that wraps by `wrap`.
+    fn decode(&self, t: &Tile, size: [u32; 2], wrap: [Wrap; 2], tlut: u32) -> Texture {
+        let mut rgba = Vec::with_capacity((size[0] * size[1] * 4) as usize);
+        for y in 0..size[1] {
+            for x in 0..size[0] {
+                let (x, y) = (
+                    wrap_mask(x, t.mask[0], t.cm[0]),
+                    wrap_mask(y, t.mask[1], t.cm[1]),
+                );
+                rgba.extend_from_slice(&self.texel(t, x, y, tlut));
+            }
+        }
+        Texture {
+            width: size[0],
+            height: size[1],
+            rgba: rgba.into(),
+            wrap,
+        }
+    }
+
+    /// A key for what [`Tmem::decode`] makes of `t`: the settings that
+    /// shape its texels and only the TMEM bytes it reads, so a load
+    /// elsewhere in TMEM keeps the texture.
+    fn content_key(&self, t: &Tile, size: [u32; 2], wrap: [Wrap; 2], tlut: u32) -> u64 {
+        // Where the tile sits and how it scales change how it maps, not
+        // its texels.
+        let shape = Tile {
+            ul: [0; 2],
+            lr: [0; 2],
+            shift: [0; 2],
+            ..*t
+        };
+        let mut h = Fx(0);
+        (shape, size, wrap, tlut).hash(&mut h);
+        let (lo, hi) = texel_range(t, size);
+        if hi - lo >= TMEM_BYTES {
+            h.write(&self.mem[..]);
+        } else if hi <= TMEM_BYTES {
+            h.write(&self.mem[lo..hi]);
+        } else {
+            h.write(&self.mem[lo..]);
+            h.write(&self.mem[..hi - TMEM_BYTES]);
+        }
+        if let Some((lo, hi)) = palette_range(t, tlut) {
+            h.write(&self.mem[lo..hi]);
+        }
+        h.finish()
+    }
+}
+
+/// The TMEM bytes `lo..hi` holding the texels that decoding `t` at `size`
+/// reads, widened to whole swap blocks (odd rows are read swapped). `hi`
+/// may pass the end of TMEM, where addresses wrap to the start.
+fn texel_range(t: &Tile, size: [u32; 2]) -> (usize, usize) {
+    // The last texel read on each axis: masked coordinates stay inside one
+    // period.
+    let last = |k: usize| {
+        let n = match t.mask[k] {
+            0 => size[k],
+            m => size[k].min(1 << m.min(10)),
+        };
+        n.saturating_sub(1) as usize
+    };
+    let texel_bytes = (bits(t.siz) as usize / 8).max(1);
+    let lo = t.tmem as usize * 8;
+    let hi = lo + last(1) * Tmem::stride(t) + last(0) * bits(t.siz) as usize / 8 + texel_bytes;
+    (
+        lo / SWAP_BLOCK * SWAP_BLOCK,
+        hi.next_multiple_of(SWAP_BLOCK),
+    )
+}
+
+/// The TMEM bytes `lo..hi` of the palette entries decoding `t` can read,
+/// if it goes through the palette (see [`Tmem::texel`]).
+fn palette_range(t: &Tile, tlut: u32) -> Option<(usize, usize)> {
+    if t.fmt != 2 && tlut < 2 {
+        return None;
+    }
+    match t.siz {
+        0 => {
+            let lo = PALETTE_BASE + t.palette as usize * PALETTE_4BIT * PALETTE_ENTRY;
+            Some((lo, lo + PALETTE_4BIT * PALETTE_ENTRY))
+        }
+        1 => Some((PALETTE_BASE, TMEM_BYTES)),
+        _ => None,
     }
 }
 
@@ -405,6 +493,146 @@ fn wrap_mask(c: u32, mask: u32, cm: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A small xorshift generator for test data.
+    struct Rng(u32);
+
+    impl Rng {
+        fn next(&mut self) -> u32 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 17;
+            self.0 ^= self.0 << 5;
+            self.0
+        }
+    }
+
+    /// Every TMEM byte decoding reads is in the ranges the key hashes: a
+    /// change to any other byte decodes the same, for tiles of every
+    /// format, stride, mask, palette and place, wrapping past the end too.
+    #[test]
+    fn decoding_reads_only_the_keyed_bytes() {
+        const CASES: usize = 40;
+        let formats = [
+            (0, 2),
+            (0, 3),
+            (2, 0),
+            (2, 1),
+            (3, 0),
+            (3, 1),
+            (3, 2),
+            (4, 0),
+            (4, 1),
+            (1, 2),
+        ];
+        let mut rng = Rng(0x1234_5678);
+        for case in 0..CASES {
+            let (fmt, siz) = formats[case % formats.len()];
+            let mut m = Tmem::default();
+            for b in m.mem.iter_mut() {
+                *b = rng.next() as u8;
+            }
+            let t = Tile {
+                fmt,
+                siz,
+                line: 1 + rng.next() % 8,
+                // Near the end in some cases, to wrap.
+                tmem: if case % 4 == 0 {
+                    0x1FC
+                } else {
+                    rng.next() % 0x200
+                },
+                palette: rng.next() % 16,
+                cm: [rng.next() % 4, rng.next() % 4],
+                mask: [rng.next() % 4, rng.next() % 4],
+                ..Tile::default()
+            };
+            let size = [1 + rng.next() % 8, 1 + rng.next() % 8];
+            let tlut = [0, 2, 3][rng.next() as usize % 3];
+            let (lo, hi) = texel_range(&t, size);
+            let pal = palette_range(&t, tlut);
+            let keyed = |a: usize| {
+                (lo..hi).contains(&a)
+                    || (lo..hi).contains(&(a + TMEM_BYTES))
+                    || pal.is_some_and(|(p, q)| (p..q).contains(&a))
+            };
+            let wrap = [Wrap::Repeat; 2];
+            let want = m.decode(&t, size, wrap, tlut);
+            for a in (0..TMEM_BYTES).filter(|&a| !keyed(a)) {
+                m.mem[a] ^= 0xFF;
+                let got = m.decode(&t, size, wrap, tlut);
+                assert_eq!(got.rgba, want.rgba, "case {case}: byte {a:#x} read");
+                m.mem[a] ^= 0xFF;
+            }
+        }
+    }
+
+    /// A 4x4 RGBA16 tile, one 64-bit line a row, from the start of TMEM:
+    /// its texels are bytes 0 to 31.
+    fn small_tile() -> Tile {
+        Tile {
+            fmt: 0,
+            siz: 2,
+            line: 1,
+            lr: [3 << 2, 3 << 2],
+            ..Tile::default()
+        }
+    }
+
+    /// Binds tile 0 in a new frame; the texture it gives.
+    fn rebind(m: &mut Tmem, textures: &mut Vec<Texture>) -> Texture {
+        m.new_frame();
+        let b = m.bind(0, 0, textures);
+        textures[b.texture as usize].clone()
+    }
+
+    #[test]
+    fn a_change_inside_the_tiles_bytes_decodes_again_and_one_outside_does_not() {
+        let mut m = Tmem::default();
+        m.tiles[0] = small_tile();
+        let mut textures = Vec::new();
+        let first = rebind(&mut m, &mut textures);
+        m.mem[0x400] = 0xFF; // another texture's load
+        let same = rebind(&mut m, &mut textures);
+        assert!(
+            std::sync::Arc::ptr_eq(&same.rgba, &first.rgba),
+            "kept, and shared rather than copied"
+        );
+        assert_eq!(m.decoded.len(), 1);
+        m.mem[31] = 0xFF; // in the last texel
+        let changed = rebind(&mut m, &mut textures);
+        assert_eq!(m.decoded.len(), 2);
+        assert_ne!(changed.rgba, same.rgba);
+    }
+
+    #[test]
+    fn moving_or_scaling_a_tile_keeps_its_decoded_texture() {
+        let mut m = Tmem::default();
+        m.tiles[0] = small_tile();
+        let mut textures = Vec::new();
+        let first = rebind(&mut m, &mut textures);
+        m.tiles[0].ul = [4 << 2, 8 << 2];
+        m.tiles[0].lr = [7 << 2, 11 << 2];
+        m.tiles[0].shift = [1, 1];
+        let moved = rebind(&mut m, &mut textures);
+        assert!(std::sync::Arc::ptr_eq(&moved.rgba, &first.rgba));
+        // A different size is a different texture.
+        m.tiles[0].lr = [8 << 2, 11 << 2];
+        let wider = rebind(&mut m, &mut textures);
+        assert_eq!((wider.width, wider.height), (5, 4));
+    }
+
+    #[test]
+    fn the_decoded_cache_starts_over_past_its_byte_limit() {
+        let mut m = Tmem::default();
+        m.tiles[0] = small_tile();
+        let mut textures = Vec::new();
+        rebind(&mut m, &mut textures);
+        m.mem[0] = 1;
+        m.decoded_bytes = DECODED_MAX_BYTES - 1;
+        let tex = rebind(&mut m, &mut textures);
+        assert_eq!(m.decoded.len(), 1, "only the new texture");
+        assert_eq!(m.decoded_bytes, tex.rgba.len());
+    }
 
     #[test]
     fn ia4_texels_use_full_intensity_range() {

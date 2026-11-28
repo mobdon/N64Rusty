@@ -119,7 +119,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let image = Image {
                 width: t.width,
                 height: t.height,
-                rgba: t.rgba.clone(),
+                rgba: t.rgba.to_vec(),
             };
             write_png(&dir.join(format!("tex_{k:03}.png")), &image)?;
         }

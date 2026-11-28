@@ -1702,6 +1702,7 @@ version = "0.0.0"
 dependencies = [
  "font8x8",
  "gilrs",
+ "libc",
  "muda",
  "n64rusty-gfx",
  "rfd",

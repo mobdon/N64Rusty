@@ -161,6 +161,8 @@ Two debugging aids, in headless and window runs alike:
 
 The renderer keeps uploaded textures (by content), their bindings and its vertex, uniform and read-back buffers from one picture to the next. `N64RUSTY_TEXTURE_CACHE=off` and `N64RUSTY_BUFFER_REUSE=off` turn that back to the old upload-everything path, to compare pictures or speed.
 
+The vertex shader moves vertices to the screen (transform, flat-depth clamp, fog factor, widescreen narrowing and HUD shifts); the CPU still finds backgrounds, backdrops, overlays and HUD pieces, and moves the vertices of a draw whose transforms do not fit in one uniform-buffer window. `N64RUSTY_GPU_VERTICES=off` moves every vertex on the CPU instead, the reference path, to compare pictures or speed.
+
 `--expansion` runs with the Expansion Pak: 8 MB of RAM instead of 4 MB, as
 games that need it check.
 
@@ -196,13 +198,19 @@ out of view (objects it culls past the original edge) stay missing.
 `--capture-wide` saves headless captures in 16:9 the same way.
 
 When the display refreshes faster than the game (a 144 Hz monitor, say),
-the window draws at the display's rate by default (`refresh = 0`);
+the window draws at the display's rate by default (`refresh = 0`; on
+Android the default is once per game frame, which saves battery);
 `refresh = 144` under `[window]` picks a rate instead. Each picture between two game frames blends where
 every 3D object is, matched by the display list code that drew it, so
 motion is smoother while the game keeps running at its own rate. What you
 see trails the game by one frame, and 2D elements move only on game frames.
 `--capture-between` also saves, with each headless capture, the picture
 half-way from the frame before.
+
+`max_render_height = 720` under `[window]` (240 or more) draws the picture
+at most that many lines high and scales it up to the window: less work for
+the GPU on a large screen or a phone, at the cost of sharpness. It is off by
+default, and the picture is then drawn at the window's own resolution.
 
 On Windows, one script does it all: it builds the translator, translates
 your ROM, builds the game program, copies it to `local\<sha256>\game.exe` and

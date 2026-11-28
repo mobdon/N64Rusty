@@ -153,22 +153,79 @@ fn alpha_input(slot: usize, code: u8) -> &'static str {
 /// two-cycle mode runs the first cycle, then the second with its output as
 /// `COMBINED`.
 pub fn fragment_shader(combine: u64, two_cycle: bool) -> String {
-    shader(ShaderKey {
-        combine,
-        two_cycle,
-        alpha_test: 0,
-        flat: false,
-        sharp: false,
-        fog: false,
-    })
+    shader(
+        ShaderKey {
+            combine,
+            two_cycle,
+            alpha_test: 0,
+            flat: false,
+            sharp: false,
+            fog: false,
+        },
+        1,
+    )
 }
 
-pub(crate) fn shader(key: ShaderKey) -> String {
+/// Vertex flag: the position is in object space, for the shader to move to
+/// clip space with its transform; without it the vertex is already final
+/// (moved on the CPU).
+pub(crate) const VF_RAW: u32 = 1;
+/// Vertex flag: the shade alpha becomes the fog factor from the depth.
+pub(crate) const VF_FOG: u32 = 2;
+/// Vertex flag: part of a backdrop or overlay, not narrowed in widescreen.
+pub(crate) const VF_BACKDROP: u32 = 4;
+/// Vertex flag: a background rectangle stretched across the pixel span in
+/// `extra.zw`.
+pub(crate) const VF_STRETCH: u32 = 8;
+
+/// The vertex stage. A raw vertex (`VF_RAW`) is moved to clip space here:
+/// its transform (`xf`, a window of `transforms` from `u.misc.w` on), the
+/// flat-depth clamp, the fog factor (multiplier and offset in `extra.xy`)
+/// and the widescreen step: stretched (`VF_STRETCH`), kept (`VF_BACKDROP`),
+/// or narrowed by `u.misc.z` and shifted by `extra.z` (a HUD piece). The
+/// operations follow the CPU path's order so both round alike.
+fn vertex_stage(transforms: u32) -> String {
+    format!(
+        "struct Xf {{ m: mat4x4f, flat: vec4f }}
+@group(0) @binding(1) var<uniform> xf: array<Xf, {transforms}>;
+
+@vertex
+fn vs(@location(0) pos: vec4f, @location(1) color: vec4f, @location(2) uv0: vec2f, @location(3) uv1: vec2f, @location(4) extra: vec4f, @location(5) info: vec2u) -> VOut {{
+    if ((info.y & {VF_RAW}u) == 0u) {{
+        return VOut(pos, color, uv0, uv1);
+    }}
+    let t = xf[info.x - u32(u.misc.w)];
+    var p = t.m[0] * pos.x + t.m[1] * pos.y + t.m[2] * pos.z + t.m[3];
+    if (t.flat.x != 0.0 && p.w > 0.0) {{
+        p.z = clamp(p.z, 0.0, p.w);
+    }}
+    var c = color;
+    if ((info.y & {VF_FOG}u) != 0u && p.w > 0.0) {{
+        // Back from wgpu's 0 to 1 depth to the console's -1 to 1.
+        let z = 2.0 * p.z / p.w - 1.0;
+        c.a = clamp(z * extra.x + extra.y, 0.0, 255.0) / 255.0;
+    }}
+    if ((info.y & {VF_STRETCH}u) != 0u) {{
+        p.x = 2.0 * (pos.x - extra.z) / (extra.w - extra.z) - 1.0;
+    }} else if ((info.y & {VF_BACKDROP}u) == 0u) {{
+        p.x = p.x / u.misc.z + extra.z * p.w;
+    }}
+    return VOut(p, c, uv0, uv1);
+}}
+"
+    )
+}
+
+/// WGSL for one combiner setting, with room for `transforms` transforms
+/// in the vertex stage's window.
+pub(crate) fn shader(key: ShaderKey, transforms: u32) -> String {
     let c = Combiner::from_raw(key.combine);
     let interp = if key.flat { "@interpolate(flat)" } else { "" };
     let sample = if key.sharp { "sharp" } else { "textureSample" };
+    let vertex = vertex_stage(transforms);
     let mut s = format!(
-        "struct U {{ prim: vec4f, env: vec4f, blend: vec4f, misc: vec4f, fog: vec4f }}
+        "// misc: prim LOD, K5, widescreen narrowing, first transform of the window.
+struct U {{ prim: vec4f, env: vec4f, blend: vec4f, misc: vec4f, fog: vec4f }}
 @group(0) @binding(0) var<uniform> u: U;
 @group(1) @binding(0) var tex0: texture_2d<f32>;
 @group(1) @binding(1) var smp0: sampler;
@@ -176,17 +233,15 @@ pub(crate) fn shader(key: ShaderKey) -> String {
 @group(1) @binding(3) var smp1: sampler;
 
 struct VOut {{
-    @builtin(position) pos: vec4f,
+    // Invariant: each combiner has its own vertex shader, and the same
+    // geometry must land at the same depth in all of them.
+    @builtin(position) @invariant pos: vec4f,
     @location(0) {interp} color: vec4f,
     @location(1) uv0: vec2f,
     @location(2) uv1: vec2f,
 }}
 
-@vertex
-fn vs(@location(0) pos: vec4f, @location(1) color: vec4f, @location(2) uv0: vec2f, @location(3) uv1: vec2f) -> VOut {{
-    return VOut(pos, color, uv0, uv1);
-}}
-
+{vertex}
 // Sharp sampling: inside a magnified texel the colour stays flat and the
 // blend between texels narrows to one screen pixel, so low resolution
 // textures stay crisp when upscaled, with smooth edges instead of the
@@ -254,14 +309,17 @@ mod tests {
         let p = Combiner::from_raw(PRIM_ONLY);
         assert_eq!(p.color[1], [15, 15, 31, 3]);
         assert_eq!(p.alpha[1], [7, 7, 7, 3]);
-        assert!(shader(ShaderKey {
-            combine: PRIM_ONLY,
-            two_cycle: false,
-            alpha_test: 0,
-            flat: false,
-            sharp: false,
-            fog: false,
-        })
+        assert!(shader(
+            ShaderKey {
+                combine: PRIM_ONLY,
+                two_cycle: false,
+                alpha_test: 0,
+                flat: false,
+                sharp: false,
+                fog: false,
+            },
+            1
+        )
         .contains("(vec3f(0.0) - vec3f(0.0)) * vec3f(0.0) + u.prim.rgb"));
     }
 

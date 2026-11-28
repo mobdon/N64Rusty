@@ -14,7 +14,10 @@
 //! scale = 2                         # window is 320x240 times this
 //! widescreen = true                 # fill a wide window, showing more
 //! refresh = 144                     # draw this often, blending frames
-//!                                   # (0, the default: the display's rate)
+//!                                   # (0, the PC default: the display's rate;
+//!                                   # left out on Android: once per game frame)
+//! max_render_height = 720           # draw at most this many lines, scaled up
+//!                                   # (left out, the default: the window's size)
 //!
 //! [[port]]                          # ports 1 to 4, in order
 //! sources = ["keyboard", "gamepad0"]
@@ -77,11 +80,17 @@ pub struct WindowConfig {
     pub widescreen: bool,
     /// Draw the window this many times per second, with pictures blended
     /// between game frames; the game itself keeps `frame_rate`. 0 (the
-    /// default) is the display's own rate; None draws once per game frame.
+    /// default on PC) is the display's own rate; None (the default on
+    /// Android, see [`DEFAULT_REFRESH`]) draws once per game frame.
     pub refresh: Option<f64>,
     /// Textures as the console filters them, soft when stretched to the
     /// window. Off (the default) keeps magnified texels crisp.
     pub console_filter: bool,
+    /// Draw the window's picture at most this many lines high (at least
+    /// [`MIN_RENDER_HEIGHT`]), scaled up to the window: less GPU work on a
+    /// large screen, at the cost of sharpness. Unset (the default) draws at
+    /// the window's own resolution.
+    pub max_render_height: Option<u32>,
     /// Per-game HUD areas kept at the window's edges in widescreen:
     /// `[x0, y0, x1, y1, side]` in the game's 4:3 pixels, side -1 (left) or
     /// 1 (right). Screen-space pieces wholly inside one move with it.
@@ -104,14 +113,27 @@ impl WindowConfig {
     }
 }
 
+/// The default `refresh`: the display's rate on PC; once per game frame
+/// on Android, where drawing more often than the game makes pictures
+/// only costs battery.
+pub const DEFAULT_REFRESH: Option<f64> = if cfg!(target_os = "android") {
+    None
+} else {
+    Some(0.0)
+};
+
+/// The lowest `max_render_height`: the console's own picture height.
+pub const MIN_RENDER_HEIGHT: u32 = 240;
+
 impl Default for WindowConfig {
     fn default() -> Self {
         WindowConfig {
             title: "n64rusty".into(),
             scale: 2,
             widescreen: true,
-            refresh: Some(0.0),
+            refresh: DEFAULT_REFRESH,
             console_filter: false,
+            max_render_height: None,
             hud: Vec::new(),
             hud_when: None,
         }
@@ -259,6 +281,13 @@ impl RunConfig {
                 ));
             }
         }
+        if let Some(h) = cfg.window.max_render_height {
+            if h < MIN_RENDER_HEIGHT {
+                return Err(format!(
+                    "window max_render_height {h} is below {MIN_RENDER_HEIGHT}"
+                ));
+            }
+        }
         if !(1..=16).contains(&cfg.window.scale) {
             return Err(format!("window scale {} is not 1 to 16", cfg.window.scale));
         }
@@ -343,6 +372,8 @@ mod tests {
             RunConfig::parse("", Path::new("")).unwrap(),
             RunConfig::default()
         );
+        // Off unless asked for: the window's own resolution.
+        assert_eq!(WindowConfig::default().max_render_height, None);
     }
 
     #[test]
@@ -371,6 +402,7 @@ mod tests {
             scale = 3
             widescreen = true
             refresh = 144
+            max_render_height = 720
             hud = [[0, 0, 150, 60, -1]]
             hud_when = [0x80001234, 0]
             [[port]]
@@ -389,6 +421,7 @@ mod tests {
         assert_eq!(cfg.window.scale, 3);
         assert!(cfg.window.widescreen);
         assert_eq!(cfg.window.refresh, Some(144.0));
+        assert_eq!(cfg.window.max_render_height, Some(720));
         assert_eq!(cfg.window.hud, vec![[0.0, 0.0, 150.0, 60.0, -1.0]]);
         assert_eq!(cfg.window.hud_when, Some([0x8000_1234, 0]));
         assert_eq!(
@@ -421,6 +454,8 @@ mod tests {
             ("frame_rate = 0", "between"),
             ("[window]\nrefresh = inf", "between"),
             ("[window]\nrefresh = 0.5", "between"),
+            ("[window]\nmax_render_height = 100", "below 240"),
+            ("[window]\nmax_render_height = -1", "invalid value"),
             ("[[port]]\nsources = [\"mouse\"]", "unknown source"),
             (
                 "[[port]]\nsources = [\"keyboard\"]\ndeadzone = 0.1",
@@ -476,6 +511,12 @@ mod tests {
         );
         assert_eq!(w(Some(0.0)).redraw_rate(NTSC_RATE, Some(60.0)), None);
         assert_eq!(w(None).redraw_rate(NTSC_RATE, Some(165.0)), None);
+        let default = WindowConfig::default().refresh;
+        if cfg!(target_os = "android") {
+            assert_eq!(default, None);
+        } else {
+            assert_eq!(default, Some(0.0));
+        }
     }
 
     #[test]

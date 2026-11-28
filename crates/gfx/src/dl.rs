@@ -269,7 +269,71 @@ struct Drawn {
 
 impl Drawn {
     fn drawn_by(&self, d: &Draw) -> bool {
-        d.state.color_image == self.image && d.state.color_width == self.width
+        draws_into(d, self.image, self.width)
+    }
+}
+
+/// Whether `d` draws into the colour image at `image`, `width` wide.
+fn draws_into(d: &Draw, image: u32, width: u32) -> bool {
+    d.state.color_image == image && d.state.color_width == width
+}
+
+/// What a later read back of an image `f` drew needs: all of it but the
+/// warnings, written over `s` to reuse its buffers. Texture pixels are
+/// shared, not copied.
+fn snapshot(mut s: Frame, f: &Frame) -> Frame {
+    s.width = f.width;
+    s.color_image = f.color_image;
+    s.transforms.clone_from(&f.transforms);
+    s.vertices.clone_from(&f.vertices);
+    s.textures.clone_from(&f.textures);
+    s.commands.clone_from(&f.commands);
+    s.warnings.clear();
+    s.hud.clone_from(&f.hud);
+    s.image_height = f.image_height;
+    s.warnings_dropped = 0;
+    s
+}
+
+/// Reads `image` (`width` x `height`) back through `rb` from `frame`,
+/// lent for the call with only the draws into that image (others may share
+/// its address) and the image's size, then put back as it was.
+fn read_drawn(
+    frame: &mut Frame,
+    rb: &mut dyn Readback,
+    image: u32,
+    width: u32,
+    height: u32,
+) -> Option<Vec<u8>> {
+    let only = (frame.commands.iter())
+        .filter(|c| !matches!(c, Command::Draw(x) if !draws_into(x, image, width)))
+        .cloned()
+        .collect();
+    let commands = std::mem::replace(&mut frame.commands, only);
+    let size = (frame.width, frame.color_image, frame.image_height);
+    (frame.width, frame.color_image, frame.image_height) = (width, image, height);
+    let lent = Lent {
+        frame,
+        commands,
+        size,
+    };
+    rb.read(lent.frame, image, width, height)
+}
+
+/// A frame lent for a read back, put back as it was when dropped (also if
+/// the read panics: the interpreter keeps going after a panic).
+struct Lent<'a> {
+    frame: &'a mut Frame,
+    commands: Vec<Command>,
+    /// Width, colour image and image height.
+    size: (u32, u32, u32),
+}
+
+impl Drop for Lent<'_> {
+    fn drop(&mut self) {
+        let f = &mut *self.frame;
+        f.commands = std::mem::take(&mut self.commands);
+        (f.width, f.color_image, f.image_height) = self.size;
     }
 }
 
@@ -278,7 +342,9 @@ impl Drawn {
 /// frame buffer, an image drawn to show inside another).
 pub trait Readback {
     /// RGBA8 of `image` (`width` x `height`, top row first), drawn from the
-    /// draws in `frame` aimed at it; `None` if it cannot be drawn.
+    /// draws in `frame` aimed at it; `None` if it cannot be drawn. The
+    /// interpreter hands over `frame` with only those draws, and with its
+    /// `width`, `color_image` and `image_height` already naming the image.
     fn read(&mut self, frame: &Frame, image: u32, width: u32, height: u32) -> Option<Vec<u8>>;
 }
 
@@ -387,13 +453,24 @@ impl Interpreter {
             ..Frame::default()
         };
         let f = std::mem::replace(&mut self.frame, next);
-        let mut snap = None;
-        for d in &mut self.drawn {
-            if f.draws().any(|x| d.drawn_by(x)) {
-                d.frame = Some(
-                    snap.get_or_insert_with(|| std::sync::Arc::new(f.clone()))
-                        .clone(),
-                );
+        let by_f: Vec<bool> = (self.drawn.iter())
+            .map(|d| f.draws().any(|x| d.drawn_by(x)))
+            .collect();
+        // The snapshots replaced lend their buffers to the new one, if no
+        // other image still holds them.
+        let replaced: Vec<_> = (self.drawn.iter_mut().zip(&by_f))
+            .filter(|(_, by_f)| **by_f)
+            .filter_map(|(d, _)| d.frame.take())
+            .collect();
+        let spare = replaced
+            .into_iter()
+            .find_map(|s| std::sync::Arc::try_unwrap(s).ok());
+        let snap = by_f
+            .contains(&true)
+            .then(|| std::sync::Arc::new(snapshot(spare.unwrap_or_default(), &f)));
+        for (d, by_f) in self.drawn.iter_mut().zip(by_f) {
+            if by_f {
+                d.frame = snap.clone();
                 d.age = 0;
             } else {
                 d.age += 1;
@@ -1019,16 +1096,25 @@ impl Interpreter {
         self.push(state, &verts);
     }
 
-    /// Decode the draw's two tiles, if texturing is on.
+    /// Decode the draw's tiles, if texturing is on: the second only when
+    /// the combiner reads it.
     fn tiles(&mut self) -> [Option<crate::tmem::Bound>; 2] {
         if !self.tex_on {
             return [None; 2];
         }
         let tlut = (self.state.other_h >> 14) & 3;
+        let second = self.reads_texel1();
         [0, 1].map(|k| {
             let tile = (self.tex_tile + k) & 7;
-            Some(self.tmem.bind(tile, tlut, &mut self.frame.textures))
+            (k == 0 || second).then(|| self.tmem.bind(tile, tlut, &mut self.frame.textures))
         })
+    }
+
+    /// Whether the combiner reads texel 1 (the tile after the draw's), in
+    /// the cycles that run.
+    fn reads_texel1(&self) -> bool {
+        crate::combiner::Combiner::from_raw(self.state.combine)
+            .reads_texel1(self.cycle_type() == G_CYC_2CYCLE)
     }
 
     fn push(&mut self, state: RenderState, verts: &[Vertex]) {
@@ -1119,42 +1205,33 @@ impl Interpreter {
             return;
         }
         self.drawn[k].read = true;
-        let d = self.drawn[k].clone();
-        let here = self.frame.draws().any(|x| d.drawn_by(x));
-        let Some(from) = (if here {
-            Some(&self.frame)
+        let (a, width, height, siz) = {
+            let d = &self.drawn[k];
+            (d.image, d.width, d.height, d.siz)
+        };
+        let here = self.frame.draws().any(|x| draws_into(x, a, width));
+        // Lent, not copied: the frame being recorded, or the handed-over
+        // one (copied only if other images share it).
+        let from = if here {
+            &mut self.frame
         } else {
-            d.frame.as_deref()
-        }) else {
+            match self.drawn[k].frame.as_mut() {
+                Some(f) => std::sync::Arc::make_mut(f),
+                None => return,
+            }
+        };
+        let Some(px) = read_drawn(from, rb, a, width, height) else {
             return;
         };
-        // Only the draws into this image: others may share its address.
-        let frame = Frame {
-            commands: from
-                .commands
-                .iter()
-                .filter(|c| !matches!(c, Command::Draw(x) if !d.drawn_by(x)))
-                .cloned()
-                .collect(),
-            ..from.clone()
-        };
-        let (a, siz) = (d.image, d.siz);
-        let Some(px) = rb.read(&frame, a, d.width, d.height) else {
-            return;
-        };
-        let want = d.width as usize * d.height as usize * RGBA_BYTES;
+        let want = width as usize * height as usize * RGBA_BYTES;
         if px.len() != want {
             self.warn(format!(
-                "drawn image {a:#010x} not read back: {} bytes for {} x {}, not {want}",
+                "drawn image {a:#010x} not read back: {} bytes for {width} x {height}, not {want}",
                 px.len(),
-                d.width,
-                d.height
             ));
             return;
         }
-        for (i, p) in px.as_chunks::<4>().0.iter().enumerate() {
-            put_pixel(ram, a, siz, i as u32, *p);
-        }
+        put_pixels(ram, a, siz, &px);
     }
 
     /// Pixels (`x0..x1`, `y0..y1`) of the colour image inside the scissor.
@@ -1306,7 +1383,7 @@ impl Interpreter {
         self.frame.textures.push(crate::Texture {
             width: w.max(1),
             height: ht.max(1),
-            rgba,
+            rgba: rgba.into(),
             wrap: [crate::Wrap::Clamp; 2],
         });
         let (x0, y0) = (f32::from(frame_x) / 4.0, f32::from(frame_y) / 4.0);
@@ -1382,21 +1459,23 @@ impl Interpreter {
             || (dsdx.abs() == 1.0 && dtdy.abs() == 1.0 && s.fract() == 0.0 && t.fract() == 0.0);
         state.geometry = 0;
         let tlut = (self.state.other_h >> 14) & 3;
-        let b0 = self.tmem.bind(tile, tlut, &mut self.frame.textures);
-        let b1 = self
-            .tmem
-            .bind((tile + 1) & 7, tlut, &mut self.frame.textures);
-        state.textures = [Some(b0.texture), Some(b1.texture)];
         if copy {
             state.combine = crate::combiner::TEXEL0_ONLY;
         }
+        let b0 = self.tmem.bind(tile, tlut, &mut self.frame.textures);
+        // Copy mode reads only texel 0.
+        let b1 = (!copy && self.reads_texel1()).then(|| {
+            self.tmem
+                .bind((tile + 1) & 7, tlut, &mut self.frame.textures)
+        });
+        state.textures = [Some(b0.texture), b1.map(|b| b.texture)];
         let uv = move |x: usize, y: usize| {
             let p = if flip {
                 [st[y][0], st[x][1]]
             } else {
                 [st[x][0], st[y][1]]
             };
-            [b0.uv(p, false), b1.uv(p, false)]
+            [b0.uv(p, false), b1.map_or([0.0; 2], |b| b.uv(p, false))]
         };
         self.push_rect([x0, y0, x1, y1], uv, state);
     }
@@ -1457,9 +1536,33 @@ fn put_pixel(ram: &mut [u8], image: u32, siz: u32, i: u32, c: [u8; 4]) {
     } else if siz == 1 {
         put_raw(ram, image + i, &c[..1]);
     } else {
-        let ch = |v: u8| u16::from(v >> 3);
-        let p = ch(c[0]) << 11 | ch(c[1]) << 6 | ch(c[2]) << 1 | u16::from(c[3] >= 128);
-        put_raw(ram, image + 2 * i, &p.to_be_bytes());
+        put_raw(ram, image + 2 * i, &to_rgba5551(c).to_be_bytes());
+    }
+}
+
+/// RGBA8 `c` as an RGBA5551 pixel (alpha set from 128 up).
+fn to_rgba5551(c: [u8; 4]) -> u16 {
+    let ch = |v: u8| u16::from(v >> 3);
+    ch(c[0]) << 11 | ch(c[1]) << 6 | ch(c[2]) << 1 | u16::from(c[3] >= 128)
+}
+
+/// Writes the RGBA8 pixels `px` as the colour image at `image` with pixel
+/// size code `siz`, as [`put_pixel`] does each one, into one slice of RAM:
+/// pixels past the end of RAM are dropped.
+fn put_pixels(ram: &mut [u8], image: u32, siz: u32, px: &[u8]) {
+    let Some(dst) = ram.get_mut(image as usize..) else {
+        return;
+    };
+    let px = px.as_chunks::<4>().0;
+    match siz {
+        3 => {
+            let n = px.len().min(dst.len() / 4) * 4;
+            dst[..n].copy_from_slice(&px.as_flattened()[..n]);
+        }
+        1 => dst.iter_mut().zip(px).for_each(|(d, c)| *d = c[0]),
+        _ => (dst.as_chunks_mut::<2>().0.iter_mut())
+            .zip(px)
+            .for_each(|(d, c)| *d = to_rgba5551(*c).to_be_bytes()),
     }
 }
 
@@ -1497,6 +1600,49 @@ mod tests {
     impl Readback for NoReadback {
         fn read(&mut self, _: &Frame, _: u32, _: u32, _: u32) -> Option<Vec<u8>> {
             None
+        }
+    }
+
+    /// The per-pixel writes `put_pixels` stands in for: the reference.
+    fn put_each(ram: &mut [u8], image: u32, siz: u32, px: &[u8]) {
+        for (i, p) in px.as_chunks::<4>().0.iter().enumerate() {
+            put_pixel(ram, image, siz, i as u32, *p);
+        }
+    }
+
+    #[test]
+    fn put_pixels_matches_put_pixel_also_past_the_end_of_ram() {
+        let px: Vec<u8> = (0..64 * 4).map(|k| (k * 37 + 11) as u8).collect();
+        for siz in 0..4 {
+            // Inside, odd start, straddling the end, at the end, past it.
+            for image in [0, 3, 1000, 1023, 1024, 2000] {
+                let mut want = vec![0xA5; 1024];
+                let mut got = want.clone();
+                put_each(&mut want, image, siz, &px);
+                put_pixels(&mut got, image, siz, &px);
+                assert_eq!(got, want, "siz {siz} image {image}");
+            }
+        }
+    }
+
+    /// `cargo test -p n64rusty-gfx --release put_pixels_timing -- --ignored
+    /// --nocapture`: read-back RAM writes per pixel against in bulk.
+    #[test]
+    #[ignore = "timing, not a check"]
+    fn put_pixels_timing() {
+        let px: Vec<u8> = (0..640 * 480 * 4).map(|k| k as u8).collect();
+        let mut ram = vec![0; 8 << 20];
+        let mut time = |put: fn(&mut [u8], u32, u32, &[u8]), siz| {
+            let t = std::time::Instant::now();
+            for _ in 0..100 {
+                put(std::hint::black_box(&mut ram), 0x10_0000, siz, &px);
+            }
+            t.elapsed() / 100
+        };
+        for siz in [2, 3] {
+            let each = time(put_each, siz);
+            let bulk = time(put_pixels, siz);
+            println!("640x480 siz {siz}: per pixel {each:?}, bulk {bulk:?}");
         }
     }
 

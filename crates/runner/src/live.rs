@@ -34,7 +34,7 @@ use n64rusty_runtime::Ctx;
 use winit::window::Window;
 
 use crate::devices::{Devices, Pad};
-use crate::media::Media;
+use crate::media::{open_gpu, Media, SharedGpu};
 
 /// The last finished frame, waiting to be drawn.
 type Shown = Arc<Mutex<Option<Frame>>>;
@@ -116,7 +116,12 @@ pub struct Screen {
     shown: Shown,
     sound: Option<Receiver<Sound>>,
     window: Option<(Arc<Window>, Renderer, WindowTarget)>,
+    /// The game side's device, which the window's renderer shares.
+    gpu: SharedGpu,
     widescreen: bool,
+    /// Lines the window's picture is drawn at, at most (scaled up to the
+    /// window); `None` draws at the window's own resolution.
+    max_height: Option<u32>,
     sharp: bool,
     /// One game frame, when pictures are blended between game frames.
     blend: Option<Duration>,
@@ -124,12 +129,39 @@ pub struct Screen {
     prev: Option<Frame>,
     /// The newest game frame and when it arrived.
     cur: Option<(Frame, Instant)>,
+    /// Game frames taken for blending so far: names the newest one.
+    taken: u64,
+    /// The last picture blended into the window; None when the window must
+    /// be drawn again (new window, new picture settings).
+    drawn: Option<Picture>,
+}
+
+/// One blended picture in the window: which game frame, how far it is
+/// blended from the one before, at what window size. The same picture
+/// twice in a row is the same pixels, so it is drawn only once.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Picture {
+    frame: u64,
+    t: f32,
+    size: (u32, u32),
+}
+
+/// How far (0 to 1) a picture is from the game frame before the newest
+/// one to the newest one, `elapsed` after the newest came, with game frames
+/// `period` apart: 1 (all of the newest) with no frame before it to blend
+/// from, or once a whole period has passed.
+fn blend_t(has_prev: bool, elapsed: Duration, period: Duration) -> f32 {
+    if !has_prev {
+        return 1.0;
+    }
+    (elapsed.as_secs_f32() / period.as_secs_f32()).min(1.0)
 }
 
 /// Connects the two sides. `media` supplies graphics, audio and capture.
 pub fn pair(mut media: Media) -> (Live, Screen) {
     let shown = Shown::default();
     media.show_frames(shown.clone());
+    let gpu = media.gpu();
     let (input_tx, input_rx) = mpsc::sync_channel(1);
     // About two seconds of buffers; the speakers keep at most half a second.
     let (sound_tx, sound_rx) = mpsc::sync_channel(120);
@@ -146,11 +178,15 @@ pub fn pair(mut media: Media) -> (Live, Screen) {
         shown,
         sound: Some(sound_rx),
         window: None,
+        gpu,
         widescreen: false,
+        max_height: None,
         sharp: true,
         blend: None,
         prev: None,
         cur: None,
+        taken: 0,
+        drawn: None,
     };
     (live, screen)
 }
@@ -163,32 +199,36 @@ impl Guest for Screen {
             // The game side is gone; the process is exiting.
             return;
         }
-        if self.blend.is_some() {
-            self.redraw();
-        } else {
+        if self.blend.is_none() {
             self.present();
+        } else if self.has_new_frame() {
+            // A new game frame shows at once, as before; other blended
+            // pictures are drawn by `redraw`, at the window's rate.
+            self.redraw();
         }
     }
 
     fn redraw(&mut self) {
-        let Some(period) = self.blend else { return };
-        let taken = self.shown.lock().unwrap_or_else(|e| e.into_inner()).take();
-        if let Some(f) = taken {
-            self.prev = self.cur.take().map(|(f, _)| f);
-            self.cur = Some((f, Instant::now()));
-        }
-        let (Some((window, renderer, target)), Some((cur, at))) = (&mut self.window, &self.cur)
-        else {
+        let Some((window, _, _)) = &self.window else {
             return;
         };
         let size = window.inner_size();
-        let t = (at.elapsed().as_secs_f32() / period.as_secs_f32()).min(1.0);
-        let r = match &self.prev {
-            Some(prev) => renderer.present_between(prev, cur, t, target, size.width, size.height),
-            None => renderer.present(cur, target, size.width, size.height),
+        let Some(picture) = self.next_picture((size.width, size.height), Instant::now()) else {
+            return;
         };
-        if let Err(e) = r {
-            eprintln!("warning: frame not shown: {e}");
+        let (Some((_, renderer, target)), Some((cur, _))) = (&mut self.window, &self.cur) else {
+            return;
+        };
+        let (width, height) = picture.size;
+        let r = match &self.prev {
+            Some(prev) => renderer.present_between(prev, cur, picture.t, target, width, height),
+            None => renderer.present(cur, target, width, height),
+        };
+        match r {
+            // shortcut: a picture the surface skipped (minimised, outdated)
+            // counts as drawn; a new size or game frame draws again.
+            Ok(()) => self.drawn = Some(picture),
+            Err(e) => eprintln!("warning: frame not shown: {e}"),
         }
         profile_window(renderer);
     }
@@ -196,24 +236,30 @@ impl Guest for Screen {
     fn view(&mut self, w: &n64rusty_host::config::WindowConfig, blend: Option<f64>) {
         self.widescreen = w.widescreen;
         self.sharp = !w.console_filter;
+        self.max_height = w.max_render_height;
         self.blend = blend.map(|rate| Duration::from_secs_f64(1.0 / rate));
+        self.drawn = None;
         if let Some((_, r, _)) = &mut self.window {
             r.set_widescreen(self.widescreen);
             r.set_sharp_textures(self.sharp);
+            r.set_max_height(self.max_height);
         }
     }
 
     fn attach_window(&mut self, window: Arc<Window>) {
-        let target = Renderer::new().and_then(|mut r| {
+        let target = open_gpu(&self.gpu).and_then(|g| {
+            let mut r = Renderer::on(g);
             r.set_widescreen(self.widescreen);
             r.set_sharp_textures(self.sharp);
-            let t = r.window_target(window.clone())?;
+            r.set_max_height(self.max_height);
+            let t = r.window_target(window.clone()).map_err(|e| e.to_string())?;
             Ok((r, t))
         });
         match target {
             Ok((r, t)) => self.window = Some((window, r, t)),
             Err(e) => eprintln!("warning: cannot draw into the window: {e}"),
         }
+        self.drawn = None;
         if let Some(rx) = self.sound.take() {
             std::thread::spawn(move || speakers(rx));
         }
@@ -236,6 +282,39 @@ fn speakers(rx: Receiver<Sound>) {
 }
 
 impl Screen {
+    /// Takes the newest finished game frame for blending, if there is one,
+    /// and gives the picture to draw at `now` in a window of `size`: None
+    /// when not blending, before the first game frame, or when it would be
+    /// the picture drawn last (no new game frame, no change in the blend
+    /// and the same size).
+    fn next_picture(&mut self, size: (u32, u32), now: Instant) -> Option<Picture> {
+        let period = self.blend?;
+        let taken = self.shown.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(f) = taken {
+            self.prev = self.cur.take().map(|(f, _)| f);
+            self.cur = Some((f, now));
+            self.taken += 1;
+        }
+        let (cur, at) = self.cur.as_ref()?;
+        // Frames of different sizes are not blended (see
+        // `n64rusty_gfx::interpolate`): every t is the same picture.
+        let blends = self.prev.as_ref().is_some_and(|p| p.width == cur.width);
+        let picture = Picture {
+            frame: self.taken,
+            t: blend_t(blends, now.saturating_duration_since(*at), period),
+            size,
+        };
+        (self.drawn != Some(picture)).then_some(picture)
+    }
+
+    /// Whether a finished game frame waits to be taken.
+    fn has_new_frame(&self) -> bool {
+        self.shown
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
+
     /// Draws the newest finished frame, if there is one, at the window's
     /// size, straight on the GPU.
     fn present(&mut self) {
@@ -295,6 +374,7 @@ pub fn play(
     let (live, mut screen) = pair(media);
     screen.widescreen = cfg.window.widescreen;
     screen.sharp = !cfg.window.console_filter;
+    screen.max_height = cfg.window.max_render_height;
     let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stopped = stopping.clone();
     let game = std::thread::Builder::new()
@@ -397,5 +477,124 @@ mod tests {
         // Finished frames reach the screen; with no window none is drawn.
         assert!(shown.lock().unwrap().is_some());
         drop(screen);
+    }
+
+    #[test]
+    fn blend_t_runs_from_the_frame_before_to_the_newest() {
+        let ms = Duration::from_millis;
+        assert_eq!(blend_t(true, ms(0), ms(20)), 0.0);
+        assert_eq!(blend_t(true, ms(10), ms(20)), 0.5);
+        assert_eq!(blend_t(true, ms(20), ms(20)), 1.0);
+        assert_eq!(blend_t(true, ms(500), ms(20)), 1.0);
+        // Nothing to blend from: all of the newest.
+        assert_eq!(blend_t(false, ms(0), ms(20)), 1.0);
+    }
+
+    /// A screen blending game frames `period` apart, with no window.
+    fn blending(period: Duration) -> Screen {
+        let (_, mut screen) = pair(Media::new(None, 60, None, false, None));
+        screen.blend = Some(period);
+        screen
+    }
+
+    #[test]
+    fn window_and_game_side_share_one_device() {
+        let (live, screen) = pair(Media::new(None, 60, None, false, None));
+        assert!(Arc::ptr_eq(&live.media.gpu(), &screen.gpu));
+    }
+
+    /// Takes the next picture as `redraw` does, marking it drawn.
+    fn draw(screen: &mut Screen, size: (u32, u32), now: Instant) -> bool {
+        let picture = screen.next_picture(size, now);
+        if picture.is_some() {
+            screen.drawn = picture;
+        }
+        picture.is_some()
+    }
+
+    #[test]
+    fn a_picture_is_drawn_once_until_something_changes() {
+        let ms = Duration::from_millis;
+        let size = (640, 480);
+        let t0 = Instant::now();
+        let mut s = blending(ms(20));
+        // No game frame yet: nothing to draw.
+        assert!(!draw(&mut s, size, t0));
+        // The first game frame has none before it: drawn once, as it is.
+        *s.shown.lock().unwrap() = Some(Frame::default());
+        assert!(draw(&mut s, size, t0));
+        assert!(!draw(&mut s, size, t0 + ms(10)));
+        // A new size draws it again; new picture settings too.
+        assert!(draw(&mut s, (800, 480), t0 + ms(10)));
+        assert!(!draw(&mut s, (800, 480), t0 + ms(10)));
+        s.view(&Default::default(), Some(50.0));
+        assert!(draw(&mut s, (800, 480), t0 + ms(10)));
+        // The second frame blends from the first until a period has passed.
+        s.blend = Some(ms(20));
+        *s.shown.lock().unwrap() = Some(Frame::default());
+        assert!(draw(&mut s, size, t0 + ms(20)));
+        assert!(!draw(&mut s, size, t0 + ms(20)));
+        assert!(draw(&mut s, size, t0 + ms(30)));
+        assert!(draw(&mut s, size, t0 + ms(40)));
+        assert!(!draw(&mut s, size, t0 + ms(50)));
+        // Without blending `redraw` draws nothing (frames are drawn as
+        // they come, by `frame`).
+        s.blend = None;
+        *s.shown.lock().unwrap() = Some(Frame::default());
+        assert!(!draw(&mut s, size, t0 + ms(60)));
+    }
+
+    /// Measures the pictures drawn in one second: host frames at 50 Hz, a
+    /// game making a frame every second host frame (25 a second), and the
+    /// window drawn at 100 Hz. A host frame draws only when a game frame
+    /// waits, as `frame` does, so each game frame shows at the host frame
+    /// it comes in. Before, every window tick and every host frame drew a
+    /// picture: 150.
+    #[test]
+    fn a_slow_game_draws_only_pictures_that_change() {
+        let ms = Duration::from_millis;
+        let t0 = Instant::now();
+        let size = (640, 480);
+        let mut s = blending(ms(20));
+        let mut drawn = 0;
+        for tick in 0..100u32 {
+            let now = t0 + ms(u64::from(tick) * 10);
+            if tick % 2 == 0 {
+                // A host frame: the game's frame comes every second one.
+                if tick % 4 == 0 {
+                    *s.shown.lock().unwrap() = Some(Frame::default());
+                }
+                if s.has_new_frame() {
+                    assert!(draw(&mut s, size, now));
+                    assert_eq!(s.cur.as_ref().map(|(_, at)| *at), Some(now));
+                    drawn += 1;
+                }
+            }
+            // The window's tick, at the same moment: already drawn.
+            drawn += u32::from(draw(&mut s, size, now));
+        }
+        // The first frame once; each later one at t = 0, 0.5 and 1, and
+        // not again while the game makes the next.
+        assert_eq!(drawn, 1 + 24 * 3);
+    }
+
+    #[test]
+    fn frames_of_another_size_are_drawn_once() {
+        let ms = Duration::from_millis;
+        let size = (640, 480);
+        let t0 = Instant::now();
+        let mut s = blending(ms(20));
+        *s.shown.lock().unwrap() = Some(Frame::default());
+        assert!(draw(&mut s, size, t0));
+        // A wider frame is not blended from the one before: every t would
+        // be the same picture.
+        *s.shown.lock().unwrap() = Some(Frame {
+            width: 640,
+            ..Frame::default()
+        });
+        assert!(draw(&mut s, size, t0 + ms(20)));
+        assert_eq!(s.drawn.map(|p| p.t), Some(1.0));
+        assert!(!draw(&mut s, size, t0 + ms(30)));
+        assert!(!draw(&mut s, size, t0 + ms(40)));
     }
 }

@@ -8,11 +8,11 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use n64rusty_audio::{AudioRsp, Wav};
-use n64rusty_gfx::{write_png, Frame, Image, Interpreter, Readback, RenderError, Renderer};
+use n64rusty_gfx::{write_png, Frame, Gpu, Image, Interpreter, Readback, RenderError, Renderer};
 use n64rusty_host::script::Player;
 use n64rusty_runtime::Ctx;
 
@@ -81,6 +81,8 @@ pub struct Media {
     hud_when: Option<[u32; 2]>,
     /// The frame before the next one to save, kept when `between` is set.
     prev: Option<Frame>,
+    /// The device every renderer of the run draws on.
+    gpu: SharedGpu,
     renderer: Option<Renderer>,
     renderer_failed: bool,
     tasks: u64,
@@ -126,18 +128,34 @@ pub(crate) fn samples(ctx: &Ctx, addr: u32, len: u32) -> Vec<i16> {
         .collect()
 }
 
-/// The off-screen renderer, made on first use (and then set up by `setup`).
-/// When one cannot be made, says so once, with `lost` naming what is not
-/// done without it, and gives none from then on.
+/// A run's graphics device, opened on first use and shared by all its
+/// renderers (the window's too, see `live::pair`), so a run opens one.
+pub(crate) type SharedGpu = Arc<OnceLock<Gpu>>;
+
+/// The device of `gpu`, opened if it is not yet. A failure is not kept, so
+/// a later call (a resumed window, say) tries again.
+pub(crate) fn open_gpu(gpu: &SharedGpu) -> Result<&Gpu, String> {
+    if let Some(g) = gpu.get() {
+        return Ok(g);
+    }
+    let g = Gpu::open().map_err(|e| e.to_string())?;
+    Ok(gpu.get_or_init(|| g))
+}
+
+/// The off-screen renderer, made on first use on `gpu` (and then set up by
+/// `setup`). When one cannot be made, says so once, with `lost` naming what
+/// is not done without it, and gives none from then on.
 fn renderer_on_demand<'a>(
     renderer: &'a mut Option<Renderer>,
     failed: &mut bool,
+    gpu: &SharedGpu,
     lost: &str,
     setup: impl FnOnce(&mut Renderer),
 ) -> Option<&'a mut Renderer> {
     if renderer.is_none() && !*failed {
-        match Renderer::new() {
-            Ok(mut r) => {
+        match open_gpu(gpu) {
+            Ok(g) => {
+                let mut r = Renderer::on(g);
                 setup(&mut r);
                 *renderer = Some(r);
             }
@@ -222,6 +240,7 @@ impl Media {
             hud: Vec::new(),
             hud_when: None,
             prev: None,
+            gpu: SharedGpu::default(),
             renderer: None,
             renderer_failed: false,
             tasks: 0,
@@ -280,6 +299,11 @@ impl Media {
         self
     }
 
+    /// The device this run's renderers draw on, for a window to share.
+    pub(crate) fn gpu(&self) -> SharedGpu {
+        self.gpu.clone()
+    }
+
     /// Hands every finished frame to `slot`, replacing one not yet taken.
     pub fn show_frames(&mut self, slot: Arc<Mutex<Option<Frame>>>) {
         self.shown = Some(slot);
@@ -302,6 +326,7 @@ impl Media {
         let Some(r) = renderer_on_demand(
             &mut self.renderer,
             &mut self.renderer_failed,
+            &self.gpu,
             "frames are not saved",
             |r| r.set_widescreen(wide),
         ) else {
@@ -371,6 +396,7 @@ impl Media {
 struct GpuReadback<'a> {
     renderer: &'a mut Option<Renderer>,
     failed: &'a mut bool,
+    gpu: &'a SharedGpu,
     /// Sizes already warned about as not read back.
     warned: &'a mut HashSet<(u32, u32)>,
     /// Widescreen setting of saved frames, restored after each read.
@@ -382,17 +408,27 @@ impl Readback for GpuReadback<'_> {
         let r = renderer_on_demand(
             self.renderer,
             self.failed,
+            self.gpu,
             "drawn images are not read back",
             |_| {},
         )?;
-        let f = Frame {
-            width,
-            color_image: image,
-            image_height: height,
-            ..frame.clone()
+        // The interpreter hands the frame over already naming the image;
+        // a copy only for one that does not.
+        let named = (frame.width, frame.color_image, frame.image_height) == (width, image, height);
+        let renamed;
+        let f = if named {
+            frame
+        } else {
+            renamed = Frame {
+                width,
+                color_image: image,
+                image_height: height,
+                ..frame.clone()
+            };
+            &renamed
         };
         r.set_widescreen(false);
-        let img = r.render(&f, width, height);
+        let img = r.render(f, width, height);
         r.set_widescreen(self.wide);
         readback_pixels(img, width, height, self.warned)
     }
@@ -482,6 +518,7 @@ impl Devices for Media {
         let mut rb = GpuReadback {
             renderer: &mut self.renderer,
             failed: &mut self.renderer_failed,
+            gpu: &self.gpu,
             warned: &mut self.readback_warned,
             wide: self.wide,
         };

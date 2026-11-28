@@ -834,10 +834,11 @@ fn reschedule(c: &mut Ctx, mut st: MutexGuard<'static, State>) -> MutexGuard<'st
             spawn_thread(best, generation);
         }
         st.threads[&best].cv.notify_one();
-        // The main thread watches for the boot thread ending.
-        os().cv.notify_all();
         if mine == Some(TState::Dead) {
-            // A finished thread never runs guest code again.
+            // The main thread watches for the boot thread ending: only a
+            // thread's end can change that, so other switches wake no one
+            // else. A finished thread never runs guest code again.
+            os().cv.notify_all();
             park(st);
         }
         st = wait_turn(st, me);

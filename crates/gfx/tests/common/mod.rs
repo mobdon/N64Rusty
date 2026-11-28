@@ -335,3 +335,51 @@ pub fn setup(ram: &mut Ram, dl: &mut Dl) {
         .mtx(proj, LOAD | PROJECTION)
         .mtx(ident, LOAD);
 }
+
+/// A busy textured frame for timing: `objects` objects of ten triangles,
+/// each loading one of `textures` 32x32 RGBA16 textures first, as games
+/// draw. Returns the display list's address.
+pub fn textured_scene(ram: &mut Ram, objects: u32, textures: u32) -> u32 {
+    const SIDE: u32 = 32;
+    const VERTS: u32 = 30;
+    let mut seed = 0x2545_F491u32;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed
+    };
+    let tex: Vec<u32> = (0..textures)
+        .map(|_| {
+            let texels: Vec<u8> = (0..SIDE * SIDE * 2).map(|_| next() as u8).collect();
+            ram.put(&texels)
+        })
+        .collect();
+    let mut dl = Dl::default();
+    setup(ram, &mut dl);
+    dl.other_modes(CYCLE_1, 0)
+        .combine(pass(TEXEL0))
+        .texture(true, 0);
+    for k in 0..objects {
+        let verts: Vec<V> = (0..VERTS)
+            .map(|_| {
+                let c = |r: u32| (r % 200) as i16 - 100;
+                let mut p = v(c(next()), c(next()), c(next()), [255; 4]);
+                p.st = [(next() % 1024) as i16, (next() % 1024) as i16];
+                p
+            })
+            .collect();
+        let verts = ram.vertices(&verts);
+        dl.timg(0, 2, 1, tex[(k % textures) as usize])
+            .tile(0, 2, 0, 0, 7)
+            .load_block(7, SIDE * SIDE)
+            .tile(0, 2, SIDE * 2 / 8, 0, 0)
+            .tile_size(0, SIDE, SIDE)
+            .vtx(verts, VERTS, 0);
+        for t in 0..VERTS / 3 {
+            dl.tri(3 * t, 3 * t + 1, 3 * t + 2);
+        }
+    }
+    dl.end();
+    ram.dl(&dl)
+}
