@@ -1048,7 +1048,19 @@ fn a_pop_with_nothing_pushed_keeps_the_loaded_matrix() {
 }
 
 #[test]
-#[ignore = "bug: popping more matrices than were pushed pops to the bottom instead of being ignored"]
+fn a_zero_byte_pop_pops_no_matrix() {
+    // G_POPMTX's w1 is a byte count; 0 bytes pops no matrix.
+    const PUSHES: usize = 2;
+    let mut ram = Ram::default();
+    let mut dl = Dl::default();
+    let (_, verts) = push_translations(&mut ram, &mut dl, PUSHES);
+    dl.pop(0).vtx(verts, 1, 0).end();
+    let addr = ram.dl(&dl);
+    let f = run(&ram, addr);
+    assert_eq!(f.transforms[0].modelview, translate_x(PUSHES));
+}
+
+#[test]
 fn a_pop_of_more_than_was_pushed_changes_nothing() {
     // F3DEX2's G_POPMTX skips a pop that would go below the stack's base
     // (as GLideN64's gSPPopMatrixN does: "pop matrix stack below 0").
@@ -1063,7 +1075,6 @@ fn a_pop_of_more_than_was_pushed_changes_nothing() {
 }
 
 #[test]
-#[ignore = "bug: a matrix pop keeps a gSPInsertMatrix-edited combined matrix instead of recomputing it"]
 fn a_pop_after_insert_matrix_uses_the_popped_modelview() {
     // F3DEX2 marks the combined matrix stale on G_POPMTX as on G_MTX, so
     // the next vertices use the restored modelview times the projection.

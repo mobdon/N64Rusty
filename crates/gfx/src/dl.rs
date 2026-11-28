@@ -43,6 +43,8 @@ impl std::error::Error for GfxError {}
 const VTX_BUFFER: usize = 32;
 const DL_STACK: usize = 18;
 const MTX_STACK: usize = 32;
+/// Bytes per matrix on the RSP stack: G_POPMTX's w1 counts these.
+const MTX_BYTES: u32 = 64;
 /// Bytes per pixel a [`Readback`] hands back (RGBA8).
 const RGBA_BYTES: usize = 4;
 const MAX_COMMANDS: usize = 1 << 20;
@@ -427,9 +429,14 @@ impl Interpreter {
                     self.tex_on = w0 & 0xFE != 0;
                 }
                 0xD8 => {
-                    let n = (w1 / 64).max(1) as usize;
-                    let keep = self.modelview.len().saturating_sub(n).max(1);
-                    self.modelview.truncate(keep);
+                    let n = (w1 / MTX_BYTES) as usize;
+                    // F3DEX2 skips a pop below the stack base (bltz); a zero-byte pop
+                    // removes nothing but still reloads the modelview like any pop.
+                    if n < self.modelview.len() {
+                        self.modelview.truncate(self.modelview.len() - n);
+                        // F3DEX2 reloads the modelview and marks the combined matrix stale (GLideN64: CHANGED_MATRIX).
+                        self.mvp = None;
+                    }
                 }
                 0xD9 => self.geometry = (self.geometry & (w0 & 0x00FF_FFFF)) | w1,
                 0xDA => self.matrix(ram.r(), w0, w1, at)?,
