@@ -13,9 +13,13 @@
 /// Interpreter state.
 #[derive(Clone)]
 pub struct Cpu {
+    /// General-purpose registers.
     pub r: [u64; 32],
+    /// Multiply/divide result register HI.
     pub hi: u64,
+    /// Multiply/divide result register LO.
     pub lo: u64,
+    /// Address of the instruction [`Cpu::step`] runs next.
     pub pc: u32,
     next_pc: u32,
     /// Floating-point registers as 64-bit cells.
@@ -32,7 +36,7 @@ pub struct Cpu {
     pub map: Vec<(u32, u32, u32)>,
     /// The page of `map` that matched last: most accesses fall in it.
     last: std::cell::Cell<(u32, u32, u32)>,
-    /// Which version of a [`Memory`]-style page list `map` is a copy of
+    /// Which version of a runtime `Memory`-style page list `map` is a copy of
     /// (its owner's count of changes), so a copy is refreshed only when
     /// the list changed.
     pub map_version: u64,
@@ -42,9 +46,19 @@ pub struct Cpu {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Stop {
     /// An instruction this interpreter does not implement.
-    Unimplemented { pc: u32, word: u32 },
+    Unimplemented {
+        /// Address of the instruction.
+        pc: u32,
+        /// The instruction word.
+        word: u32,
+    },
     /// A memory access outside RAM or not aligned.
-    BadAccess { pc: u32, addr: u32 },
+    BadAccess {
+        /// Address of the instruction that made the access.
+        pc: u32,
+        /// The address accessed.
+        addr: u32,
+    },
     /// The step limit was hit.
     StepLimit,
 }
@@ -54,6 +68,8 @@ fn se32(v: u32) -> u64 {
 }
 
 impl Cpu {
+    /// An interpreter with zeroed registers over the RAM `mem`, at `pc` 0
+    /// with no TLB pages.
     pub fn new(mem: Vec<u8>) -> Self {
         Cpu {
             r: [0; 32],
@@ -301,6 +317,190 @@ impl Cpu {
         }
     }
 
+    /// SPECIAL (opcode 0): register-form arithmetic, logic and shifts, HI
+    /// and LO moves, multiply and divide, SYNC, and JR/JALR, whose target
+    /// it returns.
+    fn special(
+        &mut self,
+        word: u32,
+        s: u64,
+        t: u64,
+        link: u64,
+        unimpl: Stop,
+    ) -> Result<Option<u32>, Stop> {
+        let rd = (word >> 11) & 31;
+        let sa = (word >> 6) & 31;
+        let funct = word & 63;
+        match funct {
+            0 => self.set(rd, se32((t as u32) << sa)),
+            2 => self.set(rd, se32((t as u32) >> sa)),
+            3 => self.set(rd, se32(((t as i64) >> sa) as u32)),
+            4 => self.set(rd, se32((t as u32) << (s & 31))),
+            6 => self.set(rd, se32((t as u32) >> (s & 31))),
+            7 => self.set(rd, se32(((t as i64) >> (s & 31)) as u32)),
+            8 => return Ok(Some(s as u32)),
+            9 => {
+                self.set(rd, link);
+                return Ok(Some(s as u32));
+            }
+            0x0F => {}
+            0x10 => self.set(rd, self.hi),
+            0x11 => self.hi = s,
+            0x12 => self.set(rd, self.lo),
+            0x13 => self.lo = s,
+            0x14 => self.set(rd, t << (s & 63)),
+            0x16 => self.set(rd, t >> (s & 63)),
+            0x17 => self.set(rd, ((t as i64) >> (s & 63)) as u64),
+            0x18 => {
+                let p = i64::from(s as i32) * i64::from(t as i32);
+                self.lo = se32(p as u32);
+                self.hi = se32((p >> 32) as u32);
+            }
+            0x19 => {
+                let p = u64::from(s as u32) * u64::from(t as u32);
+                self.lo = se32(p as u32);
+                self.hi = se32((p >> 32) as u32);
+            }
+            0x1A => {
+                let (n, d) = (i64::from(s as i32), i64::from(t as i32));
+                if d == 0 {
+                    self.lo = if n < 0 { 1 } else { u64::MAX };
+                    self.hi = se32(n as u32);
+                } else {
+                    // In 64-bit arithmetic MIN / -1 does not overflow;
+                    // truncating to 32 bits gives the hardware result.
+                    self.lo = se32((n / d) as u32);
+                    self.hi = se32((n % d) as u32);
+                }
+            }
+            0x1B => {
+                let (n, d) = (u64::from(s as u32), u64::from(t as u32));
+                match n.checked_div(d) {
+                    None => {
+                        self.lo = u64::MAX;
+                        self.hi = se32(n as u32);
+                    }
+                    Some(q) => {
+                        self.lo = se32(q as u32);
+                        self.hi = se32((n - q * d) as u32);
+                    }
+                }
+            }
+            0x1C => {
+                let p = i128::from(s as i64) * i128::from(t as i64);
+                self.lo = p as u64;
+                self.hi = (p >> 64) as u64;
+            }
+            0x1D => {
+                let p = u128::from(s) * u128::from(t);
+                self.lo = p as u64;
+                self.hi = (p >> 64) as u64;
+            }
+            0x1E => {
+                let (n, d) = (i128::from(s as i64), i128::from(t as i64));
+                if d == 0 {
+                    self.lo = if n < 0 { 1 } else { u64::MAX };
+                    self.hi = n as u64;
+                } else {
+                    self.lo = (n / d) as u64;
+                    self.hi = (n % d) as u64;
+                }
+            }
+            0x1F => match s.checked_div(t) {
+                None => {
+                    self.lo = u64::MAX;
+                    self.hi = s;
+                }
+                Some(q) => {
+                    self.lo = q;
+                    self.hi = s - q * t;
+                }
+            },
+            0x20 | 0x21 => self.set(rd, se32((s as u32).wrapping_add(t as u32))),
+            0x22 | 0x23 => self.set(rd, se32((s as u32).wrapping_sub(t as u32))),
+            0x24 => self.set(rd, s & t),
+            0x25 => self.set(rd, s | t),
+            0x26 => self.set(rd, s ^ t),
+            0x27 => self.set(rd, !(s | t)),
+            0x2A => self.set(rd, u64::from((s as i64) < (t as i64))),
+            0x2B => self.set(rd, u64::from(s < t)),
+            0x2C | 0x2D => self.set(rd, s.wrapping_add(t)),
+            0x2E | 0x2F => self.set(rd, s.wrapping_sub(t)),
+            0x38 => self.set(rd, t << sa),
+            0x3A => self.set(rd, t >> sa),
+            0x3B => self.set(rd, ((t as i64) >> sa) as u64),
+            0x3C => self.set(rd, t << (sa + 32)),
+            0x3E => self.set(rd, t >> (sa + 32)),
+            0x3F => self.set(rd, ((t as i64) >> (sa + 32)) as u64),
+            _ => return Err(unimpl),
+        }
+        Ok(None)
+    }
+
+    /// LWL, LWR, LDL and LDR (opcode `opc`) at `ea`, merged into the old
+    /// register value `t`, byte by byte. Register bytes are numbered from
+    /// the most significant end, like memory.
+    fn load_unaligned(mem: &[u8], opc: u32, ea: u32, t: u64, pc: u32) -> Result<u64, Stop> {
+        let size: u32 = if opc == 0x22 || opc == 0x26 { 4 } else { 8 };
+        let off = ea % size;
+        let base = ea - off;
+        let mut regb = if size == 4 {
+            let b = (t as u32).to_be_bytes();
+            let mut v = [0u8; 8];
+            v[..4].copy_from_slice(&b);
+            v
+        } else {
+            t.to_be_bytes()
+        };
+        let left = opc == 0x22 || opc == 0x1A;
+        if left {
+            // Bytes ea..end of unit go to the top of the register.
+            for k in 0..(size - off) {
+                regb[k as usize] = Self::byte(mem, ea + k, pc)?;
+            }
+        } else {
+            // Bytes base..=ea go to the bottom of the register.
+            for k in 0..=off {
+                regb[(size - 1 - off + k) as usize] = Self::byte(mem, base + k, pc)?;
+            }
+        }
+        let v = if size == 4 {
+            let w = u32::from_be_bytes([regb[0], regb[1], regb[2], regb[3]]);
+            if left || off == 3 {
+                se32(w)
+            } else {
+                (t & 0xFFFF_FFFF_0000_0000) | u64::from(w)
+            }
+        } else {
+            u64::from_be_bytes(regb)
+        };
+        Ok(v)
+    }
+
+    /// SWL, SWR, SDL and SDR (opcode `opc`) of `t` at `ea`, byte by byte.
+    fn store_unaligned(mem: &mut [u8], opc: u32, ea: u32, t: u64, pc: u32) -> Result<(), Stop> {
+        let size: u32 = if opc == 0x2A || opc == 0x2E { 4 } else { 8 };
+        let off = ea % size;
+        let base = ea - off;
+        let regb: Vec<u8> = if size == 4 {
+            (t as u32).to_be_bytes().to_vec()
+        } else {
+            t.to_be_bytes().to_vec()
+        };
+        let left = opc == 0x2A || opc == 0x2C;
+        if left {
+            for k in 0..(size - off) {
+                Self::store(mem, ea + k, 1, u64::from(regb[k as usize]), pc)?;
+            }
+        } else {
+            for k in 0..=off {
+                let b = regb[(size - 1 - off + k) as usize];
+                Self::store(mem, base + k, 1, u64::from(b), pc)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Runs from `entry` until `pc` equals `stop` (the return address the
     /// caller planted in `$ra`), or until `max_steps` instructions.
     pub fn run(&mut self, entry: u32, stop: u32, max_steps: usize) -> Result<(), Stop> {
@@ -361,8 +561,6 @@ impl Cpu {
         let rs = (word >> 21) & 31;
         let rt = (word >> 16) & 31;
         let rd = (word >> 11) & 31;
-        let sa = (word >> 6) & 31;
-        let funct = word & 63;
         let imm = word & 0xFFFF;
         let simm = i64::from(imm as u16 as i16);
         let s = self.r[rs as usize];
@@ -383,109 +581,11 @@ impl Cpu {
         let mut branch: Option<(bool, bool)> = None;
 
         match opc {
-            0 => match funct {
-                0 => self.set(rd, se32((t as u32) << sa)),
-                2 => self.set(rd, se32((t as u32) >> sa)),
-                3 => self.set(rd, se32(((t as i64) >> sa) as u32)),
-                4 => self.set(rd, se32((t as u32) << (s & 31))),
-                6 => self.set(rd, se32((t as u32) >> (s & 31))),
-                7 => self.set(rd, se32(((t as i64) >> (s & 31)) as u32)),
-                8 => nnpc = s as u32,
-                9 => {
-                    self.set(rd, link);
-                    nnpc = s as u32;
+            0 => {
+                if let Some(target) = self.special(word, s, t, link, unimpl)? {
+                    nnpc = target;
                 }
-                0x0F => {}
-                0x10 => self.set(rd, self.hi),
-                0x11 => self.hi = s,
-                0x12 => self.set(rd, self.lo),
-                0x13 => self.lo = s,
-                0x14 => self.set(rd, t << (s & 63)),
-                0x16 => self.set(rd, t >> (s & 63)),
-                0x17 => self.set(rd, ((t as i64) >> (s & 63)) as u64),
-                0x18 => {
-                    let p = i64::from(s as i32) * i64::from(t as i32);
-                    self.lo = se32(p as u32);
-                    self.hi = se32((p >> 32) as u32);
-                }
-                0x19 => {
-                    let p = u64::from(s as u32) * u64::from(t as u32);
-                    self.lo = se32(p as u32);
-                    self.hi = se32((p >> 32) as u32);
-                }
-                0x1A => {
-                    let (n, d) = (i64::from(s as i32), i64::from(t as i32));
-                    if d == 0 {
-                        self.lo = if n < 0 { 1 } else { u64::MAX };
-                        self.hi = se32(n as u32);
-                    } else {
-                        // In 64-bit arithmetic MIN / -1 does not overflow;
-                        // truncating to 32 bits gives the hardware result.
-                        self.lo = se32((n / d) as u32);
-                        self.hi = se32((n % d) as u32);
-                    }
-                }
-                0x1B => {
-                    let (n, d) = (u64::from(s as u32), u64::from(t as u32));
-                    match n.checked_div(d) {
-                        None => {
-                            self.lo = u64::MAX;
-                            self.hi = se32(n as u32);
-                        }
-                        Some(q) => {
-                            self.lo = se32(q as u32);
-                            self.hi = se32((n - q * d) as u32);
-                        }
-                    }
-                }
-                0x1C => {
-                    let p = i128::from(s as i64) * i128::from(t as i64);
-                    self.lo = p as u64;
-                    self.hi = (p >> 64) as u64;
-                }
-                0x1D => {
-                    let p = u128::from(s) * u128::from(t);
-                    self.lo = p as u64;
-                    self.hi = (p >> 64) as u64;
-                }
-                0x1E => {
-                    let (n, d) = (i128::from(s as i64), i128::from(t as i64));
-                    if d == 0 {
-                        self.lo = if n < 0 { 1 } else { u64::MAX };
-                        self.hi = n as u64;
-                    } else {
-                        self.lo = (n / d) as u64;
-                        self.hi = (n % d) as u64;
-                    }
-                }
-                0x1F => match s.checked_div(t) {
-                    None => {
-                        self.lo = u64::MAX;
-                        self.hi = s;
-                    }
-                    Some(q) => {
-                        self.lo = q;
-                        self.hi = s - q * t;
-                    }
-                },
-                0x20 | 0x21 => self.set(rd, se32((s as u32).wrapping_add(t as u32))),
-                0x22 | 0x23 => self.set(rd, se32((s as u32).wrapping_sub(t as u32))),
-                0x24 => self.set(rd, s & t),
-                0x25 => self.set(rd, s | t),
-                0x26 => self.set(rd, s ^ t),
-                0x27 => self.set(rd, !(s | t)),
-                0x2A => self.set(rd, u64::from((s as i64) < (t as i64))),
-                0x2B => self.set(rd, u64::from(s < t)),
-                0x2C | 0x2D => self.set(rd, s.wrapping_add(t)),
-                0x2E | 0x2F => self.set(rd, s.wrapping_sub(t)),
-                0x38 => self.set(rd, t << sa),
-                0x3A => self.set(rd, t >> sa),
-                0x3B => self.set(rd, ((t as i64) >> sa) as u64),
-                0x3C => self.set(rd, t << (sa + 32)),
-                0x3E => self.set(rd, t >> (sa + 32)),
-                0x3F => self.set(rd, ((t as i64) >> (sa + 32)) as u64),
-                _ => return Err(unimpl),
-            },
+            }
             1 => {
                 let neg = (s as i64) < 0;
                 let (taken, likely, links) = match rt {
@@ -550,70 +650,15 @@ impl Cpu {
                 let v = Self::load(mem, ea, 8, pc)?;
                 self.set(rt, v)
             }
-            // Unaligned loads, byte by byte. Register bytes are numbered
-            // from the most significant end, like memory.
             0x22 | 0x26 | 0x1A | 0x1B => {
-                let size: u32 = if opc == 0x22 || opc == 0x26 { 4 } else { 8 };
-                let off = ea % size;
-                let base = ea - off;
-                let mut regb = if size == 4 {
-                    let b = (t as u32).to_be_bytes();
-                    let mut v = [0u8; 8];
-                    v[..4].copy_from_slice(&b);
-                    v
-                } else {
-                    t.to_be_bytes()
-                };
-                let left = opc == 0x22 || opc == 0x1A;
-                if left {
-                    // Bytes ea..end of unit go to the top of the register.
-                    for k in 0..(size - off) {
-                        regb[k as usize] = Self::byte(mem, ea + k, pc)?;
-                    }
-                } else {
-                    // Bytes base..=ea go to the bottom of the register.
-                    for k in 0..=off {
-                        regb[(size - 1 - off + k) as usize] = Self::byte(mem, base + k, pc)?;
-                    }
-                }
-                let v = if size == 4 {
-                    let w = u32::from_be_bytes([regb[0], regb[1], regb[2], regb[3]]);
-                    if left || off == 3 {
-                        se32(w)
-                    } else {
-                        (t & 0xFFFF_FFFF_0000_0000) | u64::from(w)
-                    }
-                } else {
-                    u64::from_be_bytes(regb)
-                };
+                let v = Self::load_unaligned(mem, opc, ea, t, pc)?;
                 self.set(rt, v);
             }
             0x28 => Self::store(mem, ea, 1, t, pc)?,
             0x29 => Self::store(mem, ea, 2, t, pc)?,
             0x2B => Self::store(mem, ea, 4, t, pc)?,
             0x3F => Self::store(mem, ea, 8, t, pc)?,
-            // Unaligned stores, byte by byte.
-            0x2A | 0x2E | 0x2C | 0x2D => {
-                let size: u32 = if opc == 0x2A || opc == 0x2E { 4 } else { 8 };
-                let off = ea % size;
-                let base = ea - off;
-                let regb: Vec<u8> = if size == 4 {
-                    (t as u32).to_be_bytes().to_vec()
-                } else {
-                    t.to_be_bytes().to_vec()
-                };
-                let left = opc == 0x2A || opc == 0x2C;
-                if left {
-                    for k in 0..(size - off) {
-                        Self::store(mem, ea + k, 1, u64::from(regb[k as usize]), pc)?;
-                    }
-                } else {
-                    for k in 0..=off {
-                        let b = regb[(size - 1 - off + k) as usize];
-                        Self::store(mem, base + k, 1, u64::from(b), pc)?;
-                    }
-                }
-            }
+            0x2A | 0x2E | 0x2C | 0x2D => Self::store_unaligned(mem, opc, ea, t, pc)?,
             0x2F => {}
             0x11 => match rs {
                 0 => self.set(rt, se32(self.get_w(rd))),

@@ -23,6 +23,21 @@ pub struct Io {
     pub flash: Flash,
 }
 
+/// Start of KSEG0, the cached window onto physical memory. KSEG1, the
+/// uncached one, follows it at `0xA000_0000`.
+const KSEG0: u32 = 0x8000_0000;
+/// Length of KSEG0 and KSEG1 together.
+const DIRECT_LEN: u32 = 0x4000_0000;
+/// Bits of a KSEG0/KSEG1 address that give the physical address.
+pub(crate) const PHYS_MASK: u32 = 0x1FFF_FFFF;
+
+/// Whether `vaddr` is in KSEG0 or KSEG1, which map to physical memory
+/// without the TLB.
+#[inline(always)]
+pub(crate) fn direct(vaddr: u32) -> bool {
+    vaddr.wrapping_sub(KSEG0) < DIRECT_LEN
+}
+
 /// Physical address of the flash chip's status (read) on the PI bus.
 const FLASH_STATUS: usize = 0x0800_0000;
 /// Physical address of the flash chip's command register (write).
@@ -48,9 +63,17 @@ pub struct Flash {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FlashOp {
     /// Set `len` bytes from `offset` to 0xFF.
-    Erase { offset: usize, len: usize },
+    Erase {
+        /// First byte cleared.
+        offset: usize,
+        /// Number of bytes cleared.
+        len: usize,
+    },
     /// Write the page buffer (128 bytes) at `offset`.
-    Program { offset: usize },
+    Program {
+        /// First byte written.
+        offset: usize,
+    },
 }
 
 impl Flash {
@@ -202,7 +225,7 @@ impl Memory {
     /// it; any other address unchanged.
     #[inline(always)]
     pub fn kseg0(&self, vaddr: u32) -> u32 {
-        if self.map.is_empty() || vaddr.wrapping_sub(0x8000_0000) < 0x4000_0000 {
+        if self.map.is_empty() || direct(vaddr) {
             return vaddr;
         }
         self.mapped(vaddr)
@@ -210,9 +233,8 @@ impl Memory {
 
     #[inline(never)]
     fn mapped(&self, vaddr: u32) -> u32 {
-        self.page(vaddr).map_or(vaddr, |(base, _, phys)| {
-            0x8000_0000 | (phys + (vaddr - base))
-        })
+        self.page(vaddr)
+            .map_or(vaddr, |(base, _, phys)| KSEG0 | (phys + (vaddr - base)))
     }
 
     /// The TLB page that covers `vaddr`, if any; the one that matched last
@@ -320,7 +342,7 @@ impl Memory {
 
     #[inline(always)]
     fn phys(&self, vaddr: u32, len: usize) -> usize {
-        let p = (self.kseg0(vaddr) & 0x1FFF_FFFF) as usize;
+        let p = (self.kseg0(vaddr) & PHYS_MASK) as usize;
         if p & (len - 1) != 0 {
             misaligned(vaddr, len);
         }
@@ -349,34 +371,42 @@ impl Memory {
         }
     }
 
+    /// The byte at guest address `a`, which must be aligned to its size.
     #[inline(always)]
     pub fn read_u8(&self, a: u32) -> u8 {
         self.get::<1>(a)[0]
     }
+    /// The big-endian halfword at guest address `a`, which must be aligned to its size.
     #[inline(always)]
     pub fn read_u16(&self, a: u32) -> u16 {
         u16::from_be_bytes(self.get(a))
     }
+    /// The big-endian word at guest address `a`, which must be aligned to its size.
     #[inline(always)]
     pub fn read_u32(&self, a: u32) -> u32 {
         u32::from_be_bytes(self.get(a))
     }
+    /// The big-endian doubleword at guest address `a`, which must be aligned to its size.
     #[inline(always)]
     pub fn read_u64(&self, a: u32) -> u64 {
         u64::from_be_bytes(self.get(a))
     }
+    /// Stores `v` as the byte at guest address `a`, which must be aligned to its size.
     #[inline(always)]
     pub fn write_u8(&mut self, a: u32, v: u8) {
         self.put(a, [v]);
     }
+    /// Stores `v` as the big-endian halfword at guest address `a`, which must be aligned to its size.
     #[inline(always)]
     pub fn write_u16(&mut self, a: u32, v: u16) {
         self.put(a, v.to_be_bytes());
     }
+    /// Stores `v` as the big-endian word at guest address `a`, which must be aligned to its size.
     #[inline(always)]
     pub fn write_u32(&mut self, a: u32, v: u32) {
         self.put(a, v.to_be_bytes());
     }
+    /// Stores `v` as the big-endian doubleword at guest address `a`, which must be aligned to its size.
     #[inline(always)]
     pub fn write_u64(&mut self, a: u32, v: u64) {
         self.put(a, v.to_be_bytes());
@@ -498,7 +528,7 @@ fn misaligned(vaddr: u32, len: usize) -> ! {
 /// TLB address, which is not modelled, or a wild pointer: stop there
 /// instead of storing it as a register.
 fn unmapped_ok(vaddr: u32) -> bool {
-    (0x8000_0000..0xC000_0000).contains(&vaddr)
+    direct(vaddr)
 }
 
 /// Extra words for a crash at an address that is really an instruction or
@@ -506,7 +536,7 @@ fn unmapped_ok(vaddr: u32) -> bool {
 pub(crate) fn wild_hint(addr: u32) -> &'static str {
     if addr >> 16 == 0x27BD {
         " (looks like the instruction addiu sp, sp, n: a pointer overwritten with code)"
-    } else if !(0x8000_0000..0xC000_0000).contains(&addr) {
+    } else if !direct(addr) {
         " (not a KSEG0/KSEG1 address: a wild or overwritten pointer, or TLB-mapped memory)"
     } else {
         ""

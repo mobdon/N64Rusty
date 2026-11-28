@@ -79,7 +79,7 @@ pub struct Ctx {
     pub cop0: [u32; 32],
     /// TLB entries as PageMask, EntryHi, EntryLo0, EntryLo1. A write also
     /// gives the valid pages to [`Memory::set_map`].
-    pub tlb: [[u32; 4]; 32],
+    pub tlb: [[u32; 4]; TLB_ENTRIES],
     /// The game's own TLB refill routine (the one its exception handler
     /// calls), or 0: [`Ctx::tlb_miss`] runs it for an address no page maps.
     pub tlb_refill: u32,
@@ -110,13 +110,53 @@ struct Overlay {
     funcs: HashMap<u32, GuestFn>,
 }
 
+/// COP0 register numbers (VR4300 manual, System Control Coprocessor).
+mod cop0 {
+    pub const INDEX: usize = 0;
+    pub const ENTRY_LO0: usize = 2;
+    pub const ENTRY_LO1: usize = 3;
+    pub const CONTEXT: usize = 4;
+    pub const PAGE_MASK: usize = 5;
+    pub const WIRED: usize = 6;
+    pub const BAD_VADDR: usize = 8;
+    pub const COUNT: usize = 9;
+    pub const ENTRY_HI: usize = 10;
+}
+
+/// COP0 function codes of the TLB instructions.
+const TLBR: u32 = 1;
+const TLBWI: u32 = 2;
+const TLBWR: u32 = 6;
+const TLBP: u32 = 8;
+
+/// Number of TLB entries; Index and Wired hold a slot in their low bits.
+const TLB_ENTRIES: usize = 32;
+/// Random's upper bound: the slot it holds after reset or a Wired write.
+const RANDOM_TOP: usize = TLB_ENTRIES - 1;
+/// Virtual address bits below VPN2: an entry maps at least two 4 KiB pages.
+const VPN2_LOW: u32 = 0x1FFF;
+/// EntryHi bits holding the address space id.
+const ASID_MASK: u32 = 0xFF;
+/// Context bits holding PTEBase, which a TLB miss keeps.
+const CONTEXT_PTE_BASE: u32 = 0xFF80_0000;
+/// Index bit 31: set by TLBP when no entry matches.
+const PROBE_FAILED: u32 = 0x8000_0000;
+/// EntryLo bit 0: Global (the address space id is ignored).
+const LO_GLOBAL: u32 = 1;
+/// EntryLo bit 1: Valid.
+const LO_VALID: u32 = 2;
+/// EntryLo bit where the physical frame number starts.
+const LO_PFN_SHIFT: u32 = 6;
+/// Size of a physical frame as a shift: 4 KiB.
+const FRAME_SHIFT: u32 = 12;
+
 /// The valid pages of `tlb` as (virtual base, length, physical base).
 /// shortcut: address space ids are ignored (every entry counts as global),
 /// compare EntryHi's id if a game ever uses more than one.
-fn tlb_pages(tlb: &[[u32; 4]; 32]) -> Vec<(u32, u32, u32)> {
+fn tlb_pages(tlb: &[[u32; 4]; TLB_ENTRIES]) -> Vec<(u32, u32, u32)> {
     let mut pages = Vec::new();
     for e in tlb {
-        let mask = e[0] | 0x1FFF;
+        let mask = e[0] | VPN2_LOW;
         let len = (mask >> 1) + 1;
         let base = e[1] & !mask;
         for (k, lo) in [e[2], e[3]].into_iter().enumerate() {
@@ -130,8 +170,8 @@ fn tlb_pages(tlb: &[[u32; 4]; 32]) -> Vec<(u32, u32, u32)> {
             let covered = pages.iter().any(|&(b, l, _): &(u32, u32, u32)| {
                 page.wrapping_sub(b) < l && len <= l - (page - b)
             });
-            if lo & 2 != 0 && !covered {
-                pages.push((page, len, (lo >> 6) << 12));
+            if lo & LO_VALID != 0 && !covered {
+                pages.push((page, len, (lo >> LO_PFN_SHIFT) << FRAME_SHIFT));
             }
         }
     }
@@ -166,9 +206,9 @@ impl Ctx {
             calls: 0,
             depth: 0,
             cop0: [0; 32],
-            tlb: [[0; 4]; 32],
+            tlb: [[0; 4]; TLB_ENTRIES],
             tlb_refill: 0,
-            tlb_random: 31,
+            tlb_random: RANDOM_TOP,
             clock: 0,
             deadline: u64::MAX,
             on_deadline: None,
@@ -182,13 +222,13 @@ impl Ctx {
         self.funcs.insert(addr, f);
     }
 
-    /// Replaces the function at `addr`. Overrides win over registered
-    /// functions, so a hook can stand in for any guest routine.
     /// The override at `addr`, if any.
     pub fn override_at(&self, addr: u32) -> Option<GuestFn> {
         self.overrides.get(&addr).copied()
     }
 
+    /// Replaces the function at `addr`. Overrides win over registered
+    /// functions, so a hook can stand in for any guest routine.
     pub fn set_override(&mut self, addr: u32, f: GuestFn) {
         self.overrides.insert(addr, f);
     }
@@ -242,7 +282,7 @@ impl Ctx {
     fn verify_image(&mut self, addr: u32) -> Option<GuestFn> {
         let cands = self.images.get(&addr)?;
         let bytes = self.mem.bytes();
-        let at = (addr & 0x1FFF_FFFF) as usize;
+        let at = (addr & memory::PHYS_MASK) as usize;
         let &(len, _, f) = cands.iter().find(|&&(len, hash, _)| {
             bytes
                 .get(at..at + len as usize)
@@ -414,17 +454,15 @@ impl Ctx {
     /// reproducible.
     pub fn mfc0(&self, n: usize) -> u64 {
         match n {
-            9 => sx32(self.clock as u32),
+            cop0::COUNT => sx32(self.clock as u32),
             _ => sx32(self.cop0[n]),
         }
     }
 
     /// MTC0. Writes are stored; a write to Wired (6) also resets Random.
     pub fn mtc0(&mut self, n: usize, v: u64) {
-        const WIRED: usize = 6;
-        const RANDOM_TOP: usize = 31;
         self.cop0[n] = v as u32;
-        if n == WIRED {
+        if n == cop0::WIRED {
             // VR4300 manual, Wired register: a write sets Random to its upper bound.
             self.tlb_random = RANDOM_TOP;
         }
@@ -433,39 +471,44 @@ impl Ctx {
     /// TLBR (1), TLBWI (2), TLBWR (6) and TLBP (8), on COP0 Index (0),
     /// EntryLo0/1 (2, 3), PageMask (5) and EntryHi (10).
     pub fn tlb(&mut self, funct: u32) {
-        const REGS: [usize; 4] = [5, 10, 2, 3];
-        let index = (self.cop0[0] & 31) as usize;
+        use cop0::{ENTRY_HI, ENTRY_LO0, ENTRY_LO1, INDEX, PAGE_MASK, WIRED};
+        const REGS: [usize; 4] = [PAGE_MASK, ENTRY_HI, ENTRY_LO0, ENTRY_LO1];
+        const SLOT: u32 = TLB_ENTRIES as u32 - 1;
+        let index = (self.cop0[INDEX] & SLOT) as usize;
         match funct {
-            1 => {
-                const GLOBAL: u32 = 1;
+            TLBR => {
                 for (k, &n) in REGS.iter().enumerate() {
                     self.cop0[n] = self.tlb[index][k];
                 }
                 // VR4300 manual, TLBR: the entry keeps one G (Lo0.G AND Lo1.G), read into both.
-                let g = self.cop0[2] & self.cop0[3] & GLOBAL;
-                self.cop0[2] = self.cop0[2] & !GLOBAL | g;
-                self.cop0[3] = self.cop0[3] & !GLOBAL | g;
+                let g = self.cop0[ENTRY_LO0] & self.cop0[ENTRY_LO1] & LO_GLOBAL;
+                self.cop0[ENTRY_LO0] = self.cop0[ENTRY_LO0] & !LO_GLOBAL | g;
+                self.cop0[ENTRY_LO1] = self.cop0[ENTRY_LO1] & !LO_GLOBAL | g;
             }
-            2 | 6 => {
-                // Random counts down from 31 to Wired (COP0 6) and wraps.
-                let slot = if funct == 2 { index } else { self.tlb_random };
-                if funct == 6 {
-                    let wired = (self.cop0[6] & 31) as usize;
-                    self.tlb_random = if slot <= wired { 31 } else { slot - 1 };
+            TLBWI | TLBWR => {
+                // Random counts down from 31 to Wired and wraps.
+                let slot = if funct == TLBWI {
+                    index
+                } else {
+                    self.tlb_random
+                };
+                if funct == TLBWR {
+                    let wired = (self.cop0[WIRED] & SLOT) as usize;
+                    self.tlb_random = if slot <= wired { RANDOM_TOP } else { slot - 1 };
                 }
                 for (k, &n) in REGS.iter().enumerate() {
                     self.tlb[slot][k] = self.cop0[n];
                 }
                 self.mem.set_map(tlb_pages(&self.tlb));
             }
-            8 => {
-                let hi = self.cop0[10];
+            TLBP => {
+                let hi = self.cop0[ENTRY_HI];
                 let hit = self.tlb.iter().position(|e| {
-                    let mask = !(e[0] | 0x1FFF);
-                    let global = e[2] & e[3] & 1 != 0;
-                    (e[1] ^ hi) & mask == 0 && (global || (e[1] ^ hi) & 0xFF == 0)
+                    let mask = !(e[0] | VPN2_LOW);
+                    let global = e[2] & e[3] & LO_GLOBAL != 0;
+                    (e[1] ^ hi) & mask == 0 && (global || (e[1] ^ hi) & ASID_MASK == 0)
                 });
-                self.cop0[0] = hit.map_or(0x8000_0000, |k| k as u32);
+                self.cop0[INDEX] = hit.map_or(PROBE_FAILED, |k| k as u32);
             }
             _ => self.unimplemented(0, funct),
         }
@@ -475,9 +518,7 @@ impl Ctx {
     /// game that has a refill routine: [`Ctx::tlb_miss`] may map it.
     #[inline(always)]
     pub fn unmapped(&self, vaddr: u32) -> bool {
-        self.tlb_refill != 0
-            && vaddr.wrapping_sub(0x8000_0000) >= 0x4000_0000
-            && self.mem.page(vaddr).is_none()
+        self.tlb_refill != 0 && !memory::direct(vaddr) && self.mem.page(vaddr).is_none()
     }
 
     /// What the TLB miss exception does for `vaddr`: sets BadVAddr, Context
@@ -490,9 +531,11 @@ impl Ctx {
             return false;
         }
         let saved = (self.r, self.hi, self.lo, self.f, self.fcr31);
-        self.cop0[8] = vaddr;
-        self.cop0[4] = (self.cop0[4] & 0xFF80_0000) | ((vaddr >> 13) << 4);
-        self.cop0[10] = (vaddr & !0x1FFF) | (self.cop0[10] & 0xFF);
+        use cop0::{BAD_VADDR, CONTEXT, ENTRY_HI};
+        self.cop0[BAD_VADDR] = vaddr;
+        // Context: PTEBase kept, BadVPN2 (vaddr bits 31..13) at bits 22..4.
+        self.cop0[CONTEXT] = (self.cop0[CONTEXT] & CONTEXT_PTE_BASE) | ((vaddr >> 13) << 4);
+        self.cop0[ENTRY_HI] = (vaddr & !VPN2_LOW) | (self.cop0[ENTRY_HI] & ASID_MASK);
         // An exception handler runs with interrupts off: no deadline (a
         // thread switch, say) is taken until the routine is done.
         let deadline = std::mem::replace(&mut self.deadline, u64::MAX);

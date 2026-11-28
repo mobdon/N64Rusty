@@ -117,21 +117,25 @@ impl Ctx {
         }
     }
 
+    /// Single register `n` as a float.
     #[inline(always)]
     pub fn fs(&self, n: usize) -> f32 {
         f32::from_bits(self.fw(n))
     }
 
+    /// Writes single register `n` as a float.
     #[inline(always)]
     pub fn set_fs(&mut self, n: usize, v: f32) {
         self.set_fw(n, v.to_bits());
     }
 
+    /// Double register `n` as a float.
     #[inline(always)]
     pub fn fd(&self, n: usize) -> f64 {
         f64::from_bits(self.fl(n))
     }
 
+    /// Writes double register `n` as a float.
     #[inline(always)]
     pub fn set_fd(&mut self, n: usize, v: f64) {
         self.set_fl(n, v.to_bits());

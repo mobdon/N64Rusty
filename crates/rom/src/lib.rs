@@ -41,10 +41,15 @@ impl fmt::Display for ByteOrder {
 /// Boot code (CIC) variant, identified by CRC-32 of ROM bytes 0x40..0x1000.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Cic {
+    /// CIC-NUS-6101.
     Cic6101,
+    /// CIC-NUS-6102, the most common variant.
     Cic6102,
+    /// CIC-NUS-6103: starts the game 1 MiB below the header's entry.
     Cic6103,
+    /// CIC-NUS-6105.
     Cic6105,
+    /// CIC-NUS-6106: starts the game 2 MiB below the header's entry.
     Cic6106,
     /// Not recognised; the CRC is kept for reporting.
     Unknown(u32),
@@ -76,7 +81,11 @@ impl Cic {
 /// Errors loading a ROM.
 #[derive(Debug, PartialEq, Eq)]
 pub enum RomError {
-    /// Fewer bytes than a header plus boot code plus a boot segment.
+    /// No more bytes than the header and boot code (0x1000), or a length
+    /// that is not a whole number of words. Holds the file's length.
+    /// shortcut: both cases share this variant and its "too small" message,
+    /// so an odd-length large dump is reported as too small; split it if
+    /// that confuses players.
     TooSmall(usize),
     /// The first word matches no known byte order.
     UnknownByteOrder(u32),

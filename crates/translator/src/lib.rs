@@ -5,10 +5,11 @@
 //! functions go through `Ctx::call`, so any of them can be overridden by
 //! address. See [`emit`] for how blocks and branch delay slots are handled.
 //!
-//! Supported so far: the whole integer instruction set except traps, LL/SC
-//! and coprocessor instructions, which emit a call that panics with the
-//! address. Overflow exceptions (ADD, ADDI, SUB, DADD, DADDI, DSUB) are not
-//! raised.
+//! Supported so far: the whole integer instruction set, the floating-point
+//! (COP1) instructions, and the COP0 moves and TLB instructions. Traps,
+//! SYSCALL, BREAK, LL/SC and the other COP0 operations emit a call that
+//! panics with the address. Overflow exceptions (ADD, ADDI, SUB, DADD, DADDI,
+//! DSUB) are not raised.
 
 use std::fmt;
 

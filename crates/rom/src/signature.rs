@@ -6,6 +6,11 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+/// `jr ra`, the usual return, as an instruction word.
+const JR_RA: u32 = 0x03E0_0008;
+/// Primary opcode of `j`.
+const OP_J: u32 = 2;
+
 /// An instruction word with what relocation changes taken out: jump
 /// targets, `lui` values and the offsets of addressing not based on `sp`.
 pub fn masked(w: u32) -> u32 {
@@ -25,7 +30,7 @@ pub fn masked(w: u32) -> u32 {
 /// before it (past any padding) end one with `jr ra` or a `j` and its delay slot.
 /// Short routines otherwise match the tail of a longer one.
 pub fn starts_function(w: &[u32], i: usize) -> bool {
-    let ends = |k: usize| w[k] == 0x03E0_0008 || w[k] >> 26 == 2;
+    let ends = |k: usize| w[k] == JR_RA || w[k] >> 26 == OP_J;
     let mut j = i;
     while j > 0 && w[j - 1] == 0 {
         j -= 1;
@@ -83,7 +88,7 @@ pub fn make(
         }
         // Up to the first return: a sparse map's next name can be several
         // routines on, and a prefix still names the routine.
-        if let Some(r) = code[at..at + len].iter().position(|&w| w == 0x03E0_0008) {
+        if let Some(r) = code[at..at + len].iter().position(|&w| w == JR_RA) {
             len = len.min(r + 2);
         }
         if len < MIN_LEN {

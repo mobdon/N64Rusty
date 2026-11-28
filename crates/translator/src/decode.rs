@@ -1,5 +1,8 @@
 //! Decoder for the VR4300 integer instruction set (MIPS III).
 
+/// `jr $ra`, the usual return, as an instruction word.
+pub const JR_RA: u32 = 0x03E0_0008;
+
 /// Instruction mnemonics the translator knows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(missing_docs)]
@@ -126,7 +129,8 @@ pub enum Op {
     /// COP1 arithmetic, conversion or compare: format in `rs`, operation in
     /// the funct field.
     Cop1,
-    /// Anything not decoded yet (coprocessors, traps, LL/SC, ...).
+    /// Anything not decoded yet (other coprocessor operations, traps, LL/SC,
+    /// ...).
     Unknown,
 }
 
@@ -143,19 +147,32 @@ pub enum Flow {
         link: bool,
     },
     /// J or JAL to an absolute target.
-    Jump { link: bool },
+    Jump {
+        /// JAL: writes the return address to `$ra`.
+        link: bool,
+    },
     /// JR or JALR to a register.
-    JumpReg { link: bool },
+    JumpReg {
+        /// JALR: writes the return address to `rd`.
+        link: bool,
+    },
 }
 
 /// One decoded instruction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Inst {
+    /// The raw instruction word.
     pub word: u32,
+    /// The mnemonic.
     pub op: Op,
+    /// Bits 25..21: the first source register (or COP1 format).
     pub rs: u8,
+    /// Bits 20..16: the second source, or the destination of an immediate
+    /// form or a load.
     pub rt: u8,
+    /// Bits 15..11: the destination of a register form.
     pub rd: u8,
+    /// Bits 10..6: the shift amount.
     pub sa: u8,
 }
 

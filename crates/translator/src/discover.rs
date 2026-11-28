@@ -14,7 +14,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-use crate::decode::{Flow, Inst, Op};
+use crate::decode::{Flow, Inst, Op, JR_RA};
 use crate::Function;
 
 /// Code loaded at `base` in guest memory.
@@ -250,7 +250,6 @@ fn opens_frame(img: &Image, a: u32) -> bool {
 /// decodes, and a `jr $ra` comes within 32 words. Data between a return
 /// and the next one rarely does both.
 fn is_leaf(img: &Image, a: u32) -> bool {
-    const JR_RA: u32 = 0x03E0_0008;
     let words: Vec<u32> = (0..32).map_while(|k| img.word(a + 4 * k)).collect();
     words.iter().position(|&w| w == JR_RA).is_some_and(|k| {
         words[..=k]
@@ -261,10 +260,9 @@ fn is_leaf(img: &Image, a: u32) -> bool {
 
 /// Places that start a function by their layout: the image's first word,
 /// or the first non-zero word after a `jr $ra` and its delay slot, when it
-/// opens a stack frame (see [`opens_frame`]) or is a leaf (see [`is_leaf`]). For code copied in at run
+/// opens a stack frame (see `opens_frame`) or is a leaf (see `is_leaf`). For code copied in at run
 /// time, whose functions are mostly reached through pointers set up by code.
 pub fn function_starts(img: &Image) -> Vec<u32> {
-    const JR_RA: u32 = 0x03E0_0008;
     let end = img.base.wrapping_add(img.bytes.len() as u32 & !3);
     let mut out = Vec::new();
     let mut a = img.base;
@@ -312,7 +310,6 @@ pub fn function_starts(img: &Image) -> Vec<u32> {
 /// more addresses inside itself (`lui`, `addiu`). Build tools lay segment tables out this way
 /// (start, end, then load address), whatever else each entry holds.
 pub fn overlay_table(rom: &[u8]) -> Vec<(u32, u32, u32)> {
-    const JR_RA: u32 = 0x03E0_0008;
     let words: Vec<u32> = rom
         .chunks_exact(4)
         .map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]))
@@ -462,11 +459,6 @@ pub fn discover_layout(
         call_end = code_end;
         // Second pass: hints and pointer pairs inside the code found so far,
         // not inside a function already found.
-        let inside_known = |a: u32| {
-            done.range(..=a)
-                .next_back()
-                .is_some_and(|(&s, e)| a >= s && a < e.end)
-        };
         let pointers: Vec<u32> = done
             .values()
             .flat_map(|e| e.pointers.iter().copied())
@@ -488,33 +480,15 @@ pub fn discover_layout(
             let ok = a < code_end
                 && (from_hint
                     || ((layout.contains(&a) || looks_like_prologue(img.word(a).unwrap()))
-                        && !inside_known(a)));
+                        && !inside_known(&done, a)));
             if !ok {
                 continue;
             }
             known.insert(a);
             fresh.push(a);
         }
-        // Third: compiled code is laid out function after function, so
-        // code in a gap between two functions found so far (after any zero
-        // padding) starts a function too: one reached only through a
-        // pointer built in code, often a small leaf without a prologue.
-        // Only gaps between functions; data follows the last one.
         if fresh.is_empty() {
-            let starts: Vec<u32> = done.keys().copied().collect();
-            for pair in starts.windows(2) {
-                let mut a = done[&pair[0]].end;
-                while a < pair[1] && img.word(a) == Some(0) {
-                    a += 4;
-                }
-                // Data that does not even decode is not taken for code.
-                let decodes = img
-                    .word(a)
-                    .is_some_and(|w| Inst::decode(w).op != Op::Unknown);
-                if a < pair[1] && a < code_end && decodes && !inside_known(a) && known.insert(a) {
-                    fresh.push(a);
-                }
-            }
+            fresh = gap_starts(img, &done, code_end, &mut known);
         }
         if fresh.is_empty() {
             break;
@@ -525,6 +499,59 @@ pub fn discover_layout(
         queue = fresh;
     }
 
+    let (functions, jump_tables) = assemble(img, &done, !layout.is_empty());
+    Discovery {
+        functions,
+        jump_tables,
+        text_end,
+    }
+}
+
+/// Whether `a` lies inside a function in `done`.
+fn inside_known(done: &BTreeMap<u32, Explored>, a: u32) -> bool {
+    done.range(..=a)
+        .next_back()
+        .is_some_and(|(&s, e)| a >= s && a < e.end)
+}
+
+/// Third pass of [`discover_layout`]: compiled code is laid out function
+/// after function, so code in a gap between two functions found so far
+/// (after any zero padding) starts a function too: one reached only through
+/// a pointer built in code, often a small leaf without a prologue. Only
+/// gaps between functions; data follows the last one. Each start found is
+/// added to `known`.
+fn gap_starts(
+    img: &Image,
+    done: &BTreeMap<u32, Explored>,
+    code_end: u32,
+    known: &mut BTreeSet<u32>,
+) -> Vec<u32> {
+    let mut fresh = Vec::new();
+    let starts: Vec<u32> = done.keys().copied().collect();
+    for pair in starts.windows(2) {
+        let mut a = done[&pair[0]].end;
+        while a < pair[1] && img.word(a) == Some(0) {
+            a += 4;
+        }
+        // Data that does not even decode is not taken for code.
+        let decodes = img
+            .word(a)
+            .is_some_and(|w| Inst::decode(w).op != Op::Unknown);
+        if a < pair[1] && a < code_end && decodes && !inside_known(done, a) && known.insert(a) {
+            fresh.push(a);
+        }
+    }
+    fresh
+}
+
+/// The functions `done` describes, in address order, and the number of
+/// jump tables they resolved. Each is cut where the next one starts unless
+/// `keep_whole` (discovery with a layout).
+fn assemble(
+    img: &Image,
+    done: &BTreeMap<u32, Explored>,
+    keep_whole: bool,
+) -> (Vec<Function>, usize) {
     let starts: Vec<u32> = done.keys().copied().collect();
     let mut functions = Vec::with_capacity(starts.len());
     let mut jump_tables = 0;
@@ -536,12 +563,7 @@ pub fn discover_layout(
         // on into the next function. Code saved from RAM also holds stale
         // code whose calls land mid-function: there each function keeps all
         // it reaches, and overlapping translations are harmless.
-        let end = if layout.is_empty() {
-            ex.end.min(next)
-        } else {
-            ex.end
-        }
-        .max(s + 4);
+        let end = if keep_whole { ex.end } else { ex.end.min(next) }.max(s + 4);
         let words = (s..end).step_by(4).map_while(|a| img.word(a)).collect();
         let mut f = Function::new(s, words);
         f.jump_targets = ex
@@ -554,11 +576,7 @@ pub fn discover_layout(
         f.jump_targets.dedup();
         functions.push(f);
     }
-    Discovery {
-        functions,
-        jump_tables,
-        text_end,
-    }
+    (functions, jump_tables)
 }
 
 #[cfg(test)]
