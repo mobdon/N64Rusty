@@ -62,6 +62,7 @@ impl AudioOut {
         }
     }
 
+    /// Whether the speakers are silenced (see [`AudioOut::set_muted`]).
     pub fn muted(&self) -> bool {
         self.muted
     }

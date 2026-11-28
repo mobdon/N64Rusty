@@ -465,6 +465,8 @@ These apply to every commit, pull request, issue and commit message.
 - **Headless tests.** Tests never open a window, take focus or play sound, and
   use synthetic code only, never game bytes.
 
+Pitfalls learned so far, and the known limits, are in [docs/PITFALLS.md](docs/PITFALLS.md).
+
 ## Per-game files
 
 Each game is identified by the SHA-256 hash of its ROM after it has been

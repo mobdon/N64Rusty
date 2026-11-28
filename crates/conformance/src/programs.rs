@@ -8,14 +8,20 @@ pub const CODE: u32 = 0x8000_1000;
 /// Where a second function (a callee) starts.
 pub const CALLEE: u32 = 0x8000_2000;
 /// Base register value for loads and stores; the data area is
-/// `DATA - 0x800 .. DATA + 0x800` and is filled with random bytes.
+/// [`DATA_SPAN`] bytes centred on it, `DATA - 0x800 .. DATA + 0x800`, and is
+/// filled with random bytes.
 pub const DATA: u32 = 0x8000_8800;
+/// Bytes of the random data area around [`DATA`].
+pub const DATA_SPAN: u32 = 0x1000;
 /// The return address planted in `$ra`; reaching it ends the run.
 pub const SENTINEL: u32 = 0x8000_0F00;
 /// RAM size used by the tests.
 pub const RAM: usize = 0x1_0000;
 
+/// One synthetic program, translated by the build script and run by the tests.
 pub struct Program {
+    /// Unique name, used in failure messages and to pair the program with its
+    /// translation.
     pub name: String,
     /// Functions as (address, words). The first is the entry point.
     pub funcs: Vec<(u32, Vec<u32>)>,
@@ -39,6 +45,7 @@ fn mem(name: String, body: Vec<u32>) -> Program {
     p
 }
 
+/// Every synthetic program, in the order the build script translates them.
 pub fn all() -> Vec<Program> {
     let mut v = Vec::new();
 

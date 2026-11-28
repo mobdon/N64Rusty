@@ -2,11 +2,17 @@
 //! CPU from the same random states and compares the results.
 
 use n64rusty_conformance::generated::PROGRAMS;
-use n64rusty_conformance::programs::{self, Program, DATA, RAM, SENTINEL};
+use n64rusty_conformance::programs::{self, Program, DATA, DATA_SPAN, RAM, SENTINEL};
 use n64rusty_refcpu::Cpu;
 use n64rusty_runtime::{sx32, Ctx, Memory};
 
 const ITERATIONS: usize = 64;
+/// Instructions the reference CPU may run before the program counts as stuck.
+const MAX_STEPS: usize = 10_000;
+/// Start of KSEG0: RAM offset 0 as the programs address it.
+const KSEG0: u32 = 0x8000_0000;
+/// Drops the top 3 bits of a KSEG0/KSEG1 address, leaving the physical one.
+const PHYS_MASK: u32 = 0x1FFF_FFFF;
 
 /// xorshift64*, so the tests need no dependencies and are reproducible.
 struct Rng(u64);
@@ -96,103 +102,136 @@ impl Rng {
 
 fn noop(_: &mut Ctx) {}
 
-fn run_one(p: &Program, register: fn(&mut Ctx), rng: &mut Rng) {
-    // Memory: code at its addresses, random bytes around DATA.
+/// The registers both CPUs start a run from.
+struct Start {
+    r: [u64; 32],
+    hi: u64,
+    lo: u64,
+    f: [u64; 32],
+    fcr31: u32,
+    fr: bool,
+}
+
+/// RAM with the program's code at its addresses and random bytes around DATA.
+fn initial_ram(p: &Program, rng: &mut Rng) -> Vec<u8> {
     let mut ram = vec![0u8; RAM];
-    let lo = (DATA - 0x800) as usize & (RAM - 1);
-    for b in &mut ram[lo..lo + 0x1000] {
+    let lo = (DATA - DATA_SPAN / 2) as usize & (RAM - 1);
+    for b in &mut ram[lo..lo + DATA_SPAN as usize] {
         *b = rng.next() as u8;
     }
     for (addr, words) in &p.funcs {
-        let base = (*addr & 0x1FFF_FFFF) as usize;
+        let base = (*addr & PHYS_MASK) as usize;
         for (k, w) in words.iter().enumerate() {
             ram[base + 4 * k..base + 4 * k + 4].copy_from_slice(&w.to_be_bytes());
         }
     }
+    ram
+}
 
-    let mut regs = [0u64; 32];
-    for r in regs.iter_mut().skip(1) {
-        *r = rng.reg();
+/// Random registers, with the program's fixed ones and `$ra` at the sentinel.
+fn random_start(p: &Program, rng: &mut Rng) -> Start {
+    let mut r = [0u64; 32];
+    for v in r.iter_mut().skip(1) {
+        *v = rng.reg();
     }
     for &(n, v) in &p.fixed {
-        regs[n as usize] = sx32(v);
+        r[n as usize] = sx32(v);
     }
-    regs[31] = sx32(SENTINEL);
-    let (hi, lo_reg) = (rng.reg(), rng.reg());
-    let mut fregs = [0u64; 32];
-    for f in &mut fregs {
-        *f = rng.freg();
+    r[31] = sx32(SENTINEL);
+    let (hi, lo) = (rng.reg(), rng.reg());
+    let mut f = [0u64; 32];
+    for v in &mut f {
+        *v = rng.freg();
     }
     // Rounding mode and condition bit at random; both register modes.
     let fcr31 = (rng.next() as u32 & 3) | if rng.next() % 2 == 0 { 1 << 23 } else { 0 };
     let fr = rng.next() % 2 == 0;
+    Start {
+        r,
+        hi,
+        lo,
+        f,
+        fcr31,
+        fr,
+    }
+}
 
-    let mut cpu = Cpu::new(ram.clone());
-    cpu.r = regs;
-    cpu.hi = hi;
-    cpu.lo = lo_reg;
-    cpu.f = fregs;
-    cpu.fcr31 = fcr31;
-    cpu.fr = fr;
-    cpu.run(p.funcs[0].0, SENTINEL, 10_000)
+fn run_reference(p: &Program, ram: Vec<u8>, s: &Start) -> Cpu {
+    let mut cpu = Cpu::new(ram);
+    cpu.r = s.r;
+    cpu.hi = s.hi;
+    cpu.lo = s.lo;
+    cpu.f = s.f;
+    cpu.fcr31 = s.fcr31;
+    cpu.fr = s.fr;
+    cpu.run(p.funcs[0].0, SENTINEL, MAX_STEPS)
         .unwrap_or_else(|e| panic!("{}: reference CPU stopped: {e:?}", p.name));
+    cpu
+}
 
+fn run_translated(p: &Program, register: fn(&mut Ctx), ram: Vec<u8>, s: &Start) -> Ctx {
     let mut ctx = Ctx::new(Memory::from_bytes(ram));
-    ctx.r = regs;
-    ctx.hi = hi;
-    ctx.lo = lo_reg;
-    ctx.f = fregs;
-    ctx.fcr31 = fcr31;
-    ctx.fr = fr;
+    ctx.r = s.r;
+    ctx.hi = s.hi;
+    ctx.lo = s.lo;
+    ctx.f = s.f;
+    ctx.fcr31 = s.fcr31;
+    ctx.fr = s.fr;
     register(&mut ctx);
     ctx.register(SENTINEL, noop);
     ctx.call(p.funcs[0].0);
+    ctx
+}
 
+/// Adds a line to `diffs` if the two values differ, both shown as `width`
+/// characters of hex (prefix included).
+fn diff_value(diffs: &mut Vec<String>, name: &str, translated: u64, reference: u64, width: usize) {
+    if translated != reference {
+        diffs.push(format!(
+            "  {name}: translated {translated:#0width$x}, reference {reference:#0width$x}"
+        ));
+    }
+}
+
+/// Every difference between the two CPUs after a run, one line each.
+fn differences(ctx: &Ctx, cpu: &Cpu) -> Vec<String> {
     let mut diffs = Vec::new();
     for n in 0..32 {
-        if ctx.r[n] != cpu.r[n] {
-            diffs.push(format!(
-                "  r{n}: translated {:#018x}, reference {:#018x}",
-                ctx.r[n], cpu.r[n]
-            ));
-        }
+        diff_value(&mut diffs, &format!("r{n}"), ctx.r[n], cpu.r[n], 18);
     }
     for n in 0..32 {
-        if ctx.f[n] != cpu.f[n] {
-            diffs.push(format!(
-                "  f{n}: translated {:#018x}, reference {:#018x}",
-                ctx.f[n], cpu.f[n]
-            ));
-        }
+        diff_value(&mut diffs, &format!("f{n}"), ctx.f[n], cpu.f[n], 18);
     }
-    if ctx.fcr31 != cpu.fcr31 {
-        diffs.push(format!(
-            "  fcr31: translated {:#010x}, reference {:#010x}",
-            ctx.fcr31, cpu.fcr31
-        ));
-    }
-    if ctx.hi != cpu.hi {
-        diffs.push(format!(
-            "  hi: translated {:#018x}, reference {:#018x}",
-            ctx.hi, cpu.hi
-        ));
-    }
-    if ctx.lo != cpu.lo {
-        diffs.push(format!(
-            "  lo: translated {:#018x}, reference {:#018x}",
-            ctx.lo, cpu.lo
-        ));
-    }
+    diff_value(&mut diffs, "fcr31", ctx.fcr31.into(), cpu.fcr31.into(), 10);
+    diff_value(&mut diffs, "hi", ctx.hi, cpu.hi, 18);
+    diff_value(&mut diffs, "lo", ctx.lo, cpu.lo, 18);
     let same = ctx.mem.bytes() == &cpu.mem[..];
     if let Some(at) = (0..RAM).find(|&k| !same && ctx.mem.bytes()[k] != cpu.mem[k]) {
         diffs.push(format!(
             "  memory differs first at {:#010x}: translated {:#04x}, reference {:#04x}",
-            0x8000_0000 + at as u32,
+            KSEG0 + at as u32,
             ctx.mem.bytes()[at],
             cpu.mem[at]
         ));
     }
+    diffs
+}
+
+fn run_one(p: &Program, register: fn(&mut Ctx), rng: &mut Rng) {
+    let ram = initial_ram(p, rng);
+    let s = random_start(p, rng);
+    let cpu = run_reference(p, ram.clone(), &s);
+    let ctx = run_translated(p, register, ram, &s);
+    let diffs = differences(&ctx, &cpu);
     if !diffs.is_empty() {
+        let Start {
+            r: regs,
+            hi,
+            lo,
+            f: fregs,
+            fcr31,
+            fr,
+        } = s;
         let init: Vec<String> = regs
             .iter()
             .enumerate()
@@ -200,7 +239,7 @@ fn run_one(p: &Program, register: fn(&mut Ctx), rng: &mut Rng) {
             .map(|(n, v)| format!("r{n}={v:#x}"))
             .collect();
         panic!(
-            "{}: translated code differs from the reference CPU\n{}\n  start: {} hi={hi:#x} lo={lo_reg:#x} fr={fr} fcr31={fcr31:#x}\n  floats: {:x?}",
+            "{}: translated code differs from the reference CPU\n{}\n  start: {} hi={hi:#x} lo={lo:#x} fr={fr} fcr31={fcr31:#x}\n  floats: {:x?}",
             p.name,
             diffs.join("\n"),
             init.join(" "),

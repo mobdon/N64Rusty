@@ -34,6 +34,10 @@ pub const VERSION: u32 = 2; // 2: Api::set_override_with appended
 pub const INSTALL: &[u8] = b"n64rusty_mod_install";
 /// The name of a mod's `extern "C" fn() -> u32` that returns [`VERSION`].
 pub const VERSION_FN: &[u8] = b"n64rusty_mod_version";
+/// Largest handoff, in bytes, [`Api::switch_game`] passes on to the next game.
+pub const HANDOFF_MAX: usize = 4096;
+/// Drops the top 3 bits of a KSEG0/KSEG1 address, leaving the physical one.
+const PHYS_MASK: u32 = 0x1FFF_FFFF;
 
 /// Exports [`VERSION_FN`] for a mod.
 #[macro_export]
@@ -125,10 +129,10 @@ impl Api {
         // SAFETY: the player keeps found ROMs for the whole run.
         (!p.is_null()).then(|| unsafe { std::slice::from_raw_parts(p, len) })
     }
-    /// See [`Api::switch_game`]; `data` is at most 4096 bytes (false if
-    /// longer).
+    /// See [`Api::switch_game`]; `data` is at most [`HANDOFF_MAX`] bytes
+    /// (false if longer).
     pub fn switch_game(&self, sha256: &str, data: &[u8]) -> bool {
-        data.len() <= 4096
+        data.len() <= HANDOFF_MAX
             && (self.switch_game)(sha256.as_ptr(), sha256.len(), data.as_ptr(), data.len())
     }
     /// See [`Api::handoff`].
@@ -143,15 +147,17 @@ impl Api {
     pub fn set_override_with<T: Sync>(&self, addr: u32, hook: HookWith, state: &'static T) {
         (self.set_override_with)(addr, hook, state as *const T as *mut c_void);
     }
-    /// General register `i` (0 to 31) of `ctx`.
+    /// General register `i` (0 to 31) of `ctx`. Only the low 5 bits of `i`
+    /// are used, so 32 reads register 0.
     pub fn reg(&self, ctx: Ctx, i: usize) -> u64 {
         // SAFETY: 32 registers.
         unsafe { *(self.regs)(ctx).add(i & 31) }
     }
     fn at(&self, vaddr: u32) -> usize {
-        (vaddr & 0x1FFF_FFFF) as usize
+        (vaddr & PHYS_MASK) as usize
     }
-    /// The byte at `vaddr` (KSEG0/KSEG1 or physical).
+    /// The byte at `vaddr` (KSEG0/KSEG1 or physical). This and the other
+    /// reads and writes panic if the address is past the end of RAM.
     pub fn read_u8(&self, vaddr: u32) -> u8 {
         self.ram()[self.at(vaddr)]
     }
@@ -187,8 +193,6 @@ mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
 
-    /// Largest handoff [`Api::switch_game`] passes on.
-    const HANDOFF_MAX: usize = 4096;
     /// Physical RAM the fake game is told it has (4 MiB, no Expansion Pak).
     const GAME_RAM: usize = 0x40_0000;
     /// The mods' own bytes above it.
