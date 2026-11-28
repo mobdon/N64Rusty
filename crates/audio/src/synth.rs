@@ -117,23 +117,27 @@ impl Synth {
 pub(crate) struct Streams {
     window: Option<(u32, Box<[f32; 512]>)>,
     synths: std::collections::HashMap<u32, Synth>,
-    state: u32,
+    /// The state block command 8 named; none until it runs.
+    state: Option<u32>,
 }
 
 impl Streams {
     /// Command 8: the stream whose history the next frames use.
     pub(crate) fn set_state(&mut self, at: u32) {
-        self.state = at;
+        self.state = Some(at);
     }
 
     /// Command 7: the frame buffer at `buf` to PCM, with the window from
     /// the microcode data at `data`.
     pub(crate) fn frame(&mut self, ram: &mut Memory, data: u32, buf: u32) {
+        let Some(state) = self.state else {
+            eprintln!("audio: stream frame at {buf:#010x} before any stream state, skipped");
+            return;
+        };
         if !matches!(&self.window, Some((at, _)) if *at == data) {
             self.window = Some((data, window(ram, data)));
         }
         let d = &self.window.as_ref().unwrap().1;
-        let state = self.state;
         if ram.read_u32(state + MARK_AT) != MARK {
             self.synths.insert(state, Synth::new());
             ram.write_u32(state + MARK_AT, MARK);
@@ -214,6 +218,19 @@ mod tests {
         expect[5] = want;
         assert_eq!(out, expect);
         assert!(want != 0);
+    }
+
+    #[test]
+    fn a_frame_before_any_stream_state_leaves_memory_alone() {
+        const DATA: u32 = 0x8000_1000;
+        const BUF: u32 = 0x8005_0000;
+        // Where an unset state of 0 would put its mark.
+        const LOW: u32 = 0;
+        let mut ram = ram_with_rows(DATA, |_, _| 8000);
+        ram.write_u32(BUF, 1 << 16);
+        let before = (ram.read_u32(LOW + MARK_AT), ram.read_u32(BUF));
+        Streams::default().frame(&mut ram, DATA, BUF);
+        assert_eq!((ram.read_u32(LOW + MARK_AT), ram.read_u32(BUF)), before);
     }
 
     #[test]

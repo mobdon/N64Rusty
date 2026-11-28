@@ -60,6 +60,8 @@ pub struct AudioRsp {
     /// steps they move by every 8 samples.
     env: [u16; 3],
     env_step: [u16; 3],
+    /// Opcodes already warned of as not implemented, so each warns once.
+    warned: [bool; 256],
 }
 
 impl Default for AudioRsp {
@@ -103,6 +105,7 @@ impl AudioRsp {
             book: [0; 256],
             env: [0; 3],
             env_step: [0; 3],
+            warned: [false; 256],
         }
     }
 
@@ -133,8 +136,8 @@ impl AudioRsp {
     }
 
     /// Runs the `len`-byte command list at `list` in guest RAM, as the RSP
-    /// does for an audio task. Panics on a command it does not implement,
-    /// naming it, so the first one a game uses is easy to find.
+    /// does for an audio task. A command it does not implement is skipped,
+    /// with a warning naming it the first time each opcode is seen.
     pub fn run(&mut self, ram: &mut Memory, list: u32, len: u32) {
         // A third command set (opcodes up to 0x19, fixed fields, no
         // segments) is told apart by its list: the other two stop at 0x0F.
@@ -190,7 +193,7 @@ impl AudioRsp {
             13 => self.interleave(out, hi1, lo1, count),
             14 => self.pole_filter(ram, flags, lo0, (inp, out, count), self.addr(w1)),
             15 => self.loop_addr = self.addr(w1),
-            op => panic!("audio command {op:#x} not implemented ({w0:08x} {w1:08x})"),
+            _ => self.unknown("audio", w0, w1),
         }
     }
 
@@ -215,7 +218,7 @@ impl AudioRsp {
                 let out = N_MAIN + (w1 & 0xFFF) as u16;
                 self.adpcm(ram, flags & !A_SMALL, a0, inp, out, count);
             }
-            2 => self.clear(N_MAIN + lo0, lo1 & 0xFFF),
+            2 => self.clear(N_MAIN.wrapping_add(lo0), lo1 & 0xFFF),
             3 => {
                 self.vol[1] = lo0 as i16;
                 self.envmix_lin(ram, flags, a1);
@@ -234,9 +237,18 @@ impl AudioRsp {
             }
             9 if flags & A_VOL != 0 => (self.target[1], self.rate[1]) = (lo0 as i16, w1 as i32),
             9 => (self.target[0], self.rate[0]) = (lo0 as i16, w1 as i32),
-            10 => self.dmem_move(N_MAIN + lo0, N_MAIN + hi1, (lo1 + 3) & !3),
+            10 => self.dmem_move(
+                N_MAIN.wrapping_add(lo0),
+                N_MAIN.wrapping_add(hi1),
+                round_up4(lo1),
+            ),
             11 => self.load_book(ram, a1, lo0),
-            12 => self.mix(lo0 as i16, N_MAIN + hi1, N_MAIN + lo1, N_COUNT),
+            12 => self.mix(
+                lo0 as i16,
+                N_MAIN.wrapping_add(hi1),
+                N_MAIN.wrapping_add(lo1),
+                N_COUNT,
+            ),
             13 => self.interleave(N_MAIN, N_DRY_LEFT, N_DRY_RIGHT, N_COUNT),
             // That game's microcode runs a biquad instead when the first
             // two coefficients are not both zero (its streams' low-pass).
@@ -250,7 +262,7 @@ impl AudioRsp {
             15 => self.loop_addr = a1,
             7 if self.streams => self.stream_state.frame(ram, self.ucode_data, a1),
             8 if self.streams => self.stream_state.set_state(a1),
-            op => panic!("n_audio command {op:#x} not implemented ({w0:08x} {w1:08x})"),
+            _ => self.unknown("n_audio", w0, w1),
         }
     }
 
@@ -273,8 +285,8 @@ impl AudioRsp {
             3 | 0x19 => {}
             4 => {
                 for i in (0..count16).step_by(2) {
-                    let v = self.ld(hi1 + i) as i32;
-                    self.add(lo1 + i, v);
+                    let v = self.ld(hi1.wrapping_add(i)) as i32;
+                    self.add(lo1.wrapping_add(i), v);
                 }
             }
             5 => self.resample(ram, flags, lo0, a1, inp, out, count),
@@ -283,8 +295,8 @@ impl AudioRsp {
                 let step = u32::from(lo0) * 2;
                 let mut pos = w1 & 0xFFFF;
                 for j in 0..count / 2 {
-                    let v = self.ld(inp + 2 * (pos >> 16) as u16);
-                    self.st(out + 2 * j, v);
+                    let v = self.ld(inp.wrapping_add(((pos >> 16) as u16).wrapping_mul(2)));
+                    self.st(out.wrapping_add(2 * j), v);
                     pos += step;
                 }
             }
@@ -294,10 +306,10 @@ impl AudioRsp {
             8 => (self.inp, self.out, self.count) = (lo0, hi1, lo1),
             9 => {
                 for k in 0..u16::from(flags) {
-                    self.dmem_move(lo0, hi1 + 128 * k, 128);
+                    self.dmem_move(lo0, hi1.wrapping_add(128 * k), 128);
                 }
             }
-            10 => self.dmem_move(lo0, hi1, (lo1 + 3) & !3),
+            10 => self.dmem_move(lo0, hi1, round_up4(lo1)),
             11 => self.load_book(ram, a1, lo0),
             12 => self.mix(lo0 as i16, hi1, lo1, count16),
             13 => self.interleave(lo0, hi1, lo1, count16),
@@ -305,15 +317,15 @@ impl AudioRsp {
                 // Gain Q4.4.
                 let gain = i32::from(flags as i8);
                 for i in (0..lo0 & 0xFFF).step_by(2) {
-                    let v = (self.ld(hi1 + i) as i32 * gain) >> 4;
-                    self.st(hi1 + i, clamp(v as i64));
+                    let v = (self.ld(hi1.wrapping_add(i)) as i32 * gain) >> 4;
+                    self.st(hi1.wrapping_add(i), clamp(v as i64));
                 }
             }
             15 => self.loop_addr = a1,
             0x11 => {
                 for i in 0..lo0 {
-                    let v = self.ld(hi1 + 4 * i);
-                    self.st(lo1 + 2 * i, v);
+                    let v = self.ld(hi1.wrapping_add(i.wrapping_mul(4)));
+                    self.st(lo1.wrapping_add(i.wrapping_mul(2)), v);
                 }
             }
             0x12 => {
@@ -325,7 +337,16 @@ impl AudioRsp {
             0x15 => self.save(ram, a1, (w0 & 0xFFF) as u16, ((w0 >> 12) & 0xFFF) as u16),
             0x16 => (self.env[0], self.env[1]) = (hi1, lo1),
             0x17 => self.s8_decode(ram, flags, a1, inp, out, count),
-            op => panic!("audio command {op:#x} not implemented ({w0:08x} {w1:08x})"),
+            _ => self.unknown("audio", w0, w1),
+        }
+    }
+
+    /// Skips a command the game sent that this interpreter does not run,
+    /// warning once per opcode so a game cannot flood the log.
+    fn unknown(&mut self, set: &str, w0: u32, w1: u32) {
+        let op = (w0 >> 24) as usize;
+        if !std::mem::replace(&mut self.warned[op], true) {
+            eprintln!("audio: {set} command {op:#x} not implemented ({w0:08x} {w1:08x}), skipped");
         }
     }
 
@@ -385,39 +406,44 @@ impl AudioRsp {
                 *v = ram.read_u16(src + 2 * i as u32) as i16;
             }
         }
+        // DMEM addresses wrap: the RSP keeps only the low 12 bits.
         for (i, &v) in last.iter().enumerate() {
-            self.st(out + 2 * i as u16, v);
+            self.st(out.wrapping_add(2 * i as u16), v);
         }
         let n = count.div_ceil(32) * 16;
+        let new = out.wrapping_add(32);
         for i in 0..n {
-            let b = self.dmem[(inp + i) as usize & MASK] as i8;
-            self.st(out + 32 + 2 * i, i16::from(b) << 8);
+            let b = self.dmem[inp.wrapping_add(i) as usize & MASK] as i8;
+            self.st(new.wrapping_add(2 * i), i16::from(b) << 8);
         }
-        let end = out + 32 + 2 * n;
+        let end = new.wrapping_add(n.wrapping_mul(2));
         for i in 0..16u16 {
-            ram.write_u16(state + 2 * i as u32, self.ld(end - 32 + 2 * i) as u16);
+            let at = end.wrapping_sub(32).wrapping_add(2 * i);
+            ram.write_u16(state + 2 * i as u32, self.ld(at) as u16);
         }
     }
 
+    // DMEM indexes below wrap before the mask, as the RSP's 12-bit DMEM
+    // addressing does.
     fn clear(&mut self, at: u16, count: u16) {
-        (0..count).for_each(|i| self.dmem[(at + i) as usize & MASK] = 0);
+        (0..count).for_each(|i| self.dmem[at.wrapping_add(i) as usize & MASK] = 0);
     }
 
     fn load(&mut self, ram: &Memory, src: u32, at: u16, count: u16) {
         for i in 0..count {
-            self.dmem[(at + i) as usize & MASK] = ram.read_u8(src + i as u32);
+            self.dmem[at.wrapping_add(i) as usize & MASK] = ram.read_u8(src + i as u32);
         }
     }
 
     fn save(&self, ram: &mut Memory, dst: u32, at: u16, count: u16) {
         for i in 0..count {
-            ram.write_u8(dst + i as u32, self.dmem[(at + i) as usize & MASK]);
+            ram.write_u8(dst + i as u32, self.dmem[at.wrapping_add(i) as usize & MASK]);
         }
     }
 
     fn dmem_move(&mut self, from: u16, to: u16, count: u16) {
         let bytes: Vec<u8> = (0..count)
-            .map(|i| self.dmem[(from + i) as usize & MASK])
+            .map(|i| self.dmem[from.wrapping_add(i) as usize & MASK])
             .collect();
         for (i, b) in bytes.into_iter().enumerate() {
             self.dmem[(to as usize + i) & MASK] = b;
@@ -433,20 +459,25 @@ impl AudioRsp {
     /// Saturating `out += in * gain` (gain Q15) over `count` bytes.
     fn mix(&mut self, gain: i16, inp: u16, out: u16, count: u16) {
         for i in (0..count).step_by(2) {
-            let v = (self.ld(inp + i) as i32 * gain as i32) >> 15;
-            self.add(out + i, v);
+            let v = (self.ld(inp.wrapping_add(i)) as i32 * gain as i32) >> 15;
+            self.add(out.wrapping_add(i), v);
         }
     }
 
     /// Left and right buffers of `count` bytes each into one stereo buffer.
     fn interleave(&mut self, out: u16, left: u16, right: u16, count: u16) {
         let lr: Vec<(i16, i16)> = (0..count / 2)
-            .map(|i| (self.ld(left + 2 * i), self.ld(right + 2 * i)))
+            .map(|i| {
+                (
+                    self.ld(left.wrapping_add(2 * i)),
+                    self.ld(right.wrapping_add(2 * i)),
+                )
+            })
             .collect();
         for (i, (l, r)) in lr.into_iter().enumerate() {
-            let at = out + 4 * i as u16;
+            let at = out.wrapping_add((4 * i) as u16);
             self.st(at, l);
-            self.st(at + 2, r);
+            self.st(at.wrapping_add(2), r);
         }
     }
 
@@ -490,14 +521,14 @@ impl AudioRsp {
             }
         }
         for (i, &v) in last.iter().enumerate() {
-            self.st(out + 2 * i as u16, v);
+            self.st(out.wrapping_add(2 * i as u16), v);
         }
         let (mut p2, mut p1) = (last[14] as i64, last[15] as i64);
-        let out = out + 32;
+        let out = out.wrapping_add(32);
         let (mut inp, mut out) = (inp, out);
         for _ in 0..frames {
             let header = self.dmem[inp as usize & MASK];
-            inp += 1;
+            inp = inp.wrapping_add(1);
             let (shift, pred) = (header >> 4, (header & 0xF) as usize);
             let c0: Vec<i64> = self.book[pred * 16..pred * 16 + 8]
                 .iter()
@@ -513,7 +544,7 @@ impl AudioRsp {
                     // Two-bit residuals, four to a byte, high bits first.
                     for k in 0..2 {
                         let b = self.dmem[inp as usize & MASK];
-                        inp += 1;
+                        inp = inp.wrapping_add(1);
                         for j in 0..4 {
                             let v = ((b << (2 * j)) as i8) >> 6;
                             r[4 * k + j] = (v as i64) << shift;
@@ -522,7 +553,7 @@ impl AudioRsp {
                 } else {
                     for k in 0..4 {
                         let b = self.dmem[inp as usize & MASK];
-                        inp += 1;
+                        inp = inp.wrapping_add(1);
                         r[2 * k] = (((b as i8) >> 4) as i64) << shift;
                         r[2 * k + 1] = ((((b << 4) as i8) >> 4) as i64) << shift;
                     }
@@ -535,7 +566,7 @@ impl AudioRsp {
                     }
                     o[i] = clamp(acc >> 11) as i64;
                     self.st(out, o[i] as i16);
-                    out += 2;
+                    out = out.wrapping_add(2);
                 }
                 (p2, p1) = (o[6], o[7]);
             }
@@ -543,7 +574,7 @@ impl AudioRsp {
         for i in 0..16u16 {
             ram.write_u16(
                 state + 2 * i as u32,
-                self.ld(out.wrapping_sub(32) + 2 * i) as u16,
+                self.ld(out.wrapping_sub(32).wrapping_add(2 * i)) as u16,
             );
         }
     }
@@ -578,7 +609,7 @@ impl AudioRsp {
         let step = pitch as u64 * 2;
         let n_out = count / 2;
         let n_in = ((pos + step * n_out as u64) >> 16) as u16;
-        s.extend((0..n_in).map(|i| self.ld(inp + 2 * i) as i32));
+        s.extend((0..n_in).map(|i| self.ld(inp.wrapping_add(i.wrapping_mul(2))) as i32));
         for j in 0..n_out {
             let i = (pos >> 16) as usize;
             let t = (pos & 0xFFFF) as f32 / 65536.0;
@@ -586,7 +617,7 @@ impl AudioRsp {
             let v = b + 0.5
                 * t
                 * (c - a + t * (2.0 * a - 5.0 * b + 4.0 * c - d + t * (3.0 * (b - c) + d - a)));
-            self.st(out + 2 * j, clamp(v.round() as i64));
+            self.st(out.wrapping_add(2 * j), clamp(v.round() as i64));
             pos += step;
         }
         let n = n_in as usize;
@@ -622,12 +653,18 @@ impl AudioRsp {
             (dry, wet) = (w(6) as i16, w(7) as i16);
         }
         for i in 0..count / 2 {
-            let x = self.ld(inp + 2 * i) as i64;
+            let x = self.ld(inp.wrapping_add(2 * i)) as i64;
             for ch in 0..2 {
                 let g = (x * (vol[ch] >> 16)) >> 15;
-                self.add(outs[ch] + 2 * i, ((g * dry as i64) >> 15) as i32);
+                self.add(
+                    outs[ch].wrapping_add(2 * i),
+                    ((g * dry as i64) >> 15) as i32,
+                );
                 if flags & A_AUX != 0 {
-                    self.add(outs[2 + ch] + 2 * i, ((g * wet as i64) >> 15) as i32);
+                    self.add(
+                        outs[2 + ch].wrapping_add(2 * i),
+                        ((g * wet as i64) >> 15) as i32,
+                    );
                 }
             }
             if i % 8 == 7 {
@@ -721,8 +758,12 @@ impl AudioRsp {
             b[1] != 0 || self.book[2] != 0,
             "biquad with no b1: a filter form not implemented"
         );
-        // Multiply and round as the vector unit does in Q15.
-        let q15 = |c: i32, v: i32| (c * v * 2 + 0x8000) >> 16;
+        // Multiply and round as the vector unit does in Q15 (VMULF), in i64
+        // so -1 * -1 cannot overflow, and clamped as VMULF clamps that one
+        // product to 0x7FFF.
+        let q15 = |c: i32, v: i32| {
+            i32::from(clamp((i64::from(c) * i64::from(v) * 2 + 0x8000) >> 16))
+        };
         let (mut x, mut y) = ([0i32; 2], [0i32; 2]);
         if flags & A_INIT == 0 {
             let h = |k: u32| i32::from(ram.read_u16(state + 2 * k) as i16);
@@ -765,24 +806,173 @@ impl AudioRsp {
             l2 = ram.read_u16(state + 6) as i16 as i64;
         }
         for f in 0..count.div_ceil(16) {
-            let (src, at) = (inp + 16 * f, out + 16 * f);
-            let x: Vec<i64> = (0..8).map(|i| self.ld(src + 2 * i) as i64).collect();
+            let (src, at) = (inp.wrapping_add(16 * f), out.wrapping_add(16 * f));
+            let x: Vec<i64> = (0..8)
+                .map(|i| self.ld(src.wrapping_add(2 * i)) as i64)
+                .collect();
             for i in 0..8 {
                 let mut acc = x[i] * gain + h1[i] * l1 + h2[i] * l2;
                 for k in 0..i {
                     acc += h2g[k] * x[i - 1 - k];
                 }
-                self.st(at + 2 * i as u16, clamp(acc >> 14));
+                self.st(at.wrapping_add(2 * i as u16), clamp(acc >> 14));
             }
-            (l1, l2) = (self.ld(at + 12) as i64, self.ld(at + 14) as i64);
+            (l1, l2) = (
+                self.ld(at.wrapping_add(12)) as i64,
+                self.ld(at.wrapping_add(14)) as i64,
+            );
         }
-        let end = out + count.div_ceil(16) * 16;
+        let end = out.wrapping_add(count.div_ceil(16).wrapping_mul(16));
         for i in 0..4u16 {
-            ram.write_u16(state + 2 * i as u32, self.ld(end - 8 + 2 * i) as u16);
+            ram.write_u16(
+                state + 2 * i as u32,
+                self.ld(end.wrapping_sub(8).wrapping_add(2 * i)) as u16,
+            );
         }
     }
 }
 
+/// A byte count rounded up to a multiple of 4 in 16 bits, as the microcode
+/// computes it: a count near 0xFFFF wraps to 0, a no-op.
+fn round_up4(count: u16) -> u16 {
+    count.wrapping_add(3) & !3
+}
+
 fn clamp(v: i64) -> i16 {
     v.clamp(i16::MIN as i64, i16::MAX as i64) as i16
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NEAR_TOP: u16 = 0xFFF0;
+    const COUNT: u16 = 0x20;
+
+    #[test]
+    fn dmem_ranges_near_the_top_of_u16_wrap_to_dmem_start() {
+        let mut rsp = AudioRsp::new();
+        rsp.dmem.fill(0xAA);
+        rsp.clear(NEAR_TOP, COUNT);
+        // 0xFFF0..0x10010 wraps to DMEM 0xFF0..0x1000 and 0x000..0x010.
+        assert!(rsp.dmem[0xFF0..].iter().all(|&b| b == 0));
+        assert!(rsp.dmem[..0x10].iter().all(|&b| b == 0));
+        assert_eq!(rsp.dmem[0x10], 0xAA);
+        rsp.dmem[0xFF0] = 7;
+        rsp.dmem_move(NEAR_TOP, 0x100, COUNT);
+        assert_eq!(rsp.dmem[0x100], 7);
+        let mut ram = Memory::new(1 << 16);
+        ram.write_u8(0x100, 9);
+        rsp.load(&ram, 0x100, NEAR_TOP, COUNT);
+        assert_eq!(rsp.dmem[0xFF0], 9);
+        rsp.save(&mut ram, 0x200, NEAR_TOP, COUNT);
+        assert_eq!(ram.read_u8(0x200), 9);
+    }
+
+    #[test]
+    fn s8_decode_near_the_top_of_u16_wraps() {
+        let mut rsp = AudioRsp::new();
+        let mut ram = Memory::new(1 << 16);
+        rsp.dmem[0xFE0] = 0x12;
+        rsp.s8_decode(&mut ram, A_INIT, 0x400, NEAR_TOP - 0x10, NEAR_TOP, COUNT);
+        // The new samples start 32 bytes after the history, wrapped.
+        assert_eq!(rsp.ld(0x010), 0x1200);
+        // A valid range still decodes where it did.
+        rsp.dmem[0x100] = 0x34;
+        rsp.s8_decode(&mut ram, A_INIT, 0x400, 0x100, 0x200, COUNT);
+        assert_eq!(rsp.ld(0x220), 0x3400);
+    }
+
+    #[test]
+    fn biquad_of_minus_one_by_minus_one_clamps_as_vmulf() {
+        let mut rsp = AudioRsp::new();
+        let mut ram = Memory::new(1 << 16);
+        rsp.book[0] = i16::MIN;
+        rsp.book[1] = 0x100;
+        rsp.st(N_MAIN, i16::MIN);
+        rsp.biquad(&mut ram, A_INIT, N_MAIN, 0x400);
+        // b0 * x = -1 * -1 is 0x7FFF, not -0x8000.
+        assert_eq!(rsp.ld(N_MAIN), i16::MAX);
+        // An ordinary product rounds as before: 0.5 * 0.5 = 0.25.
+        rsp.book[0] = 0x4000;
+        rsp.st(N_MAIN, 0x4000);
+        rsp.biquad(&mut ram, A_INIT, N_MAIN, 0x400);
+        assert_eq!(rsp.ld(N_MAIN), 0x2000);
+    }
+
+    /// Game fields near the top of u16 for every DMEM address and count.
+    const TOP: u16 = 0xFFFE;
+    const STATE: u32 = 0x400;
+
+    fn op(op: u32, flags: u8, lo0: u16) -> u32 {
+        op << 24 | u32::from(flags) << 16 | u32::from(lo0)
+    }
+
+    fn w1(hi1: u16, lo1: u16) -> u32 {
+        u32::from(hi1) << 16 | u32::from(lo1)
+    }
+
+    #[test]
+    fn n_audio_fields_near_the_top_of_u16_wrap() {
+        let mut rsp = AudioRsp::n_audio();
+        let mut ram = Memory::new(1 << 16);
+        rsp.dmem.fill(0xAA);
+        rsp.n_command(&mut ram, op(2, 0, NEAR_TOP), u32::from(TOP));
+        // N_MAIN + 0xFFF0 wraps to 0x4E0.
+        assert_eq!(rsp.dmem[0x4E0], 0);
+        // 0xFFE bytes from 0x4E0 leave only 0x4DE and 0x4DF as they were.
+        assert_eq!(rsp.dmem[0x4DE], 0xAA);
+        let before = rsp.dmem.clone();
+        // A count of 0xFFFE rounds up to 0x10000, which wraps to 0: no move.
+        rsp.n_command(&mut ram, op(10, 0, NEAR_TOP), w1(NEAR_TOP, TOP));
+        assert_eq!(rsp.dmem, before);
+        rsp.n_command(&mut ram, op(12, 0, 0x7FFF), w1(NEAR_TOP, TOP));
+    }
+
+    #[test]
+    fn standard_fields_near_the_top_of_u16_wrap() {
+        let mut rsp = AudioRsp::new();
+        let mut ram = Memory::new(1 << 16);
+        let before = rsp.dmem.clone();
+        rsp.command(&mut ram, op(10, 0, NEAR_TOP), w1(NEAR_TOP, TOP));
+        assert_eq!(rsp.dmem, before, "a count that wraps to 0 moves nothing");
+        rsp.command(&mut ram, op(12, 0, 0x7FFF), w1(NEAR_TOP, TOP));
+        // SETBUFF with input, output and count all near the top.
+        rsp.command(&mut ram, op(8, 0, NEAR_TOP), w1(NEAR_TOP, TOP));
+        rsp.command(&mut ram, op(13, 0, 0), w1(NEAR_TOP, TOP));
+        rsp.command(&mut ram, op(1, A_INIT, 0), STATE);
+        rsp.command(&mut ram, op(3, A_INIT | A_AUX, 0), STATE);
+        rsp.command(&mut ram, op(5, A_INIT, 0xFFFF), STATE);
+        rsp.command(&mut ram, op(14, A_INIT, 0x4000), STATE);
+    }
+
+    #[test]
+    fn third_set_fields_near_the_top_of_u16_wrap() {
+        let mut rsp = AudioRsp::new();
+        let mut ram = Memory::new(1 << 16);
+        let before = rsp.dmem.clone();
+        rsp.third_command(&mut ram, op(10, 0, NEAR_TOP), w1(NEAR_TOP, TOP));
+        assert_eq!(rsp.dmem, before, "a count that wraps to 0 moves nothing");
+        rsp.third_command(&mut ram, op(4, 0xFF, 0), w1(NEAR_TOP, TOP));
+        rsp.third_command(&mut ram, op(9, 0xFF, NEAR_TOP), w1(NEAR_TOP, TOP));
+        rsp.third_command(&mut ram, op(14, 0x10, 0xFFF), w1(NEAR_TOP, TOP));
+        rsp.third_command(&mut ram, op(0x11, 0, 0xFFFF), w1(NEAR_TOP, TOP));
+        rsp.third_command(&mut ram, op(8, 0, NEAR_TOP), w1(NEAR_TOP, TOP));
+        rsp.third_command(&mut ram, op(6, 0, 0xFFFF), 0xFFFF);
+    }
+
+    #[test]
+    fn unknown_commands_are_skipped_with_one_warning_each() {
+        let mut ram = Memory::new(1 << 16);
+        let mut rsp = AudioRsp::new();
+        rsp.command(&mut ram, op(0x10, 0, 0), 0);
+        rsp.command(&mut ram, op(0x10, 0, 0), 0);
+        assert!(rsp.warned[0x10]);
+        rsp.third_command(&mut ram, op(0x18, 0, 0), 0);
+        assert!(rsp.warned[0x18]);
+        let mut rsp = AudioRsp::n_audio();
+        rsp.n_command(&mut ram, op(7, 0, 0), 0);
+        assert!(rsp.warned[7]);
+        assert_eq!(rsp.warned.iter().filter(|&&w| w).count(), 1);
+    }
 }

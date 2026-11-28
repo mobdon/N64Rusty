@@ -259,10 +259,9 @@ fn mix_interleave_save_and_segments() {
 }
 
 #[test]
-#[should_panic(expected = "audio command 0x10 not implemented")]
-fn unknown_command_names_itself() {
-    let mut ram = ram();
-    run(&mut AudioRsp::new(), &mut ram, &[c(16, 0, 0, 0)]);
+fn unknown_command_is_skipped() {
+    let (mut rsp, mut ram) = (AudioRsp::new(), ram());
+    run(&mut rsp, &mut ram, &[c(16, 0, 0, 0), c(16, 0, 0, 0)]);
 }
 
 #[test]

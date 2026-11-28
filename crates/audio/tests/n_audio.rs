@@ -303,8 +303,7 @@ fn other_games_keep_the_pole_filter_with_the_same_coefficients() {
 }
 
 #[test]
-#[should_panic(expected = "n_audio command 0x7 not implemented")]
-fn unknown_command_names_itself() {
+fn unknown_command_is_skipped() {
     let (mut rsp, mut ram) = setup();
-    run(&mut rsp, &mut ram, &[(7 << 24, 0)]);
+    run(&mut rsp, &mut ram, &[(7 << 24, 0), (7 << 24, 0)]);
 }
