@@ -144,8 +144,12 @@ fn reference_end(rom: &Path, entry: u32, words: usize) -> Result<u32, String> {
 /// The RAM images runs saved for the ROM with this SHA-256 (see
 /// [`written_images`]), as (base address, bytes).
 fn saved_images(sha256: &str) -> Result<Vec<(u32, Vec<u8>)>, String> {
-    let dir = PathBuf::from("local").join(sha256).join("images");
-    let mut paths: Vec<PathBuf> = fs::read_dir(&dir)
+    images_in(&PathBuf::from("local").join(sha256).join("images"))
+}
+
+/// [`saved_images`] from the images folder `dir`.
+fn images_in(dir: &Path) -> Result<Vec<(u32, Vec<u8>)>, String> {
+    let mut paths: Vec<PathBuf> = fs::read_dir(dir)
         .into_iter()
         .flatten()
         .flatten()
@@ -1050,5 +1054,173 @@ mod tests {
         assert!(read_table(&p, 4).is_err());
         assert!(read_table(&dir.join("absent.txt"), 3).unwrap().is_empty());
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `addiu v0, zero, 1; jr ra; nop`: the smallest whole function.
+    const RETURN_ONE: [u32; 3] = [0x2402_0001, 0x03E0_0008, 0];
+    const IMAGE_BASE: u32 = 0x8010_0000;
+
+    /// A new, empty folder for one test.
+    fn fresh_dir(test: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("n64rusty-{test}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn be_bytes(words: &[u32]) -> Vec<u8> {
+        words.iter().flat_map(|w| w.to_be_bytes()).collect()
+    }
+
+    // The order check only bites on file systems that do not already list in name
+    // order; NTFS does, so on Windows a missing sort in images_in would still pass.
+    #[test]
+    fn saved_images_take_the_base_from_the_name_in_name_order() {
+        let dir = fresh_dir("saved-images-order");
+        fs::write(dir.join("80200000_80200010.bin"), [3, 4]).unwrap();
+        fs::write(dir.join("80100000_80100000.bin"), [1, 2]).unwrap();
+        fs::write(dir.join("80300000.bin"), [5]).unwrap(); // no call part: base alone is enough
+        let images = images_in(&dir).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(
+            images,
+            vec![
+                (0x8010_0000, vec![1, 2]),
+                (0x8020_0000, vec![3, 4]),
+                (0x8030_0000, vec![5]),
+            ]
+        );
+    }
+
+    #[test]
+    fn saved_images_skip_names_that_are_not_hex_and_unreadable_entries() {
+        let dir = fresh_dir("saved-images-skip");
+        fs::write(dir.join("notes.txt"), "x").unwrap();
+        fs::write(dir.join("100000000_0.bin"), [9]).unwrap(); // base past 32 bits
+        fs::create_dir(dir.join("80400000_80400000")).unwrap(); // a folder cannot be read as bytes
+        fs::write(dir.join("80100000_80100000.bin"), [1]).unwrap();
+        let images = images_in(&dir).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(images, vec![(0x8010_0000, vec![1])]);
+    }
+
+    #[test]
+    fn saved_images_of_a_missing_folder_are_none() {
+        let dir = fresh_dir("saved-images-missing");
+        let images = images_in(&dir.join("images")).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(images.is_empty());
+    }
+
+    #[test]
+    fn written_images_discover_the_function_at_the_call_that_saved_it() {
+        let local = fresh_dir("written-images-call");
+        fs::create_dir(local.join("images")).unwrap();
+        // Two zero words before the function, so the call differs from the base.
+        let call = IMAGE_BASE + 8;
+        let name = format!("{IMAGE_BASE:08x}_{call:08x}");
+        let image = local.join("images").join(format!("{name}.bin"));
+        fs::write(image, be_bytes(&[[0, 0].as_slice(), &RETURN_ONE].concat())).unwrap();
+        let modules = written_images(&local).unwrap();
+        fs::remove_dir_all(&local).unwrap();
+        assert_eq!(modules.len(), 1);
+        let (module, found) = &modules[0];
+        assert_eq!(module, &format!("img_{name}"));
+        let f = found
+            .functions
+            .iter()
+            .find(|f| f.addr == call)
+            .expect("no function at the call");
+        assert_eq!(f.words, RETURN_ONE);
+        // Only the call that saved the image is an entry, not the image's start.
+        assert!(
+            !found.functions.iter().any(|f| f.addr == IMAGE_BASE),
+            "the image base was taken as a function"
+        );
+    }
+
+    #[test]
+    fn written_images_skip_names_without_exactly_base_and_call() {
+        let local = fresh_dir("written-images-names");
+        let images = local.join("images");
+        fs::create_dir(&images).unwrap();
+        let code = be_bytes(&RETURN_ONE);
+        fs::write(images.join("80100000.bin"), &code).unwrap(); // no call
+        fs::write(images.join("80100000_80100000_1.bin"), &code).unwrap(); // three numbers
+        fs::write(images.join("notes.txt"), "x").unwrap();
+        let modules = written_images(&local).unwrap();
+        fs::remove_dir_all(&local).unwrap();
+        let names: Vec<&String> = modules.iter().map(|m| &m.0).collect();
+        assert!(names.is_empty(), "{names:?}");
+    }
+
+    #[test]
+    fn written_images_are_none_without_an_images_folder() {
+        let local = fresh_dir("written-images-missing");
+        let modules = written_images(&local).unwrap();
+        fs::remove_dir_all(&local).unwrap();
+        assert!(modules.is_empty());
+    }
+
+    #[test]
+    fn written_images_report_an_image_that_cannot_be_read() {
+        let local = fresh_dir("written-images-unreadable");
+        // A folder with an image's name: reading it as bytes fails.
+        fs::create_dir_all(local.join("images").join("80100000_80100000")).unwrap();
+        let result = written_images(&local);
+        fs::remove_dir_all(&local).unwrap();
+        let Err(err) = result else {
+            panic!("an unreadable image was not reported");
+        };
+        assert!(err.contains("80100000_80100000"), "{err}");
+    }
+
+    #[test]
+    fn write_if_changed_creates_a_missing_file_and_its_folders() {
+        let dir = fresh_dir("write-if-changed-new");
+        let path = dir.join("a").join("b").join("lib.rs");
+        assert_eq!(write_if_changed(&path, "fn f() {}\n"), Ok(true));
+        let text = fs::read_to_string(&path).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(text, "fn f() {}\n");
+    }
+
+    #[test]
+    fn write_if_changed_leaves_an_identical_file_and_its_time_alone() {
+        let dir = fresh_dir("write-if-changed-same");
+        let path = dir.join("lib.rs");
+        fs::write(&path, "same\n").unwrap();
+        // An old time, so any rewrite would visibly move it.
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+        let file = fs::File::options().write(true).open(&path).unwrap();
+        file.set_modified(old).unwrap();
+        drop(file);
+        assert_eq!(write_if_changed(&path, "same\n"), Ok(false));
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(modified, old);
+    }
+
+    #[test]
+    fn write_if_changed_replaces_different_contents() {
+        let dir = fresh_dir("write-if-changed-differs");
+        let path = dir.join("lib.rs");
+        fs::write(&path, "old\n").unwrap();
+        assert_eq!(write_if_changed(&path, "new\n"), Ok(true));
+        let text = fs::read_to_string(&path).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(text, "new\n");
+    }
+
+    #[test]
+    fn write_if_changed_reports_a_folder_it_cannot_create() {
+        let dir = fresh_dir("write-if-changed-blocked");
+        let file = dir.join("file");
+        fs::write(&file, "").unwrap();
+        // The parent "folder" is a file, so neither creating nor writing can work.
+        let result = write_if_changed(&file.join("lib.rs"), "x");
+        fs::remove_dir_all(&dir).unwrap();
+        let err = result.unwrap_err();
+        assert!(err.starts_with("creating "), "{err}");
     }
 }

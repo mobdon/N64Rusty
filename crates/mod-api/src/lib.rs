@@ -181,3 +181,195 @@ pub unsafe fn state<T>(data: *mut c_void) -> &'static T {
     // SAFETY: the caller's promise above.
     unsafe { &*(data as *const T) }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+
+    /// Largest handoff [`Api::switch_game`] passes on.
+    const HANDOFF_MAX: usize = 4096;
+    /// Physical RAM the fake game is told it has (4 MiB, no Expansion Pak).
+    const GAME_RAM: usize = 0x40_0000;
+    /// The mods' own bytes above it.
+    const MOD_RAM: usize = 0x1000;
+    // VR4300 manual, kernel address space: KSEG0 and KSEG1 map to physical 0 by dropping the
+    // top 3 bits (cached and uncached views of the same RAM).
+    const KSEG0: u32 = 0x8000_0000;
+    const KSEG1: u32 = 0xA000_0000;
+    const PHYS: u32 = 0x1234;
+
+    thread_local! {
+        static SWITCHES: RefCell<Vec<(String, Vec<u8>)>> = const { RefCell::new(Vec::new()) };
+        static OVERRIDE: Cell<Option<(u32, *mut c_void)>> = const { Cell::new(None) };
+    }
+
+    extern "C" fn no_rom(_: *const u8, _: usize, _: *mut usize) -> *const u8 {
+        std::ptr::null()
+    }
+    extern "C" fn no_override(_: u32, _: Hook) {}
+    extern "C" fn no_call(_: Ctx, _: u32) {}
+    // The fake game's ctx is its register file.
+    extern "C" fn regs_of(ctx: Ctx) -> *mut u64 {
+        ctx as *mut u64
+    }
+    extern "C" fn record_switch(sha: *const u8, sha_len: usize, d: *const u8, n: usize) -> bool {
+        // SAFETY: Api::switch_game passes a str and a slice with their lengths.
+        let (sha, d) = unsafe {
+            (
+                std::slice::from_raw_parts(sha, sha_len),
+                std::slice::from_raw_parts(d, n),
+            )
+        };
+        let sha = String::from_utf8(sha.to_vec()).unwrap();
+        SWITCHES.with(|s| s.borrow_mut().push((sha, d.to_vec())));
+        true
+    }
+    extern "C" fn no_handoff(_: *mut usize) -> *const u8 {
+        std::ptr::null()
+    }
+    extern "C" fn record_override_with(addr: u32, _: HookWith, data: *mut c_void) {
+        OVERRIDE.with(|o| o.set(Some((addr, data))));
+    }
+    extern "C" fn noop_hook(_: Ctx, _: *mut c_void) {}
+
+    /// An Api over `ram`, whose last `mod_ram_len` bytes are the mods'.
+    fn fake_api(ram: &mut [u8], mod_ram_len: usize) -> Api {
+        const SHA: &str = "ab";
+        // Each test starts with no recorded calls, whatever thread it runs on.
+        SWITCHES.with(|s| s.borrow_mut().clear());
+        OVERRIDE.with(|o| o.set(None));
+        Api {
+            ram: ram.as_mut_ptr(),
+            ram_len: ram.len(),
+            mod_ram_len,
+            cart: std::ptr::null_mut(),
+            cart_len: 0,
+            sha256: SHA.as_ptr(),
+            sha256_len: SHA.len(),
+            find_rom: no_rom,
+            set_override: no_override,
+            call_original: no_call,
+            regs: regs_of,
+            switch_game: record_switch,
+            handoff: no_handoff,
+            set_override_with: record_override_with,
+        }
+    }
+
+    fn switches() -> Vec<(String, Vec<u8>)> {
+        SWITCHES.with(|s| s.borrow().clone())
+    }
+
+    #[test]
+    fn switch_game_refuses_data_over_4096_bytes_without_calling_the_player() {
+        let mut ram = vec![0; 16];
+        let api = fake_api(&mut ram, 0);
+        assert!(!api.switch_game("cd", &[0; HANDOFF_MAX + 1]));
+        assert!(switches().is_empty());
+    }
+
+    #[test]
+    fn switch_game_passes_exactly_4096_bytes_and_the_sha_to_the_player() {
+        let mut ram = vec![0; 16];
+        let api = fake_api(&mut ram, 0);
+        let data: Vec<u8> = (0..HANDOFF_MAX).map(|i| i as u8).collect();
+        assert!(api.switch_game("cd", &data));
+        assert_eq!(switches(), vec![("cd".to_string(), data)]);
+    }
+
+    #[test]
+    fn switch_game_passes_empty_data() {
+        let mut ram = vec![0; 16];
+        let api = fake_api(&mut ram, 0);
+        assert!(api.switch_game("cd", &[]));
+        assert_eq!(switches(), vec![("cd".to_string(), vec![])]);
+    }
+
+    #[test]
+    fn mod_ram_starts_where_the_games_ram_ends() {
+        let mut ram = vec![0; GAME_RAM + MOD_RAM];
+        assert_eq!(fake_api(&mut ram, MOD_RAM).mod_ram(), GAME_RAM as u32);
+    }
+
+    #[test]
+    fn mod_ram_is_the_end_of_ram_when_mods_have_none() {
+        let mut ram = vec![0; GAME_RAM];
+        assert_eq!(fake_api(&mut ram, 0).mod_ram(), GAME_RAM as u32);
+    }
+
+    #[test]
+    fn read_u8_sees_the_same_byte_through_kseg0_kseg1_and_physical() {
+        let mut ram = vec![0; 0x2000];
+        ram[PHYS as usize] = 0x5A;
+        let api = fake_api(&mut ram, 0);
+        for addr in [PHYS, KSEG0 | PHYS, KSEG1 | PHYS] {
+            assert_eq!(api.read_u8(addr), 0x5A, "{addr:#010x}");
+        }
+    }
+
+    #[test]
+    fn write_u8_through_kseg1_lands_at_the_physical_address() {
+        let mut ram = vec![0; 0x2000];
+        let api = fake_api(&mut ram, 0);
+        api.write_u8(KSEG1 | PHYS, 0xA5);
+        assert_eq!(ram[PHYS as usize], 0xA5);
+    }
+
+    #[test]
+    fn read_u32_is_big_endian_and_masks_kseg0() {
+        let mut ram = vec![0; 0x2000];
+        ram[PHYS as usize..PHYS as usize + 4].copy_from_slice(&[0x12, 0x34, 0x56, 0x78]);
+        let api = fake_api(&mut ram, 0);
+        // The VR4300 in the N64 runs big-endian: the first byte is the top one.
+        assert_eq!(api.read_u32(KSEG0 | PHYS), 0x1234_5678);
+        assert_eq!(api.read_u32(KSEG1 | PHYS), 0x1234_5678);
+    }
+
+    #[test]
+    fn write_u32_stores_big_endian_at_the_physical_address() {
+        let mut ram = vec![0; 0x2000];
+        let api = fake_api(&mut ram, 0);
+        api.write_u32(KSEG0 | PHYS, 0xDEAD_BEEF);
+        let p = PHYS as usize;
+        assert_eq!(ram[p..p + 4], [0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    #[test]
+    fn word_access_reaches_the_last_word_of_ram() {
+        let mut ram = vec![0; 0x100];
+        let last = (ram.len() - 4) as u32;
+        let api = fake_api(&mut ram, 0);
+        api.write_u32(KSEG1 | last, 0x0102_0304);
+        assert_eq!(api.read_u32(last), 0x0102_0304);
+    }
+
+    #[test]
+    fn reg_reads_each_of_the_32_registers() {
+        let mut ram = vec![0; 16];
+        let api = fake_api(&mut ram, 0);
+        let mut file: [u64; 32] = std::array::from_fn(|i| 0xFFFF_0000_0000_0000 | i as u64);
+        let ctx = file.as_mut_ptr() as Ctx;
+        for (i, &want) in file.iter().enumerate() {
+            assert_eq!(api.reg(ctx, i), want, "register {i}");
+        }
+    }
+
+    #[test]
+    fn state_gives_a_hook_back_what_set_override_with_was_given() {
+        struct Settings {
+            speed: u32,
+        }
+        static SETTINGS: Settings = Settings { speed: 3 };
+        const ADDR: u32 = 0x8000_1000;
+        let mut ram = vec![0; 16];
+        let api = fake_api(&mut ram, 0);
+        api.set_override_with(ADDR, noop_hook, &SETTINGS);
+        let (addr, data) = OVERRIDE.with(|o| o.get()).expect("player was not called");
+        assert_eq!(addr, ADDR);
+        // SAFETY: data was set from a &'static Settings just above.
+        let back: &Settings = unsafe { state(data) };
+        assert!(std::ptr::eq(back, &SETTINGS));
+        assert_eq!(back.speed, 3);
+    }
+}

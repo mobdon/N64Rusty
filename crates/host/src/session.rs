@@ -353,4 +353,48 @@ mod tests {
         s.mode = Mode::Paused;
         assert_eq!(s.tick(&Pads::default(), false), Tick::Done);
     }
+
+    fn temp_file(test: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("n64rusty-{test}-{}.txt", std::process::id()))
+    }
+
+    /// A session recording into `file` instead of the file its config names.
+    fn recording_into(file: File) -> Session<Count> {
+        let mut s = Session::new(Count(0), &RunConfig::default()).unwrap();
+        s.record = Some((Recorder::default(), file, 0));
+        s
+    }
+
+    #[test]
+    fn recording_is_on_disk_after_each_frame_before_finish() {
+        let path = temp_file("record-ok");
+        let cfg = RunConfig {
+            record: Some(path.clone()),
+            ..RunConfig::default()
+        };
+        let mut s = Session::new(Count(0), &cfg).unwrap();
+        assert_eq!(s.tick(&Pads::default(), false), Tick::Ran);
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        let result = s.finish();
+        std::fs::remove_file(&path).unwrap();
+        // The first frame writes every port (script::Recorder).
+        assert!(on_disk.contains("0 1 - 0 0\n"), "{on_disk}");
+        assert!(on_disk.contains("0 4 - 0 0\n"), "{on_disk}");
+        assert_eq!(result.unwrap().0, 1);
+    }
+
+    #[test]
+    fn a_failed_recording_write_keeps_the_game_running_and_finish_reports_it() {
+        let path = temp_file("record-fail");
+        File::create(&path).unwrap();
+        // Opened read-only, so every write to it fails.
+        let mut s = recording_into(File::open(&path).unwrap());
+        assert_eq!(s.tick(&Pads::default(), false), Tick::Ran);
+        assert!(s.record_error.is_some(), "the failed write was not kept");
+        assert_eq!(s.tick(&Pads::default(), false), Tick::Ran);
+        assert_eq!(s.guest.0, 2, "the game did not run both frames");
+        let result = s.finish();
+        std::fs::remove_file(&path).unwrap();
+        assert!(result.is_err(), "finish hid the failed recording");
+    }
 }
