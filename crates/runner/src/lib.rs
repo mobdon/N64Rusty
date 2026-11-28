@@ -94,12 +94,13 @@ pub fn boot(rom: &Rom, game: &Game) -> Ctx {
 }
 
 /// Function names for reports, from `name = 0xADDR;` lines in local files.
-pub fn read_names(paths: &[PathBuf]) -> BTreeMap<u32, String> {
+///
+/// Fails with the file's path when one of `paths` cannot be read, so a
+/// mistyped map is reported instead of quietly giving fewer names.
+pub fn read_names(paths: &[PathBuf]) -> Result<BTreeMap<u32, String>, String> {
     let mut out = BTreeMap::new();
     for p in paths {
-        let Ok(text) = std::fs::read_to_string(p) else {
-            continue;
-        };
+        let text = std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?;
         for line in text.lines() {
             let line = line.split("//").next().unwrap_or("").trim();
             let Some((name, rest)) = line.split_once('=') else {
@@ -113,7 +114,7 @@ pub fn read_names(paths: &[PathBuf]) -> BTreeMap<u32, String> {
             }
         }
     }
-    out
+    Ok(out)
 }
 
 /// The lines of a per-game `config.toml` that keep, from symbol maps, only
@@ -615,7 +616,13 @@ pub fn main_args(
         },
         None => save::Save::in_memory(),
     };
-    let names = read_names(&symbols);
+    let names = match read_names(&symbols) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("error: cannot read {e}");
+            return ExitCode::from(2);
+        }
+    };
     let by_name: BTreeMap<String, u32> = names.iter().map(|(a, n)| (n.clone(), *a)).collect();
     let mut save = save;
     // A game with a cartridge EEPROM says so in its config, with the size
@@ -804,9 +811,16 @@ mod tests {
         );
         let path = std::env::temp_dir().join(format!("routines-{}.toml", std::process::id()));
         std::fs::write(&path, &list).unwrap();
-        let back = read_names(std::slice::from_ref(&path));
+        let back = read_names(std::slice::from_ref(&path)).unwrap();
         std::fs::remove_file(path).unwrap();
         assert_eq!(back.len(), 2);
         assert_eq!(back[&0x8000_1000], "osCreateThread");
+    }
+
+    #[test]
+    fn read_names_names_a_file_it_cannot_read() {
+        let path = std::env::temp_dir().join(format!("no-such-map-{}.txt", std::process::id()));
+        let e = read_names(std::slice::from_ref(&path)).unwrap_err();
+        assert!(e.contains(&path.display().to_string()), "{e}");
     }
 }

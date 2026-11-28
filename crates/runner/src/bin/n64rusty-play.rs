@@ -18,7 +18,7 @@
 // from, else to n64rusty-play.log next to the program.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -318,11 +318,9 @@ fn routines(args: &[String], dir: &Path, rom: &Rom, local: &Path) -> Result<(), 
         .map(|w| PathBuf::from(&w[1]))
         .collect();
     if !maps.is_empty() {
-        let names = read_names(&maps);
-        let list = format!("{FROM_MAP}\n{}", routine_list(&names));
-        std::fs::write(&config, &list).map_err(|e| err(&config, e))?;
+        let names = list_from_maps(&maps, &config)?;
         println!("wrote the routine list to {}", config.display());
-        let wanted = read_names(std::slice::from_ref(&config))
+        let wanted = read_names(std::slice::from_ref(&config))?
             .into_values()
             .collect();
         let mut lines: BTreeSet<String> = std::fs::read_to_string(&prints)
@@ -373,6 +371,86 @@ fn routines(args: &[String], dir: &Path, rom: &Rom, local: &Path) -> Result<(), 
         .map(|(a, n)| format!("{n} = {a:#010x}\n"))
         .collect();
     std::fs::write(&config, list).map_err(|e| err(&config, e))
+}
+
+/// Writes `config` with the routines named in the symbol `maps` and returns
+/// every name the maps hold. Leaves `config` as it was when a map cannot be
+/// read or the maps name none of the routines the runner needs, since the
+/// `FROM_MAP` header would keep that empty list over the built-in one.
+fn list_from_maps(maps: &[PathBuf], config: &Path) -> Result<BTreeMap<u32, String>, String> {
+    let names = read_names(maps)?;
+    let routines = routine_list(&names);
+    if routines.is_empty() {
+        return Err(format!(
+            "the symbol maps name none of the routines the runner needs, so {} was left as it was",
+            config.display()
+        ));
+    }
+    std::fs::write(config, format!("{FROM_MAP}\n{routines}"))
+        .map_err(|e| format!("{}: {e}", config.display()))?;
+    Ok(names)
+}
+
+#[cfg(test)]
+mod list_from_maps_tests {
+    use super::*;
+
+    /// A fresh folder for one test, so tests running at once do not share files.
+    fn folder(test: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("n64rusty-{test}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    const OLD_LIST: &str = "// from a symbol map\nosCreateThread = 0x80001000\n";
+
+    #[test]
+    fn an_unreadable_map_names_its_path_and_keeps_the_list() {
+        let dir = folder("unreadable-map");
+        let config = dir.join("config.toml");
+        std::fs::write(&config, OLD_LIST).unwrap();
+        let map = dir.join("typo.map");
+        let e = list_from_maps(std::slice::from_ref(&map), &config).unwrap_err();
+        let kept = std::fs::read_to_string(&config).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(e.contains(&map.display().to_string()), "{e}");
+        assert_eq!(kept, OLD_LIST);
+    }
+
+    #[test]
+    fn a_map_without_needed_routines_writes_nothing() {
+        let dir = folder("empty-map");
+        let config = dir.join("config.toml");
+        std::fs::write(&config, OLD_LIST).unwrap();
+        let map = dir.join("game.map");
+        std::fs::write(&map, "some_game_function = 0x80002000;\n").unwrap();
+        let e = list_from_maps(std::slice::from_ref(&map), &config).unwrap_err();
+        let kept = std::fs::read_to_string(&config).unwrap();
+        let fresh = list_from_maps(std::slice::from_ref(&map), &dir.join("new.toml"));
+        let created = dir.join("new.toml").exists();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(e.contains("none of the routines"), "{e}");
+        assert_eq!(kept, OLD_LIST);
+        assert!(fresh.is_err());
+        assert!(!created);
+    }
+
+    #[test]
+    fn a_map_with_routines_writes_the_list() {
+        let dir = folder("good-map");
+        let config = dir.join("config.toml");
+        let map = dir.join("game.map");
+        std::fs::write(
+            &map,
+            "osCreateThread = 0x80001000;\nsome_game_function = 0x80002000;\n",
+        )
+        .unwrap();
+        let names = list_from_maps(std::slice::from_ref(&map), &config).unwrap();
+        let list = std::fs::read_to_string(&config).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(names.len(), 2);
+        assert_eq!(list, format!("{FROM_MAP}\nosCreateThread = 0x80001000\n"));
+    }
 }
 
 /// The recent list with `rom` moved to the top, at most ten entries.
