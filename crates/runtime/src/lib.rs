@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::{BTreeMap, HashMap};
+use std::hash::{BuildHasherDefault, Hasher};
 
 mod fpu;
 mod memory;
@@ -51,8 +52,8 @@ pub struct Ctx {
     pub fr: bool,
     /// Guest RAM.
     pub mem: Memory,
-    funcs: HashMap<u32, GuestFn>,
-    overrides: HashMap<u32, GuestFn>,
+    funcs: AddrMap<GuestFn>,
+    overrides: AddrMap<GuestFn>,
     overlays: Vec<Overlay>,
     /// Overlays currently in RAM, as indexes into `overlays`, each with the
     /// ranges later copies have overwritten since it was loaded.
@@ -60,7 +61,7 @@ pub struct Ctx {
     /// Functions of code the game writes into RAM itself (unpacked or
     /// built, so no cartridge copy shows it), by address: each candidate's
     /// length in bytes, the [`code_hash`] of its words and the function.
-    images: HashMap<u32, Vec<(u32, u64, GuestFn)>>,
+    images: AddrMap<Vec<(u32, u64, GuestFn)>>,
     /// Image functions whose bytes matched RAM when last called, with their
     /// length; dropped when a copy or an I-cache invalidation covers them.
     /// shortcut: code the CPU rewrites with neither keeps running the old
@@ -107,7 +108,40 @@ struct Overlay {
     rom: u32,
     ram: u32,
     len: u32,
-    funcs: HashMap<u32, GuestFn>,
+    funcs: AddrMap<GuestFn>,
+}
+
+/// A map keyed by guest address. Every guest call looks its target up in
+/// these, so they hash with one multiply instead of SipHash (see the
+/// `addr_hash_timing` test). Addresses are not chosen by an attacker.
+type AddrMap<V> = HashMap<u32, V, BuildHasherDefault<AddrHasher>>;
+
+/// The Fx hash (as rustc's), finished with a rotation so the high product
+/// bits, which every address bit reaches, land in the bucket index.
+#[derive(Default)]
+struct AddrHasher(u64);
+
+/// The Fx multiplier.
+const FX_SEED: u64 = 0xF135_7AEA_2E62_A9C5;
+
+impl Hasher for AddrHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u64(u64::from(b));
+        }
+    }
+
+    fn write_u32(&mut self, v: u32) {
+        self.write_u64(u64::from(v));
+    }
+
+    fn write_u64(&mut self, v: u64) {
+        self.0 = self.0.wrapping_add(v).wrapping_mul(FX_SEED);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0.rotate_left(26)
+    }
 }
 
 /// COP0 register numbers (VR4300 manual, System Control Coprocessor).
@@ -195,11 +229,11 @@ impl Ctx {
             fcr31: 0,
             fr: true,
             mem,
-            funcs: HashMap::new(),
-            overrides: HashMap::new(),
+            funcs: AddrMap::default(),
+            overrides: AddrMap::default(),
             overlays: Vec::new(),
             loaded: Vec::new(),
-            images: HashMap::new(),
+            images: AddrMap::default(),
             verified: BTreeMap::new(),
             trace: [0; TRACE_LEN],
             entering: 0,
@@ -678,6 +712,51 @@ pub fn bad_pc(func: u32, pc: u32) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn addr_maps_find_every_address() {
+        let mut m = AddrMap::default();
+        // Word-aligned addresses, as calls use, and the extremes.
+        let addrs: Vec<u32> = (0..4096)
+            .map(|k| 0x8000_0000 + 4 * k)
+            .chain([0, u32::MAX])
+            .collect();
+        for (i, &a) in addrs.iter().enumerate() {
+            m.insert(a, i);
+        }
+        for (i, &a) in addrs.iter().enumerate() {
+            assert_eq!(m.get(&a), Some(&i));
+        }
+        assert_eq!(m.get(&0x8000_0002), None);
+    }
+
+    /// `cargo test -p n64rusty-runtime --release addr_hash_timing --
+    /// --ignored --nocapture`: function table lookups with SipHash and
+    /// with the address hasher.
+    #[test]
+    #[ignore = "timing, not a check"]
+    fn addr_hash_timing() {
+        use std::hint::black_box;
+        const FUNCS: u32 = 20_000;
+        const LOOKUPS: u32 = 10_000_000;
+        let at = |j: u32| 0x8000_0400 + 0x40 * j;
+        // Calls in a scattered order, as a game's are.
+        let addr = |k: u32| at(k.wrapping_mul(2_654_435_761) % FUNCS);
+        let sip: HashMap<u32, u32> = (0..FUNCS).map(|j| (at(j), j)).collect();
+        let fx: AddrMap<u32> = (0..FUNCS).map(|j| (at(j), j)).collect();
+        let t = std::time::Instant::now();
+        let a: u32 = (0..LOOKUPS)
+            .map(|k| sip[&black_box(addr(k))])
+            .fold(0, u32::wrapping_add);
+        let sip_ns = t.elapsed().as_nanos() as f64 / f64::from(LOOKUPS);
+        let t = std::time::Instant::now();
+        let b: u32 = (0..LOOKUPS)
+            .map(|k| fx[&black_box(addr(k))])
+            .fold(0, u32::wrapping_add);
+        let fx_ns = t.elapsed().as_nanos() as f64 / f64::from(LOOKUPS);
+        assert_eq!(a, b);
+        println!("lookup: SipHash {sip_ns:.2} ns, address hasher {fx_ns:.2} ns");
+    }
 
     #[test]
     fn deadline_runs_hook_once_before_the_call() {
