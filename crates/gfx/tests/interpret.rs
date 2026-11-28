@@ -974,3 +974,167 @@ fn a_background_of_no_size_or_too_big_is_not_drawn() {
         assert_eq!(f.draws().count(), 0, "{w}x{h}");
     }
 }
+
+/// Matrices the interpreter's modelview stack holds, the bottom one included.
+const MATRIX_STACK_DEPTH: usize = 32;
+
+/// A modelview that moves x by `k`: whole numbers survive S15.16 exactly.
+fn translate_x(k: usize) -> n64rusty_gfx::Mat4 {
+    let mut m = n64rusty_gfx::IDENTITY;
+    m[3][0] = k as f32;
+    m
+}
+
+/// Load `translate_x(0)`, then push and load `translate_x(1..=pushes)`.
+/// Returns the matrices' addresses by k and a one-vertex buffer.
+fn push_translations(ram: &mut Ram, dl: &mut Dl, pushes: usize) -> (Vec<u32>, u32) {
+    let verts = ram.vertices(&[v(0, 0, 0, [255; 4])]);
+    let ms: Vec<u32> = (0..=pushes).map(|k| ram.matrix(translate_x(k))).collect();
+    setup(ram, dl);
+    dl.mtx(ms[0], LOAD);
+    for &m in &ms[1..] {
+        dl.mtx(m, PUSH | LOAD);
+    }
+    (ms, verts)
+}
+
+#[test]
+fn a_full_matrix_stack_pops_back_through_every_pushed_matrix() {
+    let pushes = MATRIX_STACK_DEPTH - 1;
+    let mut ram = Ram::default();
+    let mut dl = Dl::default();
+    let (_, verts) = push_translations(&mut ram, &mut dl, pushes);
+    dl.vtx(verts, 1, 0);
+    for _ in 0..pushes {
+        dl.pop(1).vtx(verts, 1, 0);
+    }
+    dl.end();
+    let addr = ram.dl(&dl);
+    let f = run(&ram, addr);
+    assert!(f.warnings.is_empty(), "{:?}", f.warnings);
+    // One vertex load at the top, then one after each pop, deepest first.
+    let got: Vec<f32> = f.transforms.iter().map(|t| t.modelview[3][0]).collect();
+    let want: Vec<f32> = (0..=pushes).rev().map(|k| k as f32).collect();
+    assert_eq!(got, want);
+    for t in &f.transforms {
+        assert_eq!(t.modelview, translate_x(t.modelview[3][0] as usize));
+    }
+}
+
+#[test]
+fn pop_matrix_n_drops_n_matrices_at_once() {
+    const PUSHES: usize = 5;
+    const POPPED: u32 = 3;
+    let mut ram = Ram::default();
+    let mut dl = Dl::default();
+    let (_, verts) = push_translations(&mut ram, &mut dl, PUSHES);
+    // gSPPopMatrixN(G_MTX_MODELVIEW, n): w1 is n * 64 bytes (gbi.h).
+    dl.pop(POPPED).vtx(verts, 1, 0).end();
+    let addr = ram.dl(&dl);
+    let f = run(&ram, addr);
+    let left = PUSHES - POPPED as usize;
+    assert_eq!(f.transforms[0].modelview, translate_x(left));
+}
+
+#[test]
+fn a_pop_with_nothing_pushed_keeps_the_loaded_matrix() {
+    let mut ram = Ram::default();
+    let mut dl = Dl::default();
+    let (_, verts) = push_translations(&mut ram, &mut dl, 0);
+    dl.pop(1).vtx(verts, 1, 0).end();
+    let addr = ram.dl(&dl);
+    let f = run(&ram, addr);
+    assert_eq!(f.transforms[0].modelview, translate_x(0));
+}
+
+#[test]
+#[ignore = "bug: popping more matrices than were pushed pops to the bottom instead of being ignored"]
+fn a_pop_of_more_than_was_pushed_changes_nothing() {
+    // F3DEX2's G_POPMTX skips a pop that would go below the stack's base
+    // (as GLideN64's gSPPopMatrixN does: "pop matrix stack below 0").
+    const PUSHES: usize = 2;
+    let mut ram = Ram::default();
+    let mut dl = Dl::default();
+    let (_, verts) = push_translations(&mut ram, &mut dl, PUSHES);
+    dl.pop(PUSHES as u32 + 1).vtx(verts, 1, 0).end();
+    let addr = ram.dl(&dl);
+    let f = run(&ram, addr);
+    assert_eq!(f.transforms[0].modelview, translate_x(PUSHES));
+}
+
+#[test]
+#[ignore = "bug: a matrix pop keeps a gSPInsertMatrix-edited combined matrix instead of recomputing it"]
+fn a_pop_after_insert_matrix_uses_the_popped_modelview() {
+    // F3DEX2 marks the combined matrix stale on G_POPMTX as on G_MTX, so
+    // the next vertices use the restored modelview times the projection.
+    let mut ram = Ram::default();
+    let verts = ram.vertices(&[v(0, 0, 0, [255; 4]); 3]);
+    let mut dl = Dl::default();
+    let _ = push_translations(&mut ram, &mut dl, 1);
+    // Integer part of element 0 becomes 2 (see insert_matrix_edits_...).
+    dl.0.extend([0xDB00_0000, 0x0002_0000]);
+    dl.pop(1).vtx(verts, 3, 0).tri(0, 1, 2).end();
+    let addr = ram.dl(&dl);
+    let f = run(&ram, addr);
+    let t = &f.transforms[f.vertices[0].transform as usize];
+    assert_eq!(t.modelview, translate_x(0));
+    let p = t.projection;
+    assert!((p[0][0] - 0.01).abs() < 1e-4, "{p:?}");
+}
+
+#[test]
+fn fog_position_sets_the_signed_fog_multiplier_and_offset() {
+    // gSPFogPosition(996, 1000): multiplier 32000, offset -31744.
+    const MUL: f32 = 32000.0;
+    const OFF: f32 = -31744.0;
+    let mut ram = Ram::default();
+    let verts = ram.vertices(&[v(0, 0, 0, [255; 4]); 3]);
+    let mut dl = Dl::default();
+    setup(&mut ram, &mut dl);
+    dl.geometry(0, G_SHADE | G_FOG)
+        .fog_position(996, 1000)
+        .vtx(verts, 3, 0)
+        .tri(0, 1, 2)
+        .end();
+    let addr = ram.dl(&dl);
+    let f = run(&ram, addr);
+    let d = f.draws().next().unwrap();
+    assert_eq!(d.state.fog_factor, [MUL, OFF]);
+}
+
+#[test]
+fn a_flipped_texture_rectangle_steps_s_down_and_t_across() {
+    // 0xE5 (G_TEXRECTFLIP) swaps the axes: s grows with y by dsdx and t
+    // with x by dtdy (RDP manual, Texture Rectangle Flip).
+    const TEX_SIZE: f32 = 4.0;
+    const ONE: u16 = 1 << 10; // 1.0 in S5.10
+    const HALF: u16 = 1 << 9;
+    let (x0, y0, x1, y1) = (10, 20, 18, 24); // 8 wide, 4 tall
+    let mut ram = Ram::default();
+    let tex = ram.put(&[0xFF; 32]); // 4x4 RGBA16 white
+    let mut dl = Dl::default();
+    setup(&mut ram, &mut dl);
+    dl.other_modes(CYCLE_1, 0)
+        .timg(0, 2, 1, tex)
+        .tile(0, 2, 0, 0, 7)
+        .load_block(7, 16)
+        .tile(0, 2, 1, 0, 0)
+        .tile_size(0, 4, 4)
+        .tex_rect_flip(0, [x0, y0, x1, y1], [0, 0], [ONE, HALF])
+        .end();
+    let addr = ram.dl(&dl);
+    let f = run(&ram, addr);
+    let corners: Vec<_> = f.vertices[..6].iter().map(|v| (v.pos, v.uv[0])).collect();
+    let at = |x: u32, y: u32| [x as f32, y as f32, -1.0];
+    // s at the bottom: 4 rows * 1.0; t at the right: 8 columns * 0.5.
+    let s_bottom = (y1 - y0) as f32 * 1.0 / TEX_SIZE;
+    let t_right = (x1 - x0) as f32 * 0.5 / TEX_SIZE;
+    for want in [
+        (at(x0, y0), [0.0, 0.0]),
+        (at(x1, y0), [0.0, t_right]),
+        (at(x0, y1), [s_bottom, 0.0]),
+        (at(x1, y1), [s_bottom, t_right]),
+    ] {
+        assert!(corners.contains(&want), "{want:?} not in {corners:?}");
+    }
+}

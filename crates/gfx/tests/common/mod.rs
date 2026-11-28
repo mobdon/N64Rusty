@@ -102,6 +102,8 @@ pub const G_SHADE: u32 = 0x4;
 pub const G_CULL_FRONT: u32 = 0x200;
 pub const G_CULL_BACK: u32 = 0x400;
 pub const G_LIGHTING: u32 = 0x2_0000;
+/// Vertex shade alpha is the fog factor from depth.
+pub const G_FOG: u32 = 0x1_0000;
 pub const G_SHADING_SMOOTH: u32 = 0x20_0000;
 
 /// One cycle, texture perspective correction on (as games set it).
@@ -210,6 +212,20 @@ impl Dl {
     pub fn combine(&mut self, raw: u64) -> &mut Self {
         self.c(0xFC << 24 | (raw >> 32) as u32, raw as u32)
     }
+    pub fn fog_color(&mut self, rgba: u32) -> &mut Self {
+        self.c(0xF8 << 24, rgba)
+    }
+    /// `gSPFogPosition(min, max)` as libultra's gbi.h encodes it: the fog
+    /// multiplier 128000 / (max - min) and offset (500 - min) * 256 /
+    /// (max - min) in one `G_MW_FOG` moveword.
+    pub fn fog_position(&mut self, min: i32, max: i32) -> &mut Self {
+        let mul = 128_000 / (max - min);
+        let off = (500 - min) * 256 / (max - min);
+        self.c(
+            0xDB << 24 | 0x08 << 16,
+            (mul as u32) << 16 | (off as u32 & 0xFFFF),
+        )
+    }
     pub fn prim(&mut self, rgba: u32) -> &mut Self {
         self.c(0xFA << 24, rgba)
     }
@@ -228,8 +244,28 @@ impl Dl {
     }
     /// Texture rectangle in whole pixels; `st` in S10.5, steps in S5.10.
     pub fn tex_rect(&mut self, tile: u32, xy: [u32; 4], st: [u16; 2], step: [u16; 2]) -> &mut Self {
+        self.tex_rect_op(0xE4, tile, xy, st, step)
+    }
+    /// Flipped texture rectangle (`0xE5`): s steps down and t across.
+    pub fn tex_rect_flip(
+        &mut self,
+        tile: u32,
+        xy: [u32; 4],
+        st: [u16; 2],
+        step: [u16; 2],
+    ) -> &mut Self {
+        self.tex_rect_op(0xE5, tile, xy, st, step)
+    }
+    fn tex_rect_op(
+        &mut self,
+        op: u32,
+        tile: u32,
+        xy: [u32; 4],
+        st: [u16; 2],
+        step: [u16; 2],
+    ) -> &mut Self {
         self.c(
-            0xE4 << 24 | (xy[2] * 4) << 12 | xy[3] * 4,
+            op << 24 | (xy[2] * 4) << 12 | xy[3] * 4,
             tile << 24 | (xy[0] * 4) << 12 | xy[1] * 4,
         );
         self.c(0xE1 << 24, (st[0] as u32) << 16 | st[1] as u32);

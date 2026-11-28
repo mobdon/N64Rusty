@@ -655,3 +655,56 @@ fn a_flat_piece_in_front_of_the_near_plane_still_shows() {
     let img = r.render(&f, 320, 240).unwrap();
     assert_px(&img, 160, 130, RED);
 }
+
+/// Two cycles, texture perspective correction on.
+const CYCLE_2: u32 = (1 << 20) | (1 << 19);
+/// G_RM_FOG_SHADE_A in the first blender cycle: FOG * SHADE_A +
+/// IN * (1 - SHADE_A) (gbi.h). The second cycle is left 0, which passes
+/// the first cycle's colour through.
+const FOG_SHADE_A: u32 = (3 << 30) | (2 << 26);
+
+#[test]
+fn fog_blends_the_fog_colour_by_depth_from_the_fog_position() {
+    let Some(mut r) = renderer() else { return };
+    // gSPFogPosition(400, 600): multiplier 640, offset 128. F3DEX's fog
+    // factor is clamp(z / w * 640 + 128, 0, 255), z / w from -1 to 1, so
+    // the factor is 0 up to z / w -0.2, 128 at 0 and 255 from about 0.2 on.
+    const NEAR_Z: i16 = -50;
+    const MID_Z: i16 = 0;
+    const FAR_Z: i16 = 50;
+    let mut ram = Ram::default();
+    let red = [255, 0, 0, 255];
+    // Three vertical strips, left to right: near, middle, far.
+    let mut quads = Vec::new();
+    for (x0, x1, z) in [(-100, -34, NEAR_Z), (-33, 33, MID_Z), (34, 100, FAR_Z)] {
+        quads.push(ram.vertices(&[
+            v(x0, -100, z, red),
+            v(x1, -100, z, red),
+            v(x1, 100, z, red),
+            v(x0, 100, z, red),
+        ]));
+    }
+    let dl = scene(&mut ram, |_, dl| {
+        dl.other_modes(CYCLE_2, FOG_SHADE_A)
+            .geometry(0, G_SHADE | G_SHADING_SMOOTH | G_FOG)
+            .combine(pass(SHADE))
+            .fog_color(0x00FF_00FF)
+            .fog_position(400, 600);
+        for &q in &quads {
+            dl.vtx(q, 4, 0).tri2([0, 1, 2], [0, 2, 3]);
+        }
+    });
+    let f = frame(&mut ram, &dl);
+    let img = r.render(&f, 320, 240).unwrap();
+    let rgb = |x| {
+        let p = img.pixel(x, 120);
+        [p[0], p[1], p[2]]
+    };
+    let close = |got: [u8; 3], want: [u8; 3]| got.iter().zip(want).all(|(a, b)| a.abs_diff(b) <= 3);
+    // Pixel x is 160 + 1.6 * object x.
+    let (near, mid, far) = (rgb(53), rgb(160), rgb(267));
+    assert!(close(near, [255, 0, 0]), "no fog: {near:?}");
+    // Factor 128 of 255: red and green about half each.
+    assert!(close(mid, [127, 128, 0]), "half fog: {mid:?}");
+    assert!(close(far, [0, 255, 0]), "all fog: {far:?}");
+}

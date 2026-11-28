@@ -1810,4 +1810,60 @@ mod tests {
         assert!(!ok(&rgba, (4, 3), (0, 0, max + 1, 6)), "too wide");
         assert!(!ok(&rgba, (4, 3), (max, 0, max, 6)), "too far");
     }
+
+    /// RGBA8 pixels of one grey level each, all four channels alike.
+    fn greys(levels: &[u8]) -> Vec<u8> {
+        levels.iter().flat_map(|&g| [g; 4]).collect()
+    }
+
+    #[test]
+    fn half_of_one_pixel_is_that_pixel() {
+        const PX: [u8; 4] = [10, 20, 30, 40];
+        assert_eq!(half(&PX, 1, 1), (PX.to_vec(), 1, 1));
+    }
+
+    #[test]
+    fn half_averages_each_channel_of_a_two_by_two_block_rounding_to_nearest() {
+        let src = [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 0], [0; 4]].concat();
+        // (255 + 2) / 4 = 64, (510 + 2) / 4 = 128.
+        assert_eq!(half(&src, 2, 2), (vec![64, 64, 64, 128], 1, 1));
+        // A quarter rounds down, a half rounds up.
+        assert_eq!(half(&greys(&[0, 0, 0, 1]), 2, 2).0, greys(&[0]));
+        assert_eq!(half(&greys(&[0, 0, 1, 1]), 2, 2).0, greys(&[1]));
+    }
+
+    #[test]
+    fn half_of_an_odd_size_rounds_down_and_drops_the_last_row_and_column() {
+        // Mip sizes are floor(size / 2), at least 1 (as OpenGL and wgpu
+        // number them); each texel is the box average of its 2x2 block.
+        #[rustfmt::skip]
+        let src = greys(&[
+            0, 40, 200,
+            80, 120, 200,
+            200, 200, 200,
+        ]);
+        assert_eq!(half(&src, 3, 3), (greys(&[60]), 1, 1));
+    }
+
+    #[test]
+    fn half_of_a_one_pixel_wide_or_tall_image_averages_along_the_long_side() {
+        let pairs = greys(&[20, 60]);
+        let tall = greys(&[10, 30, 50, 70]);
+        assert_eq!(half(&tall, 1, 4), (pairs.clone(), 1, 2));
+        let wide = greys(&[10, 30, 50, 70, 250]);
+        assert_eq!(half(&wide, 5, 1), (pairs, 2, 1));
+    }
+
+    #[test]
+    fn halving_an_odd_image_down_to_one_pixel_never_panics() {
+        let (mut level, mut w, mut h) = (vec![0x80u8; 7 * 3 * 4], 7, 3);
+        let mut sizes = vec![(w, h)];
+        while (w, h) != (1, 1) {
+            (level, w, h) = half(&level, w, h);
+            assert_eq!(level.len(), (w * h * 4) as usize);
+            sizes.push((w, h));
+        }
+        assert_eq!(sizes, [(7, 3), (3, 1), (1, 1)]);
+        assert_eq!(level, vec![0x80; 4]);
+    }
 }
