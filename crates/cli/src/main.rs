@@ -95,27 +95,50 @@ fn info(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Reads `name = 0xADDR;` lines. Anything else is skipped.
+/// Reads `name = 0xADDR;` lines. Anything else is skipped; a `0x` value that
+/// is not a 32-bit hex number is skipped with a warning naming the line.
 fn read_symbols(path: &Path) -> Result<Vec<(u32, String)>, String> {
     let text = fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
     let mut out = Vec::new();
-    for line in text.lines() {
-        let line = line.split("//").next().unwrap_or("").trim();
-        let Some((name, rest)) = line.split_once('=') else {
-            continue;
-        };
-        let value = rest.trim().trim_end_matches(';').trim();
-        let Some(hex) = value
-            .strip_prefix("0x")
-            .or_else(|| value.strip_prefix("0X"))
-        else {
-            continue;
-        };
-        if let Ok(a) = u32::from_str_radix(hex, 16) {
-            out.push((a, name.trim().to_string()));
+    for (n, line) in text.lines().enumerate() {
+        match parse_symbol_line(line) {
+            Some(Ok(sym)) => out.push(sym),
+            Some(Err(e)) => eprintln!("warning: skipped {} line {}: {e}", path.display(), n + 1),
+            None => {}
         }
     }
     Ok(out)
+}
+
+/// One `name = 0xADDR;` line as (address, name): `None` when the line is not
+/// a symbol line, an error naming the value when its `0x` part is not a
+/// 32-bit hex number.
+fn parse_symbol_line(line: &str) -> Option<Result<(u32, String), String>> {
+    let line = line.split("//").next().unwrap_or("").trim();
+    let (name, rest) = line.split_once('=')?;
+    let value = rest.trim().trim_end_matches(';').trim();
+    let hex = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))?;
+    Some(
+        u32::from_str_radix(hex, 16)
+            .map(|a| (a, name.trim().to_string()))
+            .map_err(|e| format!("bad address {value:?}: {e}")),
+    )
+}
+
+/// One past the reference's last code word, from its `entry` point; an error
+/// naming `rom` when that end would pass the top of the 32-bit address space.
+fn reference_end(rom: &Path, entry: u32, words: usize) -> Result<u32, String> {
+    let end = u64::from(entry) + 4 * words as u64;
+    // The end is an exclusive u32 bound, so an end of exactly 2^32 cannot be held either.
+    if end >= ADDRESS_SPACE {
+        return Err(format!(
+            "{}: its {words} code words from entry {entry:#010x} pass the top of the 32-bit address space",
+            rom.display()
+        ));
+    }
+    Ok(end as u32)
 }
 
 /// The RAM images runs saved for the ROM with this SHA-256 (see
@@ -151,6 +174,9 @@ fn saved_images(sha256: &str) -> Result<Vec<(u32, Vec<u8>)>, String> {
     }
     Ok(out)
 }
+
+/// One past the highest byte address a 32-bit address can name.
+const ADDRESS_SPACE: u64 = 1 << 32;
 
 /// The `missing.txt` rom column of code the game wrote into RAM itself.
 const WRITTEN: u32 = u32::MAX;
@@ -687,10 +713,18 @@ fn find_routines(
     target: &[u32],
     base: u32,
 ) -> Vec<(u32, String)> {
+    // Every target word's address must fit in 32 bits, so `base + 4 * i` below cannot wrap.
+    if u64::from(base) + 4 * target.len() as u64 > ADDRESS_SPACE {
+        eprintln!(
+            "warning: skipped image at {base:#010x}: its {} words pass the top of the address space",
+            target.len()
+        );
+        return Vec::new();
+    }
     let mref: Vec<u32> = reference.iter().map(|&w| masked(w)).collect();
     let mtgt: Vec<u32> = target.iter().map(|&w| masked(w)).collect();
     let code = |addr: u32, len: usize| {
-        let at = ((addr - ref_base) / 4) as usize;
+        let at = (addr.checked_sub(ref_base)? / 4) as usize;
         mref.get(at..at + len)
     };
     let fits = |c: &[u32], t: u32| {
@@ -792,7 +826,7 @@ fn match_routines(args: &[String]) -> Result<(), String> {
     }
     let (ref_base, ref_end) = (
         reference.entry(),
-        reference.entry() + 4 * ref_words.len() as u32,
+        reference_end(ref_path, reference.entry(), ref_words.len())?,
     );
     let mut syms = Vec::new();
     for s in &symbols {
@@ -881,6 +915,54 @@ mod tests {
         // f found twice: neither is named.
         target.extend([0x3C04_8002, jal(B + 32), 0x2484_0020, 0x03E0_0008]);
         assert!(find_routines(&reference, B, &routines, &target, B).is_empty());
+    }
+
+    #[test]
+    fn skips_an_image_past_the_top_of_the_address_space() {
+        let g = [0x8C82_0010, 0x03E0_0008, 0];
+        let routines = [(0x8000_0400, "g".to_string(), 3)];
+        // Its last word would sit at 0x1_0000_0000.
+        assert!(find_routines(&g, 0x8000_0400, &routines, &g, 0xFFFF_FFF8).is_empty());
+        // The highest base whose words still fit is searched as usual.
+        assert_eq!(
+            find_routines(&g, 0x8000_0400, &routines, &g, 0xFFFF_FFF4),
+            vec![(0xFFFF_FFF4, "g".to_string())]
+        );
+    }
+
+    #[test]
+    fn read_symbols_skips_a_bad_address() {
+        let dir = std::env::temp_dir().join(format!("n64rusty-symbols-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("symbols.txt");
+        fs::write(&p, "bad = 0xZZ;\ntoo_big = 0x100000000;\ngood = 0x80000400; // ok\n").unwrap();
+        let s = read_symbols(&p).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(s, vec![(0x8000_0400, "good".to_string())]);
+    }
+
+    #[test]
+    fn parse_symbol_line_reports_a_bad_address() {
+        assert!(matches!(parse_symbol_line("bad = 0xZZ;"), Some(Err(_))));
+        assert!(matches!(parse_symbol_line("x = 0x100000000;"), Some(Err(_))));
+        assert_eq!(
+            parse_symbol_line("good = 0x80000400; // ok"),
+            Some(Ok((0x8000_0400, "good".to_string())))
+        );
+        assert_eq!(parse_symbol_line("// just a comment"), None);
+        assert_eq!(parse_symbol_line("n = 12;"), None);
+    }
+
+    #[test]
+    fn reference_end_rejects_code_past_the_top_of_the_address_space() {
+        let rom = Path::new("ref.z64");
+        assert_eq!(reference_end(rom, 0x8000_0400, 0x100), Ok(0x8000_0800));
+        // The last word at 0xFFFF_FFF8 ends at 0xFFFF_FFFC, which still fits.
+        assert_eq!(reference_end(rom, 0xFFFF_FFF0, 3), Ok(0xFFFF_FFFC));
+        // An end of exactly 2^32 (or beyond) would wrap.
+        let e = reference_end(rom, 0xFFFF_FFF0, 4).unwrap_err();
+        assert!(e.contains("ref.z64") && e.contains("0xfffffff0"), "{e}");
+        assert!(reference_end(rom, 0x8000_0400, 0x2000_0000).is_err());
     }
 
     #[test]
