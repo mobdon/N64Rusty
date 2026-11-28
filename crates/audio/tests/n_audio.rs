@@ -175,6 +175,41 @@ fn envelope_ramps_linearly_into_dry_and_wet() {
 }
 
 #[test]
+fn envelope_adds_with_saturation_at_both_sixteen_bit_limits() {
+    let (mut rsp, mut ram) = setup();
+    // Main buffer: loud positive, loud negative, then silence.
+    let mut main = [0i16; SUBFRAME];
+    main[..2].copy_from_slice(&[16384, -16384]);
+    put(&mut ram, DATA, &main);
+    let mut dry = [0i16; SUBFRAME];
+    dry[..2].copy_from_slice(&[32700, -32700]);
+    put(&mut ram, DATA + 0x200, &dry);
+    run(
+        &mut rsp,
+        &mut ram,
+        &[
+            clear(DRY_LEFT, 0x5C0),
+            load(0, 0x170, DATA),
+            load(DRY_LEFT, 0x170, DATA + 0x200),
+            load(DRY_RIGHT, 0x170, DATA + 0x200),
+            (9 << 24 | 6 << 16 | 0x7FFF, 0x7FFF << 16), // left volume, full dry, no wet
+            (9 << 24 | 4 << 16 | 0x7FFF, 0),           // right target, rate 0
+            (9 << 24 | 0x7FFF, 0),                     // left target, rate 0
+            (3 << 24 | 1 << 16 | 0x7FFF, STATE),       // right volume
+            save(DRY_LEFT, 0x170, OUT),
+            save(DRY_RIGHT, 0x170, OUT + 0x200),
+        ],
+    );
+    // Each adds about +-16383 to +-32700: both limits clamp, and the silent
+    // samples leave the buffer as it was.
+    for at in [OUT, OUT + 0x200] {
+        let out = get(&ram, at, SUBFRAME);
+        assert_eq!(out[..2], [i16::MAX, i16::MIN]);
+        assert!(out[2..].iter().all(|&v| v == 0));
+    }
+}
+
+#[test]
 fn pole_filter_runs_on_either_buffer_and_keeps_state() {
     let (mut rsp, mut ram) = setup();
     // Second row 1.0 (Q14) everywhere: with unity gain the filter is a
