@@ -59,3 +59,27 @@ jobs:
         with:
           name: n64rusty-play-windows
           path: target/release/n64rusty-play.exe
+
+  android:
+    # The Android app and the host's Android code (crates/android,
+    # crates/host/src/android.rs and the android branches of the window and
+    # start screen) only compile for Android, so the jobs above never see
+    # them. A check, not a build: no APK, no signing key.
+    name: Check the Android app
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - name: Use the NDK's compilers
+        # Sound on Android (cpal through Oboe) builds C++ with the NDK, which
+        # the runner image carries.
+        run: |
+          bin="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "CC_aarch64_linux_android=$bin/aarch64-linux-android26-clang" >> "$GITHUB_ENV"
+          echo "CXX_aarch64_linux_android=$bin/aarch64-linux-android26-clang++" >> "$GITHUB_ENV"
+          echo "AR_aarch64_linux_android=$bin/llvm-ar" >> "$GITHUB_ENV"
+      - name: Check
+        run: cargo check --target aarch64-linux-android -p n64rusty-host -p n64rusty-android

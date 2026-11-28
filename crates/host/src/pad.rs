@@ -4,19 +4,33 @@ use std::fmt;
 
 /// Button bits as the controller reports them (16-bit button word).
 pub mod button {
+    /// The A button.
     pub const A: u16 = 0x8000;
+    /// The B button.
     pub const B: u16 = 0x4000;
+    /// The Z trigger.
     pub const Z: u16 = 0x2000;
+    /// The Start button.
     pub const START: u16 = 0x1000;
+    /// D-pad up.
     pub const D_UP: u16 = 0x0800;
+    /// D-pad down.
     pub const D_DOWN: u16 = 0x0400;
+    /// D-pad left.
     pub const D_LEFT: u16 = 0x0200;
+    /// D-pad right.
     pub const D_RIGHT: u16 = 0x0100;
+    /// The L shoulder button.
     pub const L: u16 = 0x0020;
+    /// The R shoulder button.
     pub const R: u16 = 0x0010;
+    /// C-up.
     pub const C_UP: u16 = 0x0008;
+    /// C-down.
     pub const C_DOWN: u16 = 0x0004;
+    /// C-left.
     pub const C_LEFT: u16 = 0x0002;
+    /// C-right.
     pub const C_RIGHT: u16 = 0x0001;
 
     /// Names used in scripts and config files, in button-word order.
@@ -53,8 +67,11 @@ pub const STICK_MAX: i8 = 80;
 /// One controller for one frame. `y` is positive for up, as on the console.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct Pad {
+    /// Held buttons, as [`button`] bits.
     pub buttons: u16,
+    /// Stick left (negative) to right (positive).
     pub x: i8,
+    /// Stick down (negative) to up (positive).
     pub y: i8,
 }
 

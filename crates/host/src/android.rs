@@ -11,9 +11,11 @@ use std::sync::OnceLock;
 
 use winit::event::{ElementState, KeyEvent, TouchPhase, WindowEvent};
 use winit::keyboard::{KeyCode, NativeKeyCode, PhysicalKey};
+/// The app's activity, which `android_main` is handed.
 pub use winit::platform::android::activity::AndroidApp;
 use winit::platform::android::activity::WindowManagerFlags;
 
+use crate::mapping::{DEADZONE as DEAD, PRESS};
 use crate::pad::{button, Pad, STICK_MAX};
 
 static APP: OnceLock<AndroidApp> = OnceLock::new();
@@ -52,6 +54,8 @@ const DPAD_LEFT: u32 = 21;
 const DPAD_RIGHT: u32 = 22;
 const BUTTON_A: u32 = 96;
 const BUTTON_B: u32 = 97;
+// Maps to nothing (see `n64_button`); named for the tests.
+#[allow(dead_code)]
 const BUTTON_X: u32 = 99;
 const BUTTON_Y: u32 = 100;
 const BUTTON_L1: u32 = 102;
@@ -100,11 +104,8 @@ fn menu_key(code: u32) -> Option<KeyCode> {
     })
 }
 
-/// Stick values below this count as centred.
-const DEAD: f64 = 0.15;
-/// How far the right stick, a trigger or the D-pad axis goes before it
-/// counts as a press.
-const PRESS: f64 = 0.5;
+// Stick values below `DEAD` count as centred (per axis here). The right
+// stick, a trigger or the D-pad axis counts as a press from `PRESS`.
 
 /// One Android controller as the window sees it.
 #[derive(Default)]

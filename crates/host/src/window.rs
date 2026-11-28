@@ -71,6 +71,12 @@ pub fn display_rate(window: &Window) -> Option<f64> {
     Some(f64::from(mhz?) / 1000.0)
 }
 
+/// The window's size at `scale` times the console's 320x240 picture.
+fn canvas_size(scale: f64) -> LogicalSize<f64> {
+    use crate::launcher::{H, W};
+    LogicalSize::new(W as f64 * scale, H as f64 * scale)
+}
+
 struct App<G> {
     session: Session<G>,
     cfg: RunConfig,
@@ -143,8 +149,7 @@ impl<G: Guest> App<G> {
             }
             Action::OpenModsFolder => {
                 if let Some(dir) = crate::menu::mods_dir() {
-                    let _ = std::fs::create_dir_all(&dir);
-                    let _ = std::process::Command::new("explorer").arg(dir).spawn();
+                    crate::launcher::open_folder(&dir);
                 }
                 return;
             }
@@ -154,8 +159,7 @@ impl<G: Guest> App<G> {
             Action::Scale(s) => {
                 w.scale = s;
                 window.set_fullscreen(None);
-                let _ =
-                    window.request_inner_size(LogicalSize::new(320.0 * s as f64, 240.0 * s as f64));
+                let _ = window.request_inner_size(canvas_size(s as f64));
             }
             Action::Fullscreen => {
                 let full = window.fullscreen().is_none();
@@ -221,7 +225,7 @@ impl<G: Guest> ApplicationHandler for App<G> {
             return;
         }
         let scale = self.cfg.window.scale as f64;
-        let size = LogicalSize::new(320.0 * scale, 240.0 * scale);
+        let size = canvas_size(scale);
         // The start screen's window, when the game was picked there.
         let window = match crate::one_window::take() {
             Some(w) => {
@@ -281,7 +285,6 @@ impl<G: Guest> ApplicationHandler for App<G> {
                     self.keys.remove(&key);
                 }
             }
-            // Key releases are lost while unfocused; never leave a key stuck down.
             WindowEvent::Focused(focused) => {
                 // Key releases are lost while unfocused; never leave a key
                 // stuck down. A phone pauses the game while it is away.

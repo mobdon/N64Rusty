@@ -11,6 +11,7 @@ use std::process::ExitCode;
 
 use n64rusty_rom::signature::{masked, starts_function, words};
 use n64rusty_rom::{Rom, BOOT_SEGMENT_ROM, BOOT_SEGMENT_SIZE};
+use n64rusty_translator::decode::JR_RA;
 use n64rusty_translator::discover::{
     data_pointers, discover, discover_layout, function_starts, overlay_table, Discovery, Image,
 };
@@ -149,20 +150,9 @@ fn saved_images(sha256: &str) -> Result<Vec<(u32, Vec<u8>)>, String> {
 
 /// [`saved_images`] from the images folder `dir`.
 fn images_in(dir: &Path) -> Result<Vec<(u32, Vec<u8>)>, String> {
-    let mut paths: Vec<PathBuf> = fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| e.path())
-        .collect();
-    paths.sort();
     let mut out = Vec::new();
-    for p in paths {
-        let stem = p
-            .file_stem()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
+    for p in sorted_entries(dir) {
+        let stem = file_stem(&p);
         let Some(base) = stem
             .split('_')
             .next()
@@ -179,8 +169,44 @@ fn images_in(dir: &Path) -> Result<Vec<(u32, Vec<u8>)>, String> {
     Ok(out)
 }
 
+/// The paths in `dir`, sorted; none when it cannot be listed.
+fn sorted_entries(dir: &Path) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    paths.sort();
+    paths
+}
+
+/// The file name of `p` without its extension.
+fn file_stem(p: &Path) -> String {
+    p.file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string()
+}
+
 /// One past the highest byte address a 32-bit address can name.
 const ADDRESS_SPACE: u64 = 1 << 32;
+
+/// The `missing.txt` len column of a call into the boot image (no copy).
+const IN_BOOT_IMAGE: u32 = 0;
+
+/// The primary opcode (top six bits) of JAL.
+const OP_JAL: u32 = 3;
+/// The 26-bit word index a J or JAL holds.
+const JUMP_TARGET: u32 = 0x03FF_FFFF;
+/// The segment the boot code runs in; a JAL target keeps the top bits of
+/// its own address, which for that code are these.
+const KSEG0: u32 = 0x8000_0000;
+/// Saved images that start this far or more past the reference's entry
+/// are not laid over its boot segment.
+const IMAGE_REACH: u32 = 0x0100_0000;
+/// The longest a reference routine is taken to be, in words.
+const MAX_ROUTINE_WORDS: usize = 0x1000;
 
 /// The `missing.txt` rom column of code the game wrote into RAM itself.
 const WRITTEN: u32 = u32::MAX;
@@ -194,17 +220,8 @@ const WRITTEN: u32 = u32::MAX;
 /// what decodes as data is dropped.
 fn written_images(local: &Path) -> Result<Vec<(String, Discovery)>, String> {
     let mut out = Vec::new();
-    let Ok(dir) = fs::read_dir(local.join("images")) else {
-        return Ok(out);
-    };
-    let mut paths: Vec<PathBuf> = dir.flatten().map(|e| e.path()).collect();
-    paths.sort();
-    for path in paths {
-        let stem = path
-            .file_stem()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
+    for path in sorted_entries(&local.join("images")) {
+        let stem = file_stem(&path);
         let hex: Vec<u32> = stem
             .split('_')
             .filter_map(|h| u32::from_str_radix(h, 16).ok())
@@ -316,7 +333,17 @@ impl Copies {
     }
 }
 
-fn translate(args: &[String]) -> Result<(), String> {
+/// What `translate` was asked to do (see [`USAGE`]).
+struct TranslateArgs {
+    rom: PathBuf,
+    symbols: Vec<PathBuf>,
+    out: Option<PathBuf>,
+    runtime: Option<PathBuf>,
+    code_end: Option<u32>,
+}
+
+/// Reads `translate`'s command line.
+fn translate_args(args: &[String]) -> Result<TranslateArgs, String> {
     let mut rom_path = None;
     let mut symbols = Vec::new();
     let mut out = None;
@@ -339,7 +366,23 @@ fn translate(args: &[String]) -> Result<(), String> {
             s => rom_path = Some(PathBuf::from(s)),
         }
     }
-    let rom_path = rom_path.ok_or("translate needs a ROM path")?;
+    Ok(TranslateArgs {
+        rom: rom_path.ok_or("translate needs a ROM path")?,
+        symbols,
+        out,
+        runtime,
+        code_end,
+    })
+}
+
+fn translate(args: &[String]) -> Result<(), String> {
+    let TranslateArgs {
+        rom: rom_path,
+        symbols,
+        out,
+        runtime,
+        code_end,
+    } = translate_args(args)?;
     let rom = load(&rom_path)?;
     let local = PathBuf::from("local").join(&rom.sha256);
     let out = out.unwrap_or_else(|| local.join("out"));
@@ -365,19 +408,26 @@ fn translate(args: &[String]) -> Result<(), String> {
     let mut hints: Vec<u32> = names.keys().copied().collect();
     hints.extend(data_pointers(&img));
     // Code the game copies in at run time, seen by earlier headless runs.
-    let dma = read_table(&local.join("dma.txt"), 3)?;
-    let missing = read_table(&local.join("missing.txt"), 4)?;
+    // dma.txt: one cartridge copy per row, (rom, ram, len).
+    let dma: Vec<(u32, u32, u32)> = read_table(&local.join("dma.txt"), 3)?
+        .iter()
+        .map(|d| (d[0], d[1], d[2]))
+        .collect();
+    // missing.txt: (address called, rom, ram, len) of the copy it was in.
+    let missing: Vec<(u32, u32, u32, u32)> = read_table(&local.join("missing.txt"), 4)?
+        .iter()
+        .map(|m| (m[0], m[1], m[2], m[3]))
+        .collect();
     // Boot-image code reached only through pointers, found missing in runs.
     let mut entries = vec![rom.entry()];
-    entries.extend(missing.iter().filter(|m| m[3] == 0).map(|m| m[0]));
+    entries.extend(missing.iter().filter(|m| m.3 == IN_BOOT_IMAGE).map(|m| m.0));
     let mut found = discover(&img, &entries, &hints, code_end);
 
     // Boot-image functions inside a range that a copy from elsewhere in the
     // cartridge overwrites are stale: the bytes there at run time differ.
     let boot_rom = BOOT_SEGMENT_ROM as u32;
     let overwritten = |a: u32| {
-        dma.iter().any(|d| {
-            let (r, ram, len) = (d[0], d[1], d[2]);
+        dma.iter().any(|&(r, ram, len)| {
             let same = r.wrapping_sub(boot_rom) == ram.wrapping_sub(img.base);
             !same && a >= ram && a < ram.wrapping_add(len)
         })
@@ -385,19 +435,57 @@ fn translate(args: &[String]) -> Result<(), String> {
     let before = found.functions.len();
     found.functions.retain(|f| !overwritten(f.addr));
     let stale = before - found.functions.len();
+    let (regions, planned) = overlay_regions(&rom, img.base, &dma, &missing);
+    let overlays = discover_overlays(&rom, &dma, &regions)?;
+
+    // Code the game wrote into RAM itself, saved by runs that called into it.
+    let images = written_images(&local)?;
+    write_crate(GameCrate {
+        rom: &rom,
+        img: &img,
+        local: &local,
+        out: &out,
+        runtime: &runtime,
+        names: &names,
+        found: &found,
+        overlays: &overlays,
+        images: &images,
+        stale,
+        planned,
+    })
+}
+
+/// Overlays to translate, by their copy (rom, ram, len), each with the
+/// addresses runs saw missing there.
+type Regions = BTreeMap<(u32, u32, u32), Vec<u32>>;
+
+/// One overlay copy (rom, ram, len) and the functions found in it.
+type Overlay = ((u32, u32, u32), Discovery);
+
+/// The overlays to translate, and how many of them come only from the
+/// game's load tables. `boot_base` is where the boot image runs.
+fn overlay_regions(
+    rom: &Rom,
+    boot_base: u32,
+    dma: &[(u32, u32, u32)],
+    missing: &[(u32, u32, u32, u32)],
+) -> (Regions, usize) {
+    let boot_rom = BOOT_SEGMENT_ROM as u32;
     // One overlay per distinct copy, with every address seen missing there.
-    let mut regions: BTreeMap<(u32, u32, u32), Vec<u32>> = BTreeMap::new();
-    for m in missing.iter().filter(|m| m[3] != 0 && m[1] != WRITTEN) {
-        regions.entry((m[1], m[2], m[3])).or_default().push(m[0]);
+    let mut regions = Regions::new();
+    for &(addr, r, ram, len) in missing
+        .iter()
+        .filter(|m| m.3 != IN_BOOT_IMAGE && m.1 != WRITTEN)
+    {
+        regions.entry((r, ram, len)).or_default().push(addr);
     }
     // Any other copy that is laid out like code is code too: a game loads
     // each scene's code this way, and waiting for a run to call into it
     // costs a crash per scene.
-    for d in &dma {
-        let (r, ram, len) = (d[0], d[1], d[2]);
+    for &(r, ram, len) in dma {
         let start = r as usize;
         let end = (start + len as usize).min(rom.bytes().len());
-        let boot_copy = r.wrapping_sub(boot_rom) == ram.wrapping_sub(img.base);
+        let boot_copy = r.wrapping_sub(boot_rom) == ram.wrapping_sub(boot_base);
         if len == 0 || start >= end || boot_copy || regions.contains_key(&(r, ram, len)) {
             continue;
         }
@@ -418,11 +506,9 @@ fn translate(args: &[String]) -> Result<(), String> {
         // The boot image read in place is already translated; the same
         // bytes loaded somewhere else are an overlay like any other.
         let boot_in_place = r.wrapping_sub(boot_rom) < BOOT_SEGMENT_SIZE as u32
-            && r.wrapping_sub(boot_rom) == ram.wrapping_sub(img.base);
-        let seen = dma.iter().any(|d| {
-            d[2] > 0
-                && r.wrapping_sub(d[0]) < d[2]
-                && r.wrapping_sub(d[0]) == ram.wrapping_sub(d[1])
+            && r.wrapping_sub(boot_rom) == ram.wrapping_sub(boot_base);
+        let seen = dma.iter().any(|&(dr, dram, dlen)| {
+            dlen > 0 && r.wrapping_sub(dr) < dlen && r.wrapping_sub(dr) == ram.wrapping_sub(dram)
         });
         // The same test copies seen in runs get: laid out like code.
         let end = (r as usize + len as usize).min(rom.bytes().len());
@@ -435,14 +521,23 @@ fn translate(args: &[String]) -> Result<(), String> {
             planned += 1;
         }
     }
+    (regions, planned)
+}
+
+/// The functions of each overlay region, one discovery per run of
+/// back-to-back copies, split back into one result per copy.
+fn discover_overlays(
+    rom: &Rom,
+    copies: &[(u32, u32, u32)],
+    regions: &Regions,
+) -> Result<Vec<Overlay>, String> {
     // Games often copy one long piece of code in several back-to-back
     // copies. Discovery looks at the whole run (so jump tables and calls
     // that cross a copy's edge resolve); each copy then gets the functions
     // that start inside it.
-    let copies: Vec<(u32, u32, u32)> = dma.iter().map(|d| (d[0], d[1], d[2])).collect();
-    let index = Copies::new(&copies);
+    let index = Copies::new(copies);
     let mut runs: BTreeMap<(u32, u32, u32), Vec<u32>> = BTreeMap::new();
-    for (&c, entries) in &regions {
+    for (&c, entries) in regions {
         runs.entry(index.run_of(c)).or_default().extend(entries);
     }
     // Which run each copy belongs to, worked out once.
@@ -491,10 +586,42 @@ fn translate(args: &[String]) -> Result<(), String> {
             overlays.push(((cr, cram, clen), part));
         }
     }
+    Ok(overlays)
+}
 
-    // Code the game wrote into RAM itself, saved by runs that called into it.
-    let images = written_images(&local)?;
+/// Everything [`write_crate`] writes the game's crate and report from.
+struct GameCrate<'a> {
+    rom: &'a Rom,
+    img: &'a Image<'a>,
+    local: &'a Path,
+    out: &'a Path,
+    runtime: &'a Path,
+    names: &'a BTreeMap<u32, String>,
+    found: &'a Discovery,
+    overlays: &'a [Overlay],
+    images: &'a [(String, Discovery)],
+    /// Boot-image functions dropped as overwritten by copies.
+    stale: usize,
+    /// Overlays from the game's load tables, not yet seen in a run.
+    planned: usize,
+}
 
+/// Translates every function found and writes the game's crate under
+/// `out`, its config and report under `local`, and prints the report.
+fn write_crate(g: GameCrate) -> Result<(), String> {
+    let GameCrate {
+        rom,
+        img,
+        local,
+        out,
+        runtime,
+        names,
+        found,
+        overlays,
+        images,
+        stale,
+        planned,
+    } = g;
     let mut failed = Vec::new();
     let mut translate_one = |f: &n64rusty_translator::Function| {
         let mut f = f.clone();
@@ -524,7 +651,7 @@ fn translate(args: &[String]) -> Result<(), String> {
     }
     // One file per overlay; the same ROM bytes copied to two RAM places are
     // two overlays.
-    for ((r, ram, _), d) in &overlays {
+    for ((r, ram, _), d) in overlays {
         let mut file = HEADER.to_string();
         for f in &d.functions {
             file.push_str(&translate_one(f));
@@ -536,7 +663,7 @@ fn translate(args: &[String]) -> Result<(), String> {
     // several saved images is emitted once.
     let mut image_fns: Vec<(String, u32, u32, u64)> = Vec::new();
     let mut seen_fns = std::collections::HashSet::new();
-    for (module, d) in &images {
+    for (module, d) in images {
         let mut file = HEADER.to_string();
         for f in &d.functions {
             let bytes: Vec<u8> = f.words.iter().flat_map(|w| w.to_be_bytes()).collect();
@@ -587,7 +714,7 @@ fn translate(args: &[String]) -> Result<(), String> {
             emit::fn_name(f.addr)
         );
     }
-    for ((r, ram, len), d) in &overlays {
+    for ((r, ram, len), d) in overlays {
         let _ = writeln!(
             register,
             "    ctx.register_overlay({r:#x}, {ram:#010x}, {len:#x}, &["
@@ -613,23 +740,7 @@ fn translate(args: &[String]) -> Result<(), String> {
     lib.push('\n');
     lib.push_str(&register);
     write_if_changed(&src_dir.join("lib.rs"), &lib)?;
-    // Drop parts for address ranges that no longer have functions, and the
-    // single-crate files of older versions.
-    if let Ok(entries) = fs::read_dir(&parts_dir) {
-        for e in entries.flatten() {
-            if !files.contains_key(&*e.file_name().to_string_lossy()) {
-                let _ = fs::remove_dir_all(e.path());
-            }
-        }
-    }
-    if let Ok(entries) = fs::read_dir(&src_dir) {
-        for e in entries.flatten() {
-            let name = e.file_name().to_string_lossy().to_string();
-            if name.ends_with(".rs") && name != "lib.rs" && name != "main.rs" {
-                let _ = fs::remove_file(e.path());
-            }
-        }
-    }
+    remove_stale(&parts_dir, &src_dir, &files);
     let cargo = format!(
         "# Generated by n64rusty. Never commit.\n[package]\nname = \"n64rusty-game-{short}\"\nversion = \"0.0.0\"\nedition = \"2021\"\npublish = false\n\n[dependencies]\nn64rusty-runtime = {{ path = {rt:?} }}\nn64rusty-runner = {{ path = {host:?} }}\n{deps}\n[profile.dev]\nopt-level = 1\n\n# Standalone: not part of the n64rusty workspace.\n[workspace]\n",
         host = runtime.join("../runner").canonicalize().map_err(|e| format!("runner crate next to {}: {e}", runtime.display()))?.display().to_string(),
@@ -666,7 +777,7 @@ fn translate(args: &[String]) -> Result<(), String> {
         planned,
         failed.len(),
     );
-    for ((r, ram, len), d) in &overlays {
+    for ((r, ram, len), d) in overlays {
         let _ = writeln!(
             report,
             "  overlay rom {r:#x} -> {ram:#010x} len {len:#x}: {} functions",
@@ -686,6 +797,30 @@ fn translate(args: &[String]) -> Result<(), String> {
         files.len()
     );
     Ok(())
+}
+
+/// Drops parts for address ranges that no longer have functions, and the
+/// single-crate files of older versions. A failure is reported, not fatal.
+fn remove_stale(parts_dir: &Path, src_dir: &Path, files: &BTreeMap<String, String>) {
+    if let Ok(entries) = fs::read_dir(parts_dir) {
+        for e in entries.flatten() {
+            if !files.contains_key(&*e.file_name().to_string_lossy()) {
+                if let Err(err) = fs::remove_dir_all(e.path()) {
+                    eprintln!("warning: removing {}: {err}", e.path().display());
+                }
+            }
+        }
+    }
+    if let Ok(entries) = fs::read_dir(src_dir) {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.ends_with(".rs") && name != "lib.rs" && name != "main.rs" {
+                if let Err(err) = fs::remove_file(e.path()) {
+                    eprintln!("warning: removing {}: {err}", e.path().display());
+                }
+            }
+        }
+    }
 }
 
 /// The word index just past the target of the branch `w` at index `k`, or 0
@@ -766,12 +901,12 @@ fn find_routines(
         );
         for j in 0..*len {
             let (rw, tw) = (reference[ra + j], target.get(ta + j).copied().unwrap_or(0));
-            if rw >> 26 != 3 || tw >> 26 != 3 {
+            if rw >> 26 != OP_JAL || tw >> 26 != OP_JAL {
                 continue;
             }
             let (rt, tt) = (
-                0x8000_0000 | (rw & 0x03FF_FFFF) << 2,
-                0x8000_0000 | (tw & 0x03FF_FFFF) << 2,
+                KSEG0 | (rw & JUMP_TARGET) << 2,
+                KSEG0 | (tw & JUMP_TARGET) << 2,
             );
             let Some(&callee) = by_addr.get(&rt) else {
                 continue;
@@ -818,7 +953,7 @@ fn match_routines(args: &[String]) -> Result<(), String> {
     // The reference's code saved from RAM (`images/`) stands in for the
     // packed bytes the boot image holds at those addresses.
     for (base, bytes) in saved_images(&reference.sha256)? {
-        if base < ref_base || base - ref_base >= 0x0100_0000 {
+        if base < ref_base || base - ref_base >= IMAGE_REACH {
             continue;
         }
         let at = ((base - ref_base) / 4) as usize;
@@ -855,7 +990,7 @@ fn match_routines(args: &[String]) -> Result<(), String> {
         if let Some(k) = (0..len).find(|&k| {
             reach = reach.max(branch_reach(ref_words[at + k], k));
             at + k + 2 < ref_words.len()
-                && ref_words[at + k] == 0x03E0_0008
+                && ref_words[at + k] == JR_RA
                 && k + 2 > reach
                 && starts_function(&ref_words, at + k + 2)
         }) {
@@ -864,7 +999,7 @@ fn match_routines(args: &[String]) -> Result<(), String> {
         while len > 0 && ref_words[at + len - 1] == 0 {
             len -= 1;
         }
-        routines.push((*a, n.clone(), len.min(0x1000)));
+        routines.push((*a, n.clone(), len.min(MAX_ROUTINE_WORDS)));
     }
     let mut found = find_routines(
         &ref_words,

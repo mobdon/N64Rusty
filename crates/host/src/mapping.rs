@@ -11,10 +11,15 @@ use crate::pad::{button, Pad, STICK_MAX};
 /// What a key does.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Binding {
+    /// Holds these console button bits (see [`button`]).
     Button(u16),
+    /// Pushes the stick fully up.
     StickUp,
+    /// Pushes the stick fully down.
     StickDown,
+    /// Pushes the stick fully left.
     StickLeft,
+    /// Pushes the stick fully right.
     StickRight,
     /// Held with a stick key: half tilt, for walking rather than running.
     Half,
@@ -34,6 +39,42 @@ impl Binding {
                 button::by_name(other).ok_or_else(|| format!("unknown binding `{name}`"))?,
             ),
         })
+    }
+}
+
+/// Left stick travel (0 to 1) that counts as centred, unless a config
+/// sets its own; the Android controller uses it too.
+pub(crate) const DEADZONE: f64 = 0.15;
+/// How far the right stick goes (0 to 1) before it presses a C button;
+/// the Android controller's axes use it too.
+pub(crate) const PRESS: f64 = 0.5;
+
+/// What a set of held bindings adds up to: button bits, stick keys and
+/// whether `Half` is held.
+#[derive(Default)]
+struct Held {
+    buttons: u16,
+    up: bool,
+    down: bool,
+    left: bool,
+    right: bool,
+    half: bool,
+}
+
+impl Held {
+    fn of<'a>(bindings: impl IntoIterator<Item = &'a Binding>) -> Held {
+        let mut h = Held::default();
+        for binding in bindings {
+            match binding {
+                Binding::Button(b) => h.buttons |= b,
+                Binding::StickUp => h.up = true,
+                Binding::StickDown => h.down = true,
+                Binding::StickLeft => h.left = true,
+                Binding::StickRight => h.right = true,
+                Binding::Half => h.half = true,
+            }
+        }
+        h
     }
 }
 
@@ -91,20 +132,16 @@ impl KeyMap {
     /// Controller state with these keys held.
     pub fn pad(&self, held: &HashSet<KeyCode>) -> Pad {
         let mut pad = Pad::default();
-        let (mut up, mut down, mut left, mut right, mut half) = (false, false, false, false, false);
-        for (key, binding) in &self.0 {
-            if !held.contains(key) {
-                continue;
-            }
-            match binding {
-                Binding::Button(b) => pad.buttons |= b,
-                Binding::StickUp => up = true,
-                Binding::StickDown => down = true,
-                Binding::StickLeft => left = true,
-                Binding::StickRight => right = true,
-                Binding::Half => half = true,
-            }
-        }
+        let bound = self.0.iter().filter(|(key, _)| held.contains(key));
+        let Held {
+            buttons,
+            up,
+            down,
+            left,
+            right,
+            half,
+        } = Held::of(bound.map(|(_, binding)| binding));
+        pad.buttons = buttons;
         // shortcut: diagonals reach the square's corner, not the stick's octagonal gate; fine for menus and movement, revisit if a game reads the stick's magnitude.
         let reach = if half { STICK_MAX / 2 } else { STICK_MAX };
         // Opposite keys held together cancel out, like a centred stick.
@@ -147,6 +184,7 @@ pub fn parse_pad_button(name: &str) -> Result<Button, String> {
 /// Gamepad layout for one port: buttons, and how the sticks feel.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PadMap {
+    /// What each gamepad button does.
     pub buttons: Vec<(Button, Binding)>,
     /// Left stick travel (0 to 1) that still counts as centred.
     pub deadzone: f32,
@@ -176,7 +214,7 @@ impl Default for PadMap {
                 (Button::DPadLeft, B(button::D_LEFT)),
                 (Button::DPadRight, B(button::D_RIGHT)),
             ],
-            deadzone: 0.15,
+            deadzone: DEADZONE as f32,
             sensitivity: 1.0,
         }
     }
@@ -187,26 +225,23 @@ impl PadMap {
     /// so it can be tested without a device.
     pub fn pad(&self, pressed: impl Fn(Button) -> bool, axis: impl Fn(Axis) -> f32) -> Pad {
         let mut pad = Pad::default();
-        let (mut up, mut down, mut left, mut right, mut half) = (false, false, false, false, false);
-        for &(from, to) in &self.buttons {
-            if !pressed(from) {
-                continue;
-            }
-            match to {
-                Binding::Button(b) => pad.buttons |= b,
-                Binding::StickUp => up = true,
-                Binding::StickDown => down = true,
-                Binding::StickLeft => left = true,
-                Binding::StickRight => right = true,
-                Binding::Half => half = true,
-            }
-        }
+        let bound = self.buttons.iter().filter(|(from, _)| pressed(*from));
+        let Held {
+            buttons,
+            up,
+            down,
+            left,
+            right,
+            half,
+        } = Held::of(bound.map(|(_, to)| to));
+        pad.buttons = buttons;
         let (cx, cy) = (axis(Axis::RightStickX), axis(Axis::RightStickY));
+        let press = PRESS as f32;
         for (on, bit) in [
-            (cy > 0.5, button::C_UP),
-            (cy < -0.5, button::C_DOWN),
-            (cx < -0.5, button::C_LEFT),
-            (cx > 0.5, button::C_RIGHT),
+            (cy > press, button::C_UP),
+            (cy < -press, button::C_DOWN),
+            (cx < -press, button::C_LEFT),
+            (cx > press, button::C_RIGHT),
         ] {
             if on {
                 pad.buttons |= bit;

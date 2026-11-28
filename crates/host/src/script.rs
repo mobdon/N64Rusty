@@ -19,9 +19,11 @@ use crate::pad::{parse_buttons, ButtonNames, Pad, Pads};
 /// One state change.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Event {
+    /// The frame from which the port holds `pad`.
     pub frame: u64,
     /// Port index, 0 to 3 (written 1 to 4 in the text).
     pub port: usize,
+    /// The controller state from then on.
     pub pad: Pad,
 }
 
@@ -80,6 +82,7 @@ pub struct Player {
 }
 
 impl Player {
+    /// A player for `events` (as [`parse`] returns them), from frame 0.
     pub fn new(events: Vec<Event>) -> Self {
         Player {
             events,
@@ -106,6 +109,7 @@ pub struct Recorder {
 }
 
 impl Recorder {
+    /// Takes in the states of `frame`, writing the ports that changed.
     pub fn record(&mut self, frame: u64, pads: &Pads) {
         if self.text.is_empty() {
             self.text
@@ -122,6 +126,7 @@ impl Recorder {
         self.last = Some(*pads);
     }
 
+    /// The script so far, header first.
     pub fn text(&self) -> &str {
         &self.text
     }

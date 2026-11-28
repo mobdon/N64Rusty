@@ -23,6 +23,7 @@ use std::thread;
 /// A command line and where its reply goes.
 pub type Request = (String, Sender<String>);
 
+/// A listening debug port; its commands arrive as [`Request`]s.
 pub struct DebugPort {
     pub(crate) addr: SocketAddr,
     pub(crate) requests: Receiver<Request>,
@@ -44,6 +45,7 @@ impl DebugPort {
         Ok(DebugPort { addr, requests })
     }
 
+    /// The address it listens on, with the port picked if 0 was asked.
     pub fn addr(&self) -> SocketAddr {
         self.addr
     }

@@ -40,6 +40,7 @@ pub trait Guest {
 /// What [`Session::tick`] did.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tick {
+    /// The guest ran one frame.
     Ran,
     /// Paused by the debug port.
     Waiting,
@@ -53,7 +54,10 @@ enum Mode {
     Stepping(u64, Sender<String>),
 }
 
+/// One run of a guest: its frame count, input sources (debug port, replay,
+/// live pads), recording and frame limit, without a window.
 pub struct Session<G> {
+    /// The game being run.
     pub guest: G,
     frame: u64,
     limit: Option<u64>,
@@ -67,6 +71,8 @@ pub struct Session<G> {
 }
 
 impl<G: Guest> Session<G> {
+    /// Sets up a run of `guest` as `cfg` says: opens its replay script,
+    /// recording file and debug port.
     pub fn new(guest: G, cfg: &RunConfig) -> Result<Session<G>, String> {
         let replay = match &cfg.replay {
             Some(path) => {
@@ -277,6 +283,7 @@ pub struct Pacer {
 }
 
 impl Pacer {
+    /// Paces `rate` frames per second, the first due at `now`.
     pub fn new(rate: f64, now: Instant) -> Pacer {
         Pacer {
             period: Duration::from_secs_f64(1.0 / rate),

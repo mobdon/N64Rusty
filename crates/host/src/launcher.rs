@@ -16,19 +16,31 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Theme, Window, WindowId};
 
 use crate::config::RunConfig;
-use crate::menu::{mod_options, mod_options_file, mods, toggle_mod_option, toggled, REFRESH};
+use crate::menu::{
+    mod_options, mod_options_file, mods, toggle_mod_option, toggled, REFRESH, SCALES,
+};
 
+/// Canvas width in pixels: the console's picture width.
 pub const W: usize = 320;
+/// Canvas height in pixels: the console's picture height.
 pub const H: usize = 240;
 
-/// The palette: the console's four bright colors on its dark grey.
+/// The background: the palette is the console's four bright colors
+/// ([`RED`], [`GOLD`], [`GREEN`], [`SKY`]) on this dark grey.
 pub const BG: u32 = 0x1e1e22;
+/// Panel and tab fill.
 pub const PANEL: u32 = 0x3a3a40;
+/// Borders, help text and unselected tabs.
 pub const EDGE: u32 = 0x6a6a72;
+/// Plain text.
 pub const TEXT: u32 = 0xf0f0f0;
+/// Highlight: the selection and setting values.
 pub const GOLD: u32 = 0xffc20e;
+/// One of the four bright colors; also "off" and errors.
 pub const RED: u32 = 0xe4002b;
+/// One of the four bright colors; also "on".
 pub const GREEN: u32 = 0x00a651;
+/// One of the four bright colors.
 pub const SKY: u32 = 0x0a72d8;
 const FOUR: [u32; 4] = [RED, GOLD, GREEN, SKY];
 const PICKED: u32 = 0x24345c;
@@ -39,10 +51,14 @@ const MAX_GAMES: usize = 2 * ROWS - 1;
 /// List rows on the Mods and Settings pages.
 const LIST_ROWS: usize = 8;
 
+/// A page of the start screen, chosen by its tab.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Page {
+    /// ROMs played before, as tiles.
     Games,
+    /// Mods and their options, on or off.
     Mods,
+    /// The window choices.
     Settings,
 }
 
@@ -224,7 +240,14 @@ impl Ui {
             Act::Nothing => return None,
             Act::Wide => w.widescreen = !w.widescreen,
             Act::Textures => w.console_filter = !w.console_filter,
-            Act::Size => w.scale = if w.scale >= 4 { 2 } else { w.scale + 1 },
+            Act::Size => {
+                let (smallest, largest) = (SCALES[0], SCALES[SCALES.len() - 1]);
+                w.scale = if w.scale >= largest {
+                    smallest
+                } else {
+                    w.scale + 1
+                };
+            }
             Act::Refresh => {
                 let at = REFRESH.iter().position(|(_, r)| *r == w.refresh);
                 w.refresh = REFRESH[at.map_or(0, |i| (i + 1) % REFRESH.len())].1;
@@ -555,7 +578,8 @@ impl ApplicationHandler for Screens {
                     .with_inner_size(LogicalSize::new(W as f64 * 3.0, H as f64 * 3.0));
                 match event_loop.create_window(attrs) {
                     Ok(w) => Arc::new(w),
-                    Err(_) => {
+                    Err(e) => {
+                        eprintln!("error: the start screen's window did not open: {e}");
                         event_loop.exit();
                         return;
                     }
@@ -735,7 +759,13 @@ fn load_settings() -> RunConfig {
     let Some(path) = settings_path() else {
         return RunConfig::default();
     };
-    let mut cfg = RunConfig::load(&path).unwrap_or_default();
+    // A missing file is the first run; any other failure is worth a word.
+    let mut cfg = RunConfig::load(&path).unwrap_or_else(|e| {
+        if path.exists() {
+            eprintln!("warning: settings not read, using defaults: {e}");
+        }
+        RunConfig::default()
+    });
     cfg.path = Some(path);
     cfg
 }
@@ -754,12 +784,17 @@ fn save_everywhere(cfg: &RunConfig) -> Result<(), String> {
     };
     for game in std::fs::read_dir(games).into_iter().flatten().flatten() {
         let path = game.path().join("run.toml");
-        if let Ok(mut own) = RunConfig::load(&path) {
-            own.window.widescreen = cfg.window.widescreen;
-            own.window.console_filter = cfg.window.console_filter;
-            own.window.scale = cfg.window.scale;
-            own.window.refresh = cfg.window.refresh;
-            own.save_window()?;
+        match RunConfig::load(&path) {
+            Ok(mut own) => {
+                own.window.widescreen = cfg.window.widescreen;
+                own.window.console_filter = cfg.window.console_filter;
+                own.window.scale = cfg.window.scale;
+                own.window.refresh = cfg.window.refresh;
+                own.save_window()?;
+            }
+            // A game folder without its own settings has nothing to change.
+            Err(e) if path.exists() => eprintln!("warning: {e}; its window settings not changed"),
+            Err(_) => {}
         }
     }
     Ok(())
@@ -904,12 +939,16 @@ fn open_dialog() -> Option<PathBuf> {
     None
 }
 
-fn open_folder(dir: &Path) {
-    let _ = std::fs::create_dir_all(dir);
+/// Makes `dir` if needed and opens it in the file manager (Windows only;
+/// elsewhere it is only made).
+pub(crate) fn open_folder(dir: &Path) {
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        eprintln!("warning: making {}: {e}", dir.display());
+    }
     #[cfg(windows)]
-    let _ = std::process::Command::new("explorer").arg(dir).spawn();
-    #[cfg(not(windows))]
-    let _ = dir;
+    if let Err(e) = std::process::Command::new("explorer").arg(dir).spawn() {
+        eprintln!("warning: opening {}: {e}", dir.display());
+    }
 }
 
 #[cfg(test)]

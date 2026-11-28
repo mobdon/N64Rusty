@@ -39,25 +39,38 @@ use crate::mapping::{parse_key, parse_pad_button, Binding, KeyMap, PadMap};
 /// the renderer reads it.
 pub const NTSC_RATE: f64 = 60.0 / 1.001;
 
+/// Everything that decides how a run goes (see the module docs for the
+/// file it is read from).
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunConfig {
     /// The file this config was loaded from, where window choices made in
     /// the menu are saved.
     pub path: Option<PathBuf>,
+    /// Stop after this many frames; `None` runs until closed or `quit`.
     pub frames: Option<u64>,
+    /// Host frames per second.
     pub frame_rate: f64,
+    /// No window: scripted input only.
     pub headless: bool,
+    /// An input script to play back.
     pub replay: Option<PathBuf>,
+    /// Where to write this run's input as a script.
     pub record: Option<PathBuf>,
+    /// Listen here for [`crate::debug`] commands.
     pub debug_port: Option<SocketAddr>,
+    /// The window's settings.
     pub window: WindowConfig,
+    /// Where each of the four ports' input comes from.
     pub ports: [PortConfig; 4],
 }
 
+/// The `[window]` table: how the game is shown.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct WindowConfig {
+    /// The window's title.
     pub title: String,
+    /// The window's size as a multiple of 320x240.
     pub scale: u32,
     /// Fill a window wider than 4:3 with more of the scene instead of
     /// black bars. On by default.

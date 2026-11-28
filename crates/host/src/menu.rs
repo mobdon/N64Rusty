@@ -13,18 +13,22 @@ pub enum Action {
     /// Start the program again on one page of its start screen: `games`,
     /// `mods` or `settings`.
     Screen(&'static str),
-    /// `Some(0.0)` is the display's rate.
+    /// Draw this often; `Some(0.0)` is the display's rate.
     Refresh(Option<f64>),
+    /// Widescreen on (true) or the console's 4:3 (false).
     Widescreen(bool),
+    /// Textures as the console filters them (true) or crisp (false).
     ConsoleFilter(bool),
     /// Window size as a multiple of 320x240, leaving full screen.
     Scale(u32),
+    /// Full screen on or off.
     Fullscreen,
     /// Turn the mod file on or off and start the program again.
     ToggleMod(std::path::PathBuf),
     /// Flip one `name = on|off` line of a mod's options file and start the
     /// program again.
     ToggleModOption(std::path::PathBuf, String),
+    /// Open the `mods` folder in the file manager.
     OpenModsFolder,
 }
 
@@ -60,12 +64,16 @@ pub fn mods() -> Vec<(std::path::PathBuf, bool)> {
     v
 }
 
-/// A mod's options file: `<mod name>.txt` beside it, which the mod writes.
-pub fn mod_options_file(path: &std::path::Path) -> std::path::PathBuf {
+/// A mod's name: its file name without `.off` and the library extension.
+fn mod_name(path: &std::path::Path) -> String {
     let n = path.file_name().unwrap_or_default().to_string_lossy();
     let base = n.trim_end_matches(".off");
-    let name = base.rsplit_once('.').map_or(base, |(a, _)| a);
-    path.with_file_name(format!("{name}.txt"))
+    base.rsplit_once('.').map_or(base, |(a, _)| a).to_string()
+}
+
+/// A mod's options file: `<mod name>.txt` beside it, which the mod writes.
+pub fn mod_options_file(path: &std::path::Path) -> std::path::PathBuf {
+    path.with_file_name(format!("{}.txt", mod_name(path)))
 }
 
 /// The `name = on|off` lines of an options file; other lines are ignored.
@@ -147,17 +155,21 @@ pub const SCALES: [u32; 3] = [2, 3, 4];
 #[cfg(windows)]
 pub use imp::Menu;
 
+/// No menu bar on this system.
 #[cfg(not(windows))]
 pub struct Menu;
 
 #[cfg(not(windows))]
 impl Menu {
+    /// Never a menu here.
     pub fn new(_: &Window, _: &WindowConfig) -> Option<Menu> {
         None
     }
+    /// Never a choice here.
     pub fn poll(&self) -> Option<Action> {
         None
     }
+    /// Nothing to tick here.
     pub fn show(&self, _: &WindowConfig) {}
 }
 
@@ -167,6 +179,7 @@ mod imp {
     use muda::{CheckMenuItem, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
     use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
+    /// The window's menu bar and its items.
     pub struct Menu {
         _bar: muda::Menu,
         open: MenuItem,
@@ -192,10 +205,13 @@ mod imp {
     }
 
     impl Menu {
+        /// Adds the menu bar to `window`, ticked as `cfg` says; `None` when
+        /// it is not a Win32 window or the bar cannot be made.
         pub fn new(window: &Window, cfg: &WindowConfig) -> Option<Menu> {
             let RawWindowHandle::Win32(h) = window.window_handle().ok()?.as_raw() else {
                 return None;
             };
+            let found = mods();
             let m = Menu {
                 _bar: muda::Menu::new(),
                 open: MenuItem::new("Open ROM...", true, None),
@@ -221,24 +237,20 @@ mod imp {
                 console: check("Console textures"),
                 scales: SCALES
                     .iter()
-                    .map(|s| MenuItem::new(format!("{}x{}", 320 * s, 240 * s), true, None))
-                    .collect(),
-                full: MenuItem::new("Full screen (F11)", true, None),
-                mods: mods()
-                    .into_iter()
-                    .map(|(p, on)| {
-                        let n = p.file_name().unwrap_or_default().to_string_lossy();
-                        let name = n
-                            .trim_end_matches(".off")
-                            .rsplit_once('.')
-                            .map_or(&*n, |(a, _)| a);
-                        (
-                            CheckMenuItem::new(name.replace('&', "&&"), true, on, None),
-                            p,
-                        )
+                    .map(|s| {
+                        let (w, h) = (crate::launcher::W as u32, crate::launcher::H as u32);
+                        MenuItem::new(format!("{}x{}", w * s, h * s), true, None)
                     })
                     .collect(),
-                mod_options: mods()
+                full: MenuItem::new("Full screen (F11)", true, None),
+                mods: found
+                    .iter()
+                    .map(|(p, on)| {
+                        let name = mod_name(p).replace('&', "&&");
+                        (CheckMenuItem::new(name, true, *on, None), p.clone())
+                    })
+                    .collect(),
+                mod_options: found
                     .into_iter()
                     .flat_map(|(p, on)| {
                         let file = mod_options_file(&p);
