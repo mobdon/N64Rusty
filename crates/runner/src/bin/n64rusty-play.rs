@@ -25,7 +25,7 @@ use std::process::ExitCode;
 use n64rusty_host::launcher::Page;
 use n64rusty_host::one_window::Next;
 use n64rusty_rom::{signature, Rom};
-use n64rusty_runner::{main_args, os, read_names, routine_list, Game};
+use n64rusty_runner::{main_args, os, read_names, routine_list, Game, ROM_EXTENSIONS};
 
 /// Files built into the player (see build.rs): fingerprints and routine
 /// lists for games the fingerprints alone cannot set up.
@@ -39,6 +39,14 @@ mod built {
 /// First line of a routine list written from `--symbols`: kept over the
 /// built-in one.
 const FROM_MAP: &str = "// from a symbol map";
+
+/// How [`routines`] starts its error for a ROM no fingerprint matches, which
+/// [`friendly`] tells apart from a file that is not a ROM.
+const NOT_SET_UP: &str = "no system routines found";
+
+/// The run.toml key of widescreen HUD areas: a run.toml without it is
+/// replaced by the built-in one.
+const HUD_KEY: &str = "hud";
 
 fn main() -> ExitCode {
     let args = std::env::args().skip(1).collect();
@@ -216,7 +224,7 @@ fn play_on(args: &mut Vec<String>, dir: &Path, mut plain: bool) -> ExitCode {
 
 /// What a player is told when a game cannot start.
 fn friendly(error: &str) -> String {
-    if error.contains("no system routines found") {
+    if error.contains(NOT_SET_UP) {
         "This game has not been set up for N64Rusty yet, so it cannot run. \
          Pick another game."
             .into()
@@ -279,7 +287,7 @@ fn played(args: &mut Vec<String>, dir: &Path, plain: bool) -> Result<ExitCode, S
     if let Some(run) = built::get(&format!("games/{}/run.toml", rom.sha256)) {
         let path = used.join("run.toml");
         let have = std::fs::read_to_string(&path).unwrap_or_default();
-        if !have.contains("hud") {
+        if !have.contains(HUD_KEY) {
             let _ = std::fs::write(&path, run);
         }
     }
@@ -361,7 +369,7 @@ fn routines(args: &[String], dir: &Path, rom: &Rom, local: &Path) -> Result<(), 
     );
     if found.is_empty() {
         return Err(format!(
-            "no system routines found in this ROM, so it cannot run yet ({} has {} fingerprints)",
+            "{NOT_SET_UP} in this ROM, so it cannot run yet ({} has {} fingerprints)",
             prints.display(),
             known.lines().count()
         ));
@@ -484,7 +492,7 @@ fn find_roms(dir: &Path) -> Vec<PathBuf> {
         .filter(|p| {
             p.extension()
                 .and_then(|e| e.to_str())
-                .is_some_and(|e| ["z64", "n64", "v64"].contains(&e.to_ascii_lowercase().as_str()))
+                .is_some_and(|e| ROM_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
         })
         .collect();
     roms.sort();
@@ -510,7 +518,7 @@ fn every_rom_in_the_folder_is_found() {
 fn pick_rom() -> Option<PathBuf> {
     rfd::FileDialog::new()
         .set_title("Pick your N64 ROM")
-        .add_filter("N64 ROM", &["z64", "n64", "v64"])
+        .add_filter("N64 ROM", &ROM_EXTENSIONS)
         .pick_file()
 }
 

@@ -24,6 +24,12 @@ use n64rusty_runtime::{sx32, Ctx, Flash, FlashOp, GuestFn};
 
 use crate::devices::{Devices, Pad};
 use crate::save::Save;
+use crate::PHYS_MASK;
+
+mod printf;
+#[cfg(test)]
+use printf::c_float;
+use printf::format_guest;
 
 /// COP0 Count ticks per second (half the 93.75 MHz CPU clock).
 pub const COUNT_HZ: u64 = 46_875_000;
@@ -32,12 +38,89 @@ pub const TICKS_PER_FRAME: u64 = COUNT_HZ / 60;
 
 /// System event numbers used by `osSetEventMesg`.
 pub mod event {
+    /// The RSP finished a task (`OS_EVENT_SP`).
     pub const SP: u32 = 4;
+    /// A serial (controller, EEPROM) transfer finished (`OS_EVENT_SI`).
     pub const SI: u32 = 5;
+    /// The audio interface took the next buffer (`OS_EVENT_AI`).
     pub const AI: u32 = 6;
+    /// A video retrace (`OS_EVENT_VI`).
     pub const VI: u32 = 7;
+    /// A cartridge (PI) transfer finished (`OS_EVENT_PI`).
     pub const PI: u32 = 8;
+    /// The RDP finished drawing (`OS_EVENT_DP`).
     pub const DP: u32 = 9;
+}
+
+/// Field offsets of an `OSMesgQueue` in guest memory.
+mod mq {
+    /// The queue of threads blocked on an empty queue (`mtqueue`).
+    pub const EMPTY_QUEUE: u32 = 0;
+    /// The queue of threads blocked on a full queue (`fullqueue`).
+    pub const FULL_QUEUE: u32 = 4;
+    /// Messages in the queue (`validCount`).
+    pub const VALID: u32 = 8;
+    /// The slot of the first message (`first`).
+    pub const FIRST: u32 = 12;
+    /// Slots in the buffer (`msgCount`).
+    pub const COUNT: u32 = 16;
+    /// The message buffer's address (`msg`).
+    pub const BUF: u32 = 20;
+}
+
+/// Field offsets of an `OSThread` in guest memory.
+mod thread {
+    /// Priority (`priority`).
+    pub const PRIORITY: u32 = 4;
+    /// The id the game gave it (`id`).
+    pub const ID: u32 = 0x14;
+}
+
+/// Audio interface registers games may read straight.
+mod ai_reg {
+    /// `AI_LEN_REG`: bytes left of the playing buffer.
+    pub const LEN: u32 = 0x0450_0004;
+    /// `AI_STATUS_REG`: full and busy bits.
+    pub const STATUS: u32 = 0x0450_000C;
+}
+
+/// Flash chip modes (the top byte of the last mode command, as
+/// `Flash::mode` keeps it) that a PI transfer acts on.
+mod flash_mode {
+    /// Reads the array.
+    pub const READ: u8 = 0xF0;
+    /// Reads the chip's identity.
+    pub const ID: u8 = 0xE1;
+    /// A write fills the page buffer.
+    pub const PAGE_BUFFER: u8 = 0xB4;
+}
+
+/// PIF command block bytes, and the controller and EEPROM commands in it.
+mod pif {
+    /// Ends the command block.
+    pub const END: u8 = 0xFE;
+    /// Padding, skipped.
+    pub const PAD: u8 = 0xFF;
+    /// Also skipped.
+    pub const SKIP: u8 = 0xFD;
+    /// A zero length byte: nothing for this channel, go to the next.
+    pub const NEXT_CHANNEL: u8 = 0;
+    /// Set in the reply length when a command got no reply.
+    pub const NO_REPLY: u8 = 0x80;
+    /// Device type and status.
+    pub const STATUS: u8 = 0x00;
+    /// Reset, which answers as status.
+    pub const RESET: u8 = 0xFF;
+    /// Buttons and stick.
+    pub const READ_BUTTONS: u8 = 0x01;
+    /// Reads 32 bytes of a controller pak.
+    pub const PAK_READ: u8 = 0x02;
+    /// Writes 32 bytes of a controller pak.
+    pub const PAK_WRITE: u8 = 0x03;
+    /// Reads one 8-byte EEPROM block.
+    pub const EEPROM_READ: u8 = 0x04;
+    /// Writes one 8-byte EEPROM block.
+    pub const EEPROM_WRITE: u8 = 0x05;
 }
 
 /// Guest address of the cartridge handle `osCartRomInit` returns. Low RAM
@@ -297,9 +380,13 @@ pub fn release() {
 /// `--poke`): a debugging aid, for example to start a game somewhere else.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Poke {
+    /// First retrace the write is made at.
     pub from: u64,
+    /// Last retrace the write is made at (inclusive).
     pub to: u64,
+    /// Guest address written.
     pub addr: u32,
+    /// Value written (its low `bytes` bytes).
     pub value: u32,
     /// 1, 2 or 4.
     pub bytes: u8,
@@ -348,7 +435,7 @@ pub fn set_pokes(pokes: Vec<Poke>) {
 /// numbers in decimal (retraces), address and value in hex, bytes 1, 2 or 4
 /// (default 4). `#` starts a comment.
 pub fn parse_pokes(text: &str) -> Result<Vec<Poke>, String> {
-    let hex = |t: &str| u32::from_str_radix(t.trim_start_matches("0x"), 16).ok();
+    let hex = |t: &str| crate::parse_hex(t).ok();
     let mut out = Vec::new();
     for (n, line) in text.lines().enumerate() {
         let line = line.split('#').next().unwrap_or("").trim();
@@ -498,10 +585,10 @@ const MESG_COUNT_MAX: u32 = i32::MAX as u32;
 /// highest-priority receiver. Returns false if the queue is full, or is not
 /// set up (warned about once).
 fn put_message(c: &mut Ctx, st: &mut State, mq: u32, msg: u32, jam: bool) -> bool {
-    let valid = c.mem.read_u32(mq + 8);
-    let first = c.mem.read_u32(mq + 12);
-    let count = c.mem.read_u32(mq + 16);
-    let buf = c.mem.read_u32(mq + 20);
+    let valid = c.mem.read_u32(mq + mq::VALID);
+    let first = c.mem.read_u32(mq + mq::FIRST);
+    let count = c.mem.read_u32(mq + mq::COUNT);
+    let buf = c.mem.read_u32(mq + mq::BUF);
     if count == 0 || count > MESG_COUNT_MAX || valid >= count {
         return false;
     }
@@ -524,9 +611,9 @@ fn put_message(c: &mut Ctx, st: &mut State, mq: u32, msg: u32, jam: bool) -> boo
     };
     c.mem.write_u32(at, msg);
     if jam {
-        c.mem.write_u32(mq + 12, slot);
+        c.mem.write_u32(mq + mq::FIRST, slot);
     }
-    c.mem.write_u32(mq + 8, valid + 1);
+    c.mem.write_u32(mq + mq::VALID, valid + 1);
     let waiter = st
         .threads
         .values()
@@ -541,13 +628,13 @@ fn put_message(c: &mut Ctx, st: &mut State, mq: u32, msg: u32, jam: bool) -> boo
 
 /// Takes the first message from a guest queue, waking a blocked sender.
 fn take_message(c: &mut Ctx, st: &mut State, mq: u32) -> Option<u32> {
-    let valid = c.mem.read_u32(mq + 8);
+    let valid = c.mem.read_u32(mq + mq::VALID);
     if valid == 0 {
         return None;
     }
-    let first = c.mem.read_u32(mq + 12);
-    let count = c.mem.read_u32(mq + 16);
-    let buf = c.mem.read_u32(mq + 20);
+    let first = c.mem.read_u32(mq + mq::FIRST);
+    let count = c.mem.read_u32(mq + mq::COUNT);
+    let buf = c.mem.read_u32(mq + mq::BUF);
     // The same checks as put_message: a queue with no slots, or a first
     // slot outside them, has no message to give.
     if count == 0 || count > MESG_COUNT_MAX || first >= count {
@@ -558,8 +645,8 @@ fn take_message(c: &mut Ctx, st: &mut State, mq: u32) -> Option<u32> {
         return None;
     }
     let msg = c.mem.read_u32(slot_address(c, st, mq, buf, first)?);
-    c.mem.write_u32(mq + 12, (first + 1) % count);
-    c.mem.write_u32(mq + 8, valid - 1);
+    c.mem.write_u32(mq + mq::FIRST, (first + 1) % count);
+    c.mem.write_u32(mq + mq::VALID, valid - 1);
     let waiter = st
         .threads
         .values()
@@ -580,7 +667,7 @@ const MESSAGE_BYTES: u32 = 4;
 fn slot_address(c: &Ctx, st: &mut State, mq: u32, buf: u32, slot: u32) -> Option<u32> {
     // Wraps as the library's compiled sll and addu do.
     let at = buf.wrapping_add(slot.wrapping_mul(MESSAGE_BYTES));
-    let phys = (c.mem.kseg0(at) & 0x1FFF_FFFF) as usize;
+    let phys = (c.mem.kseg0(at) & PHYS_MASK) as usize;
     if at.is_multiple_of(MESSAGE_BYTES) && phys + MESSAGE_BYTES as usize <= c.mem.bytes().len() {
         return Some(at);
     }
@@ -611,8 +698,8 @@ fn post_event(c: &mut Ctx, st: &mut State, e: u32) {
 fn ai_regs(c: &mut Ctx, st: &mut State) {
     let (len, status) = (st.ai.length(c.clock), st.ai.status(c.clock));
     if let Some(io) = c.mem.io_mut() {
-        io.regs.insert(0x0450_0004, len);
-        io.regs.insert(0x0450_000C, status);
+        io.regs.insert(ai_reg::LEN, len);
+        io.regs.insert(ai_reg::STATUS, status);
     }
 }
 
@@ -972,8 +1059,8 @@ fn os_create_thread(c: &mut Ctx) {
         arg(c, 4),
         arg(c, 5) as i32,
     );
-    c.mem.write_u32(t + 4, pri as u32);
-    c.mem.write_u32(t + 0x14, id);
+    c.mem.write_u32(t + thread::PRIORITY, pri as u32);
+    c.mem.write_u32(t + thread::ID, id);
     let mut st = lock();
     st.seq += 1;
     let generation = st.seq;
@@ -1047,7 +1134,7 @@ fn os_set_thread_pri(c: &mut Ctx) {
         x.pri = pri;
     }
     if t != 0 {
-        c.mem.write_u32(t + 4, pri as u32);
+        c.mem.write_u32(t + thread::PRIORITY, pri as u32);
     }
     let _st = reschedule(c, st);
 }
@@ -1070,7 +1157,11 @@ fn os_get_thread_id(c: &mut Ctx) {
         t => t,
     };
     drop(st);
-    let id = if t == 0 { 0 } else { c.mem.read_u32(t + 0x14) };
+    let id = if t == 0 {
+        0
+    } else {
+        c.mem.read_u32(t + thread::ID)
+    };
     ret(c, id);
 }
 
@@ -1083,12 +1174,12 @@ fn os_yield_thread(c: &mut Ctx) {
 
 fn os_create_mesg_queue(c: &mut Ctx) {
     let (mq, buf, count) = (arg(c, 0), arg(c, 1), arg(c, 2));
-    c.mem.write_u32(mq, 0);
-    c.mem.write_u32(mq + 4, 0);
-    c.mem.write_u32(mq + 8, 0);
-    c.mem.write_u32(mq + 12, 0);
-    c.mem.write_u32(mq + 16, count);
-    c.mem.write_u32(mq + 20, buf);
+    c.mem.write_u32(mq + mq::EMPTY_QUEUE, 0);
+    c.mem.write_u32(mq + mq::FULL_QUEUE, 0);
+    c.mem.write_u32(mq + mq::VALID, 0);
+    c.mem.write_u32(mq + mq::FIRST, 0);
+    c.mem.write_u32(mq + mq::COUNT, count);
+    c.mem.write_u32(mq + mq::BUF, buf);
 }
 
 fn send(c: &mut Ctx, jam: bool) {
@@ -1234,14 +1325,14 @@ fn os_stop_timer(c: &mut Ctx) {
 /// `dir` 0 reads the device, 1 writes it. Save memory is read and written;
 /// cartridge ROM is only read.
 fn pi_dma(c: &mut Ctx, st: &mut State, dir: u32, dev: u32, ram: u32, len: u32) {
-    let Some(off) = Save::sram_offset(dev & 0x1FFF_FFFF) else {
+    let Some(off) = Save::sram_offset(dev & PHYS_MASK) else {
         if dir == 0 {
             cart_copy(c, st, dev, ram, len);
         }
         return;
     };
     flash_ops(c, st);
-    let at = (ram & 0x1FFF_FFFF) as usize;
+    let at = (ram & PHYS_MASK) as usize;
     let n = len as usize;
     if at + n > c.mem.bytes().len() {
         panic!("save memory DMA at {ram:#010x}+{len:#x} runs past RAM");
@@ -1256,13 +1347,13 @@ fn pi_dma(c: &mut Ctx, st: &mut State, dir: u32, dev: u32, ram: u32, len: u32) {
         (None, 0) => st.save.read(off, &mut bytes[at..at + n]),
         (None, _) => st.save.write(off, &bytes[at..at + n]),
         // Flash reads its array at twice the bus offset.
-        (Some(0xF0), 0) => st.save.read(off * 2, &mut bytes[at..at + n]),
-        (Some(0xE1), 0) => {
+        (Some(flash_mode::READ), 0) => st.save.read(off * 2, &mut bytes[at..at + n]),
+        (Some(flash_mode::ID), 0) => {
             for k in 0..n {
                 bytes[at + k] = Flash::ID[k % 8];
             }
         }
-        (Some(0xB4), 1) => {
+        (Some(flash_mode::PAGE_BUFFER), 1) => {
             let k = n.min(128);
             st.flash_page[..k].copy_from_slice(&bytes[at..at + k]);
         }
@@ -1288,7 +1379,7 @@ fn flash_ops(c: &mut Ctx, st: &mut State) {
 /// Copies `len` bytes of cartridge space at PI address `dev` into RAM.
 fn cart_copy(c: &mut Ctx, st: &mut State, dev: u32, ram: u32, len: u32) {
     let off = (dev & 0x0FFF_FFFF) as usize;
-    let at = (ram & 0x1FFF_FFFF) as usize;
+    let at = (ram & PHYS_MASK) as usize;
     let n = len as usize;
     let bytes = c.mem.bytes_mut();
     if at + n > bytes.len() {
@@ -1497,13 +1588,12 @@ fn os_si_raw_start_dma(c: &mut Ctx) {
 /// the status says no pak. Channel 4 is the cartridge
 /// EEPROM, when the game has one (see `Save::set_eeprom`).
 fn run_pif(pif: &mut [u8; 64], pads: &[Pad; 4], save: &mut Save) {
-    const NO_REPLY: u8 = 0x80;
     let (mut i, mut ch) = (0, 0);
     while i < 63 {
         match pif[i] {
-            0xFE => break,
-            0xFF | 0xFD => i += 1,
-            0 => {
+            pif::END => break,
+            pif::PAD | pif::SKIP => i += 1,
+            pif::NEXT_CHANNEL => {
                 ch += 1;
                 i += 1;
             }
@@ -1521,13 +1611,13 @@ fn run_pif(pif: &mut [u8; 64], pads: &[Pad; 4], save: &mut Save) {
                     // bytes out; a shorter block reads or writes nothing.
                     let block = (tx >= 2).then(|| usize::from(pif[cmd + 1]) * 8);
                     match (pif[cmd], block) {
-                        (0x00 | 0xFF, _) => {
+                        (pif::STATUS | pif::RESET, _) => {
                             Some(vec![0x00, if eeprom > 512 { 0xC0 } else { 0x80 }, 0x00])
                         }
-                        (0x04, Some(block)) if block + 8 <= eeprom => {
+                        (pif::EEPROM_READ, Some(block)) if block + 8 <= eeprom => {
                             Some(save.eeprom()[block..block + 8].to_vec())
                         }
-                        (0x05, Some(block)) if block + 8 <= eeprom && tx >= 10 => {
+                        (pif::EEPROM_WRITE, Some(block)) if block + 8 <= eeprom && tx >= 10 => {
                             let data = pif[cmd + 2..cmd + 10].to_vec();
                             save.eeprom_write(block, &data);
                             Some(vec![0x00])
@@ -1537,8 +1627,8 @@ fn run_pif(pif: &mut [u8; 64], pads: &[Pad; 4], save: &mut Save) {
                 } else {
                     let rumble = RUMBLE.load(Ordering::Relaxed);
                     pad.and_then(|p| match pif[cmd] {
-                        0x00 | 0xFF => Some(vec![0x05, 0x00, u8::from(rumble)]),
-                        0x01 => Some(vec![
+                        pif::STATUS | pif::RESET => Some(vec![0x05, 0x00, u8::from(rumble)]),
+                        pif::READ_BUTTONS => Some(vec![
                             (p.buttons >> 8) as u8,
                             p.buttons as u8,
                             p.stick_x as u8,
@@ -1548,17 +1638,19 @@ fn run_pif(pif: &mut [u8; 64], pads: &[Pad; 4], save: &mut Save) {
                         // (0x8000) and takes motor writes at 0xC000.
                         // shortcut: the motor itself is not passed to the
                         // host's controller.
-                        0x02 if rumble && tx >= 3 => {
+                        pif::PAK_READ if rumble && tx >= 3 => {
                             let addr = (u16::from(pif[cmd + 1]) << 8) & 0xF000;
                             let data = vec![if addr == 0x8000 { 0x80 } else { 0 }; 32];
                             let crc = pak_crc(&data);
                             Some([data, vec![crc]].concat())
                         }
-                        0x03 if rumble && tx >= 35 => Some(vec![pak_crc(&pif[cmd + 3..cmd + 35])]),
+                        pif::PAK_WRITE if rumble && tx >= 35 => {
+                            Some(vec![pak_crc(&pif[cmd + 3..cmd + 35])])
+                        }
                         // No pak: the check byte is the complement of the
                         // data's.
-                        0x02 => Some([vec![0; 32], vec![0xFF]].concat()),
-                        0x03 => Some(vec![0xFF]),
+                        pif::PAK_READ => Some([vec![0; 32], vec![0xFF]].concat()),
+                        pif::PAK_WRITE => Some(vec![0xFF]),
                         _ => None,
                     })
                 };
@@ -1567,7 +1659,7 @@ fn run_pif(pif: &mut [u8; 64], pads: &[Pad; 4], save: &mut Save) {
                         let n = r.len().min(rx);
                         pif[at..at + n].copy_from_slice(&r[..n]);
                     }
-                    None => pif[i + 1] |= NO_REPLY,
+                    None => pif[i + 1] |= pif::NO_REPLY,
                 }
                 i = at + rx;
                 ch += 1;
@@ -1610,7 +1702,7 @@ fn os_sp_task_start_go(c: &mut Ctx) {
     // frame buffer it fills) after starting it.
     // shortcut: one fixed time for every task, not its real length.
     let at = c.clock + TASK_TICKS;
-    if kind == 1 {
+    if kind == crate::media::TASK_GFX {
         post_event_at(c, &mut st, event::SP, at, 1);
         // Graphics tasks also finish on the RDP.
         post_event_at(c, &mut st, event::DP, at + 1, 2);
@@ -1687,146 +1779,6 @@ fn debug_print(c: &mut Ctx) {
     let text = format_guest(c, arg(c, 0), 1);
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
         eprintln!("game: {line}");
-    }
-}
-
-/// The NUL-terminated string at `at` (at most 1 KiB).
-fn guest_str(c: &Ctx, at: u32) -> String {
-    (0..1024)
-        .map(|i| c.mem.read_u8(at.wrapping_add(i)))
-        .take_while(|&b| b != 0)
-        .map(char::from)
-        .collect()
-}
-
-/// Formats the guest `printf` format string at `fmt` with the arguments
-/// from argument slot `first` on: %d %i %u %x %X %o %c %s %p %f %e %g,
-/// with flags, width and precision as written.
-fn format_guest(c: &Ctx, fmt: u32, first: usize) -> String {
-    let f = guest_str(c, fmt);
-    let mut out = String::new();
-    let mut k = first;
-    let mut chars = f.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch != '%' {
-            out.push(ch);
-            continue;
-        }
-        let mut spec = String::new();
-        while let Some(&n) = chars.peek() {
-            chars.next();
-            spec.push(n);
-            if n.is_ascii_alphabetic() && n != 'l' && n != 'h' || n == '%' {
-                break;
-            }
-        }
-        let conv = spec.pop().unwrap_or('%');
-        let width: usize = spec
-            .trim_start_matches(['-', '0', '+', ' ', '#'])
-            .split('.')
-            .next()
-            .and_then(|w| w.trim_end_matches(['l', 'h']).parse().ok())
-            .unwrap_or(0);
-        let zero = spec.starts_with('0');
-        let left = spec.starts_with('-');
-        let prec: Option<usize> = spec
-            .split_once('.')
-            .and_then(|(_, p)| p.trim_end_matches(['l', 'h']).parse().ok());
-        let mut next = || {
-            k += 1;
-            arg(c, k - 1)
-        };
-        let body = match conv {
-            '%' => "%".to_string(),
-            'd' | 'i' => (next() as i32).to_string(),
-            'u' => next().to_string(),
-            'x' => format!("{:x}", next()),
-            'X' => format!("{:X}", next()),
-            'o' => format!("{:o}", next()),
-            'p' => format!("{:08x}", next()),
-            'c' => char::from(next() as u8).to_string(),
-            's' => {
-                let t = guest_str(c, next());
-                match prec {
-                    Some(p) => t.chars().take(p).collect(),
-                    None => t,
-                }
-            }
-            'f' | 'e' | 'g' | 'F' | 'E' | 'G' => {
-                // Doubles take an even pair of argument slots.
-                k += k % 2;
-                let hi = u64::from(arg(c, k));
-                let lo = u64::from(arg(c, k + 1));
-                k += 2;
-                let v = f64::from_bits(hi << 32 | lo);
-                c_float(v, conv, prec.unwrap_or(6))
-            }
-            other => format!("%{spec}{other}"),
-        };
-        let pad = width.saturating_sub(body.chars().count());
-        if left {
-            out.push_str(&body);
-            out.extend(std::iter::repeat_n(' ', pad));
-        } else if zero && conv != 's' && conv != 'c' {
-            // Zeros go after the sign.
-            let digits = body.strip_prefix('-').map_or(&body[..], |d| {
-                out.push('-');
-                d
-            });
-            out.extend(std::iter::repeat_n('0', pad));
-            out.push_str(digits);
-        } else {
-            out.extend(std::iter::repeat_n(' ', pad));
-            out.push_str(&body);
-        }
-    }
-    out
-}
-
-/// `v` as C's `printf` writes it with conversion `conv` (f e g F E G) and
-/// precision `prec`.
-fn c_float(v: f64, conv: char, prec: usize) -> String {
-    // C writes the exponent with a sign and at least two digits.
-    let exp = |p: usize| {
-        let t = format!("{v:.p$e}");
-        let (m, e) = t.split_once('e').unwrap_or((&t, "0"));
-        let e: i32 = e.parse().unwrap_or(0);
-        format!("{m}e{}{:02}", if e < 0 { '-' } else { '+' }, e.abs())
-    };
-    let t = match conv.to_ascii_lowercase() {
-        'e' => exp(prec),
-        'g' => {
-            let p = prec.max(1);
-            let x = if v == 0.0 {
-                0
-            } else {
-                format!("{v:.*e}", p - 1)
-                    .split_once('e')
-                    .and_then(|(_, e)| e.parse::<i32>().ok())
-                    .unwrap_or(0)
-            };
-            // Trailing zeros (and a bare point) are dropped.
-            let trim = |t: String| {
-                if t.contains('.') {
-                    t.trim_end_matches('0').trim_end_matches('.').to_string()
-                } else {
-                    t
-                }
-            };
-            if x < -4 || x >= p as i32 {
-                let t = exp(p - 1);
-                let (m, e) = t.split_once('e').unwrap_or((&t, ""));
-                format!("{}e{e}", trim(m.to_string()))
-            } else {
-                trim(format!("{v:.*}", (p as i32 - 1 - x).max(0) as usize))
-            }
-        }
-        _ => format!("{v:.prec$}"),
-    };
-    if conv.is_ascii_uppercase() {
-        t.to_uppercase()
-    } else {
-        t
     }
 }
 

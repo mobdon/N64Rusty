@@ -9,6 +9,8 @@
 
 use n64rusty_runtime::Memory;
 
+use crate::PHYS_MASK;
+
 const ZIGZAG: [usize; 64] = [
     0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27, 20,
     13, 6, 7, 14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51, 58, 59,
@@ -16,8 +18,6 @@ const ZIGZAG: [usize; 64] = [
 ];
 /// Bytes of one 8x8 block of 16-bit coefficients.
 const BLOCK_BYTES: u32 = 0x80;
-/// The physical address bits of a KSEG0 address.
-const PHYS_MASK: u32 = 0x1FFF_FFFF;
 /// Bytes of one quantisation table: 64 u16 entries.
 const TABLE_BYTES: u32 = 2 * 64;
 /// The SP DMA takes a 24-bit RAM address and ignores its low 3 bits, so the

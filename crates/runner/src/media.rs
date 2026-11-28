@@ -19,7 +19,7 @@ use n64rusty_runtime::Ctx;
 use crate::devices::{Devices, Pad};
 
 /// `OSTask.t.type` of a graphics task.
-const TASK_GFX: u32 = 1;
+pub(crate) const TASK_GFX: u32 = 1;
 /// `OSTask.t.type` of an audio task.
 const TASK_AUDIO: u32 = 2;
 /// Picture decode (inverse DCT and colour conversion of JPEG blocks).
@@ -111,14 +111,50 @@ struct Profile {
     png_us: u64,
 }
 
+/// `N64RUSTY_PROFILE=n`: a profile line every n pictures (120 when n is not
+/// a number, at least 1), or none when it is not set.
+pub(crate) fn profile_every<T: std::str::FromStr + Ord + From<u8>>() -> Option<T> {
+    let v = std::env::var("N64RUSTY_PROFILE").ok()?;
+    Some(v.parse().unwrap_or(T::from(120)).max(T::from(1)))
+}
+
+/// Whole left/right frames of the big-endian 16-bit samples in the audio
+/// buffer of `len` bytes at `addr`.
+pub(crate) fn samples(ctx: &Ctx, addr: u32, len: u32) -> Vec<i16> {
+    (0..(len & !3) / 2)
+        .map(|i| ctx.mem.read_u16(addr + 2 * i) as i16)
+        .collect()
+}
+
+/// The off-screen renderer, made on first use (and then set up by `setup`).
+/// When one cannot be made, says so once, with `lost` naming what is not
+/// done without it, and gives none from then on.
+fn renderer_on_demand<'a>(
+    renderer: &'a mut Option<Renderer>,
+    failed: &mut bool,
+    lost: &str,
+    setup: impl FnOnce(&mut Renderer),
+) -> Option<&'a mut Renderer> {
+    if renderer.is_none() && !*failed {
+        match Renderer::new() {
+            Ok(mut r) => {
+                setup(&mut r);
+                *renderer = Some(r);
+            }
+            Err(e) => {
+                eprintln!("warning: no off-screen renderer, {lost}: {e}");
+                *failed = true;
+            }
+        }
+    }
+    renderer.as_mut()
+}
+
 impl Profile {
     fn from_env() -> Option<Profile> {
-        let every = std::env::var("N64RUSTY_PROFILE")
-            .ok()?
-            .parse()
-            .unwrap_or(120);
+        let every: u64 = profile_every()?;
         Some(Profile {
-            every: u64::max(every, 1),
+            every,
             start: Instant::now(),
             frames: 0,
             dl_us: 0,
@@ -262,19 +298,13 @@ impl Media {
         let Some(dir) = self.capture.clone() else {
             return;
         };
-        if self.renderer.is_none() && !self.renderer_failed {
-            match Renderer::new() {
-                Ok(mut r) => {
-                    r.set_widescreen(self.wide);
-                    self.renderer = Some(r);
-                }
-                Err(e) => {
-                    eprintln!("warning: no off-screen renderer, frames are not saved: {e}");
-                    self.renderer_failed = true;
-                }
-            }
-        }
-        let Some(r) = self.renderer.as_mut() else {
+        let wide = self.wide;
+        let Some(r) = renderer_on_demand(
+            &mut self.renderer,
+            &mut self.renderer_failed,
+            "frames are not saved",
+            |r| r.set_widescreen(wide),
+        ) else {
             return;
         };
         let (mut w, h) = (f.width.max(1) * self.scale, f.height() * self.scale);
@@ -349,18 +379,12 @@ struct GpuReadback<'a> {
 
 impl Readback for GpuReadback<'_> {
     fn read(&mut self, frame: &Frame, image: u32, width: u32, height: u32) -> Option<Vec<u8>> {
-        if self.renderer.is_none() && !*self.failed {
-            match Renderer::new() {
-                Ok(r) => *self.renderer = Some(r),
-                Err(e) => {
-                    eprintln!(
-                        "warning: no off-screen renderer, drawn images are not read back: {e}"
-                    );
-                    *self.failed = true;
-                }
-            }
-        }
-        let r = self.renderer.as_mut()?;
+        let r = renderer_on_demand(
+            self.renderer,
+            self.failed,
+            "drawn images are not read back",
+            |_| {},
+        )?;
         let f = Frame {
             width,
             color_image: image,
@@ -482,10 +506,7 @@ impl Devices for Media {
         let Some(path) = &self.wav_path else {
             return;
         };
-        // Whole left/right frames of big-endian 16-bit samples.
-        let samples: Vec<i16> = (0..(len & !3) / 2)
-            .map(|i| ctx.mem.read_u16(addr + 2 * i) as i16)
-            .collect();
+        let samples = samples(ctx, addr, len);
         let result = (|| {
             if self.wav.is_none() {
                 self.wav = Some(Wav::new(BufWriter::new(File::create(path)?), self.rate)?);

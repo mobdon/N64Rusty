@@ -24,7 +24,7 @@
 //! is how this path is tested.
 
 use std::process::ExitCode;
-use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -64,9 +64,7 @@ impl Devices for Live {
         if self.rate == 0 {
             return;
         }
-        let samples = (0..(len & !3) / 2)
-            .map(|i| ctx.mem.read_u16(addr + 2 * i) as i16)
-            .collect();
+        let samples = crate::media::samples(ctx, addr, len);
         // Full when the speakers are not open (or stalled): drop the buffer.
         let _ = self.sound.try_send((self.rate, samples));
     }
@@ -161,17 +159,9 @@ impl Guest for Screen {
     fn frame(&mut self, _frame: u64, pads: &Pads) {
         // Blocks while the game is still busy with the last frame, so a
         // slow frame slows the game down instead of dropping input.
-        let mut pads = *pads;
-        loop {
-            match self.input.try_send(pads) {
-                Ok(()) => break,
-                Err(TrySendError::Full(p)) => {
-                    pads = p;
-                    std::thread::sleep(Duration::from_micros(500));
-                }
-                // The game side is gone; the process is exiting.
-                Err(TrySendError::Disconnected(_)) => return,
-            }
+        if self.input.send(*pads).is_err() {
+            // The game side is gone; the process is exiting.
+            return;
         }
         if self.blend.is_some() {
             self.redraw();
@@ -267,10 +257,7 @@ impl Screen {
 /// pictures.
 fn profile_window(renderer: &mut n64rusty_gfx::Renderer) {
     static EVERY: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
-    let Some(every) = *EVERY.get_or_init(|| {
-        let v = std::env::var("N64RUSTY_PROFILE").ok()?;
-        Some(v.parse().unwrap_or(120u32).max(1))
-    }) else {
+    let Some(every) = *EVERY.get_or_init(crate::media::profile_every::<u32>) else {
         return;
     };
     if renderer.stats().frames >= every {
@@ -293,13 +280,17 @@ pub fn play(
     run: impl FnOnce(Box<dyn Devices>) -> u8 + Send + 'static,
 ) -> ExitCode {
     // A crash closes the window and often the console with it: keep the
-    // message in crash.txt in the per-game folder as well.
+    // message in crash.txt in the current folder (where the program was
+    // started from, not necessarily next to it) as well.
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         default_hook(info);
         let thread = std::thread::current().name().unwrap_or("?").to_string();
         let trace = std::backtrace::Backtrace::force_capture();
-        let _ = std::fs::write("crash.txt", format!("thread {thread}: {info}\n\n{trace}\n"));
+        let text = format!("thread {thread}: {info}\n\n{trace}\n");
+        if let Err(e) = std::fs::write("crash.txt", text) {
+            eprintln!("warning: could not write crash.txt: {e}");
+        }
     }));
     let (live, mut screen) = pair(media);
     screen.widescreen = cfg.window.widescreen;

@@ -111,7 +111,15 @@ fn runnable(path: &std::path::Path) -> std::path::PathBuf {
     ));
     match std::fs::create_dir_all(&dir).and_then(|()| std::fs::copy(path, &copy)) {
         Ok(_) => copy,
-        Err(_) => path.to_path_buf(),
+        Err(e) => {
+            eprintln!(
+                "warning: mod {}: no fresh copy in {} ({e}), so it is loaded from where it is; \
+                 a second game in this program would get the copy already loaded",
+                path.display(),
+                dir.display()
+            );
+            path.to_path_buf()
+        }
     }
 }
 
@@ -255,7 +263,7 @@ fn dispatch(c: &mut Ctx) {
     STACK.with_borrow_mut(|s| s.pop());
 }
 
-/// Routes every hooked address through [`dispatch`]; a hook on a replaced
+/// Routes every hooked address through `dispatch`; a hook on a replaced
 /// system routine wraps the replacement, so this runs after those are in.
 pub fn route(c: &mut Ctx) {
     for a in hooked().into_keys() {
@@ -490,7 +498,7 @@ mod tests {
         let sha = n64rusty_rom::Rom::from_bytes(cart).unwrap().sha256;
         *crate::ROM_PATH.lock().unwrap() = Some(dir.join("played.z64"));
         crate::WINDOW.store(true, std::sync::atomic::Ordering::Relaxed);
-        let data = b"OOT>\x01";
+        let data = b"DATA\x01";
         let ok = switch_game(sha.as_ptr(), sha.len(), data.as_ptr(), data.len());
         crate::WINDOW.store(false, std::sync::atomic::Ordering::Relaxed);
         let asked = n64rusty_host::one_window::take_request();

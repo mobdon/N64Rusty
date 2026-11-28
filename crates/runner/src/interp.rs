@@ -36,7 +36,7 @@ static WATCHED: AtomicU32 = AtomicU32::new(0);
 
 fn watch_addr() -> Option<usize> {
     let v = std::env::var("N64RUSTY_WATCH").ok()?;
-    let a = u32::from_str_radix(v.trim_start_matches("0x"), 16).ok()?;
+    let a = crate::parse_hex(&v).ok()?;
     Some((a & 0x1FFF_FFFC) as usize)
 }
 

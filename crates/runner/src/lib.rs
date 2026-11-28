@@ -28,7 +28,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
-use n64rusty_rom::{Cic, Rom};
+use n64rusty_rom::{Cic, Rom, BOOT_SEGMENT_ROM};
 use n64rusty_runtime::{sx32, Ctx, Io, Memory};
 
 /// What a generated game crate provides.
@@ -45,6 +45,40 @@ pub struct Game {
 pub const RAM_SIZE: usize = 0x40_0000;
 /// RAM size with the Expansion Pak (`--expansion`).
 pub const RAM_SIZE_EXPANDED: usize = 0x80_0000;
+
+/// The physical address bits of a KSEG0/KSEG1 address.
+pub(crate) const PHYS_MASK: u32 = 0x1FFF_FFFF;
+/// Bytes of RSP memory (DMEM and IMEM).
+const SP_MEM_SIZE: usize = 0x2000;
+/// The largest cartridge ROM: 64 MiB.
+const MAX_ROM_SIZE: u64 = 0x400_0000;
+/// File extensions of ROM files (big-endian, little-endian, byte-swapped).
+pub const ROM_EXTENSIONS: [&str; 3] = ["z64", "n64", "v64"];
+
+/// Where the boot code leaves its boot information in low RAM for the
+/// system library (`osTvType`, `osRomBase`, `osResetType`, `osCicId`,
+/// `osVersion`, `osMemSize`).
+mod boot_info {
+    /// TV type: 1 is NTSC.
+    pub const TV_TYPE: u32 = 0x8000_0300;
+    /// The cartridge's PI base address.
+    pub const ROM_BASE: u32 = 0x8000_0308;
+    /// Reset type: 0 is a cold reset.
+    pub const RESET_TYPE: u32 = 0x8000_030C;
+    /// The boot code's (CIC) id.
+    pub const CIC_ID: u32 = 0x8000_0310;
+    /// Library version.
+    pub const VERSION: u32 = 0x8000_0314;
+    /// RAM size in bytes.
+    pub const MEM_SIZE: u32 = 0x8000_0318;
+}
+
+/// A hex number with an optional `0x` prefix, as flags, configs and run
+/// logs write addresses. (Any number of leading `0x` are taken off, as the
+/// copies this replaces did.)
+pub(crate) fn parse_hex(s: &str) -> Result<u32, std::num::ParseIntError> {
+    u32::from_str_radix(s.trim_start_matches("0x"), 16)
+}
 
 /// Whether this run has the Expansion Pak plugged in.
 static EXPANSION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -72,7 +106,7 @@ pub fn boot(rom: &Rom, game: &Game) -> Result<Ctx, String> {
         },
     );
     let seg = rom.boot_segment();
-    let at = (rom.entry() & 0x1FFF_FFFF) as usize;
+    let at = (rom.entry() & PHYS_MASK) as usize;
     if at >= size {
         return Err(format!(
             "ROM entry point {:#010x} is outside RAM ({size:#x} bytes)",
@@ -94,12 +128,12 @@ pub fn boot(rom: &Rom, game: &Game) -> Result<Ctx, String> {
         Cic::Cic6106 => 6,
         Cic::Unknown(_) => 2,
     };
-    mem.write_u32(0x8000_0300, 1);
-    mem.write_u32(0x8000_0308, 0xB000_0000);
-    mem.write_u32(0x8000_030C, 0);
-    mem.write_u32(0x8000_0310, cic_id);
-    mem.write_u32(0x8000_0314, 0);
-    mem.write_u32(0x8000_0318, size as u32);
+    mem.write_u32(boot_info::TV_TYPE, 1);
+    mem.write_u32(boot_info::ROM_BASE, 0xB000_0000);
+    mem.write_u32(boot_info::RESET_TYPE, 0);
+    mem.write_u32(boot_info::CIC_ID, cic_id);
+    mem.write_u32(boot_info::VERSION, 0);
+    mem.write_u32(boot_info::MEM_SIZE, size as u32);
     let mut ctx = Ctx::new(mem);
     (game.register)(&mut ctx);
     // A stack at the top of RAM until the game sets its own.
@@ -193,42 +227,10 @@ fn record_run(
     if let os::Outcome::Panic(m) = outcome {
         if let Some(rest) = m.strip_prefix("call to unknown guest function ") {
             let addr_text = rest.split_whitespace().next().unwrap_or("");
-            let addr = u32::from_str_radix(addr_text.trim_start_matches("0x"), 16).unwrap_or(0);
-            // Which copy put code there: the latest one covering it.
-            // The copy must still be what is there: the game may have
-            // written other code over it since (unpacking, for example).
-            let still_there = |r: u32, ram: u32| {
-                let (at, from) = (
-                    (addr & 0x1FFF_FFFC) as usize,
-                    (r + (addr & !3) - ram) as usize,
-                );
-                let n = 16.min(ram_now.len().saturating_sub(at));
-                rom.get(from..from + n)
-                    .is_some_and(|b| b == &ram_now[at..at + n])
-            };
-            let src = dma
-                .iter()
-                .rev()
-                .find(|(_, ram, len)| addr >= *ram && addr < ram.wrapping_add(*len))
-                .filter(|(r, ram, _)| still_there(*r, *ram));
-            // No copy covers it: code in the boot image reached only
-            // through a pointer, written with a zero copy.
-            let mut found = src.copied().unwrap_or((0, 0, 0));
-            if src.is_none() && addr != 0 {
-                if let Some((lo, hi)) = written_code(ram_now, rom, entry, addr) {
-                    let dir = local.join("images");
-                    std::fs::create_dir_all(&dir)?;
-                    let at = |a: u32| (a & 0x1FFF_FFFF) as usize;
-                    std::fs::write(
-                        dir.join(format!("{lo:08x}_{addr:08x}.bin")),
-                        &ram_now[at(lo)..at(hi)],
-                    )?;
-                    found = (u32::MAX, lo, hi - lo);
-                }
-            }
-            let (rom, ram, len) = found;
+            let addr = parse_hex(addr_text).unwrap_or(0);
             // A call to address 0 is a null pointer, not code to translate.
             if addr != 0 {
+                let (rom, ram, len) = missing_source(local, dma, ram_now, rom, entry, addr)?;
                 new_missing.push(format!("{addr:#010x} {rom:#010x} {ram:#010x} {len:#x}"));
             }
         }
@@ -258,13 +260,59 @@ fn record_run(
     Ok(())
 }
 
+/// Where the code at `addr`, called but never translated, came from:
+/// (rom, ram, length) of the cartridge copy that put it there, all zero for
+/// the boot image, or rom `0xffffffff` for code the game wrote itself (its
+/// RAM is then saved to `images/` in `local`).
+fn missing_source(
+    local: &std::path::Path,
+    dma: &[(u32, u32, u32)],
+    ram_now: &[u8],
+    rom: &[u8],
+    entry: u32,
+    addr: u32,
+) -> std::io::Result<(u32, u32, u32)> {
+    // Which copy put code there: the latest one covering it.
+    // The copy must still be what is there: the game may have
+    // written other code over it since (unpacking, for example).
+    let still_there = |r: u32, ram: u32| {
+        let (at, from) = (
+            (addr & 0x1FFF_FFFC) as usize,
+            (r + (addr & !3) - ram) as usize,
+        );
+        let n = 16.min(ram_now.len().saturating_sub(at));
+        rom.get(from..from + n)
+            .is_some_and(|b| b == &ram_now[at..at + n])
+    };
+    let src = dma
+        .iter()
+        .rev()
+        .find(|(_, ram, len)| addr >= *ram && addr < ram.wrapping_add(*len))
+        .filter(|(r, ram, _)| still_there(*r, *ram));
+    if let Some(&found) = src {
+        return Ok(found);
+    }
+    if let Some((lo, hi)) = written_code(ram_now, rom, entry, addr) {
+        let dir = local.join("images");
+        std::fs::create_dir_all(&dir)?;
+        let at = |a: u32| (a & PHYS_MASK) as usize;
+        std::fs::write(
+            dir.join(format!("{lo:08x}_{addr:08x}.bin")),
+            &ram_now[at(lo)..at(hi)],
+        )?;
+        return Ok((u32::MAX, lo, hi - lo));
+    }
+    // No copy covers it: code in the boot image reached only
+    // through a pointer, written with a zero copy.
+    Ok((0, 0, 0))
+}
+
 /// See `N64RUSTY_PAGES_OUT` where it is read: `spec` is `file:lo-hi`.
 /// Pages no TLB entry maps after a refill are saved as zeros.
 fn save_pages(ctx: &mut Ctx, spec: &str) -> Result<(), String> {
     let (file, range) = spec.rsplit_once(':').ok_or("needs file:lo-hi")?;
     let (lo, hi) = range.split_once('-').ok_or("needs file:lo-hi")?;
-    let hex =
-        |s: &str| u32::from_str_radix(s.trim_start_matches("0x"), 16).map_err(|e| e.to_string());
+    let hex = |s: &str| parse_hex(s).map_err(|e| e.to_string());
     let (lo, hi) = (hex(lo)? & !0xFFF, hex(hi)?);
     let mut out = Vec::new();
     let mut missing = 0;
@@ -293,10 +341,13 @@ fn save_pages(ctx: &mut Ctx, spec: &str) -> Result<(), String> {
 fn written_code(ram: &[u8], rom: &[u8], entry: u32, addr: u32) -> Option<(u32, u32)> {
     const GAP: usize = 4096;
     const MAX: usize = 4 << 20;
-    let at = (addr & 0x1FFF_FFFF) as usize & !3;
-    let boot = (entry & 0x1FFF_FFFF) as usize;
+    let at = (addr & PHYS_MASK) as usize & !3;
+    let boot = (entry & PHYS_MASK) as usize;
     let here = ram.get(at..at + 64)?;
-    let in_boot = at >= boot && rom.get(0x1000 + at - boot..0x1000 + at - boot + 64) == Some(here);
+    let in_boot = at >= boot && {
+        let from = BOOT_SEGMENT_ROM + at - boot;
+        rom.get(from..from + 64) == Some(here)
+    };
     if in_boot {
         return None;
     }
@@ -312,15 +363,9 @@ fn written_code(ram: &[u8], rom: &[u8], entry: u32, addr: u32) -> Option<(u32, u
     while hi < ram.len() && hi - at < MAX && !zero_run(hi) {
         hi += 4;
     }
-    let base = addr & !0x1FFF_FFFF;
+    let base = addr & !PHYS_MASK;
     Some((base | lo as u32, base | hi as u32))
 }
-
-/// Where `--ram-out` saves RAM at the end of the run.
-static RAM_OUT: Mutex<Option<PathBuf>> = Mutex::new(None);
-
-/// The address range `--interpret` runs in the reference interpreter.
-static INTERPRET: Mutex<Option<(u32, u32)>> = Mutex::new(None);
 
 static NAMES: Mutex<BTreeMap<u32, String>> = Mutex::new(BTreeMap::new());
 /// The ROM file this run plays, for [`find_rom`].
@@ -346,16 +391,15 @@ pub fn find_rom_path(sha256: &str) -> Option<(PathBuf, Vec<u8>)> {
         dirs.extend(sibs.flatten().map(|e| e.path()).filter(|p| p.is_dir()));
     }
     let n64 = |p: &PathBuf| {
-        p.extension().is_some_and(|x| {
-            ["z64", "n64", "v64"].contains(&x.to_string_lossy().to_lowercase().as_str())
-        })
+        p.extension()
+            .is_some_and(|x| ROM_EXTENSIONS.contains(&x.to_string_lossy().to_lowercase().as_str()))
     };
     for d in dirs {
         let Ok(files) = std::fs::read_dir(&d) else {
             continue;
         };
         for p in files.flatten().map(|e| e.path()).filter(n64) {
-            let fits = std::fs::metadata(&p).is_ok_and(|m| m.len() <= 0x400_0000);
+            let fits = std::fs::metadata(&p).is_ok_and(|m| m.len() <= MAX_ROM_SIZE);
             let rom = fits.then(|| std::fs::read(&p).ok()).flatten();
             if let Some(Ok(r)) = rom.map(Rom::from_bytes) {
                 if r.sha256 == sha256 {
@@ -406,8 +450,7 @@ pub fn crash_report(ctx: &Ctx) -> String {
             let Some((a, n)) = item.split_once(':') else {
                 continue;
             };
-            let hex = |t: &str| u32::from_str_radix(t.trim_start_matches("0x"), 16).ok();
-            let (Some(a), Some(n)) = (hex(a), hex(n)) else {
+            let (Ok(a), Ok(n)) = (parse_hex(a), parse_hex(n)) else {
                 continue;
             };
             for row in (0..n).step_by(16) {
@@ -460,42 +503,64 @@ pub fn main_with(game: Game, devices: Option<Box<dyn devices::Devices>>) -> Exit
     main_args(game, devices, std::env::args().skip(1).collect())
 }
 
-/// Like [`main_with`], with the given command-line arguments.
-pub fn main_args(
-    game: Game,
-    devices: Option<Box<dyn devices::Devices>>,
-    args: Vec<String>,
-) -> ExitCode {
-    let mut rom_path = None;
-    let mut symbols = Vec::new();
-    let mut frames = None;
-    let mut window = false;
-    let mut run_config = None;
-    // The per-game folder: config, and run logs the translator reads.
-    let mut local = PathBuf::from("..");
-    let mut capture = None;
-    let mut every = 60;
-    let mut scale = 1;
-    let mut wav = None;
-    let mut input = None;
-    let mut save = None;
-    let mut wide = false;
-    let mut between = false;
+/// The command-line flags of one run (see [`main`]).
+struct Args {
+    rom_path: Option<PathBuf>,
+    symbols: Vec<PathBuf>,
+    frames: Option<u64>,
+    window: bool,
+    run_config: Option<PathBuf>,
+    /// The per-game folder: config, and run logs the translator reads.
+    local: PathBuf,
+    capture: Option<PathBuf>,
+    every: u64,
+    scale: u32,
+    wav: Option<PathBuf>,
+    input: Option<PathBuf>,
+    save: Option<PathBuf>,
+    wide: bool,
+    between: bool,
+    /// Where `--ram-out` saves RAM at the end of the run.
+    ram_out: Option<PathBuf>,
+    /// The address range `--interpret` runs in the reference interpreter.
+    interpret: Option<(u32, u32)>,
+}
+
+/// Reads the flags in `args`. Flags that set a run-wide setting (`--poke`,
+/// `--hash-out`, `--expansion`) set it here. Fails, after printing why,
+/// with the exit code for a bad command line.
+fn parse_args(args: &[String]) -> Result<Args, ExitCode> {
+    let mut a = Args {
+        rom_path: None,
+        symbols: Vec::new(),
+        frames: None,
+        window: false,
+        run_config: None,
+        local: PathBuf::from(".."),
+        capture: None,
+        every: 60,
+        scale: 1,
+        wav: None,
+        input: None,
+        save: None,
+        wide: false,
+        between: false,
+        ram_out: None,
+        interpret: None,
+    };
     // A player plays one game after another in the same program: nothing a
     // flag set for the last game carries over.
-    *RAM_OUT.lock().unwrap() = None;
-    *INTERPRET.lock().unwrap() = None;
     os::set_pokes(Vec::new());
     EXPANSION.store(false, std::sync::atomic::Ordering::Relaxed);
     let mut it = args.iter();
-    while let Some(a) = it.next() {
-        let flag = a.as_str();
+    while let Some(arg) = it.next() {
+        let flag = arg.as_str();
         if !flag.starts_with("--") {
-            rom_path = Some(PathBuf::from(a));
+            a.rom_path = Some(PathBuf::from(arg));
             continue;
         }
         if flag == "--window" {
-            window = true;
+            a.window = true;
             continue;
         }
         if flag == "--expansion" {
@@ -503,24 +568,24 @@ pub fn main_args(
             continue;
         }
         if flag == "--capture-wide" {
-            wide = true;
+            a.wide = true;
             continue;
         }
         if flag == "--capture-between" {
-            between = true;
+            a.between = true;
             continue;
         }
         let Some(v) = it.next() else {
             eprintln!("error: {flag} needs a value");
-            return ExitCode::from(2);
+            return Err(ExitCode::from(2));
         };
         let number = || v.parse::<u64>().ok();
         match flag {
-            "--symbols" | "--config" => symbols.push(PathBuf::from(v)),
-            "--local" => local = PathBuf::from(v),
-            "--capture" => capture = Some(PathBuf::from(v)),
-            "--wav" => wav = Some(PathBuf::from(v)),
-            "--input" => input = Some(PathBuf::from(v)),
+            "--symbols" | "--config" => a.symbols.push(PathBuf::from(v)),
+            "--local" => a.local = PathBuf::from(v),
+            "--capture" => a.capture = Some(PathBuf::from(v)),
+            "--wav" => a.wav = Some(PathBuf::from(v)),
+            "--input" => a.input = Some(PathBuf::from(v)),
             "--poke" => {
                 match std::fs::read_to_string(v)
                     .map_err(|e| e.to_string())
@@ -529,48 +594,78 @@ pub fn main_args(
                     Ok(p) => os::set_pokes(p),
                     Err(e) => {
                         eprintln!("error: poke script {v}: {e}");
-                        return ExitCode::from(2);
+                        return Err(ExitCode::from(2));
                     }
                 }
             }
-            "--ram-out" => *RAM_OUT.lock().unwrap() = Some(PathBuf::from(v)),
+            "--ram-out" => a.ram_out = Some(PathBuf::from(v)),
             "--hash-out" => match std::fs::File::create(v) {
                 Ok(f) => os::set_hash_out(f),
                 Err(e) => {
                     eprintln!("error: {v}: {e}");
-                    return ExitCode::from(2);
+                    return Err(ExitCode::from(2));
                 }
             },
             "--interpret" => {
-                let range = v.split_once('-').and_then(|(a, b)| {
-                    let hex = |s: &str| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok();
-                    Some((hex(a)?, hex(b)?))
+                let range = v.split_once('-').and_then(|(lo, hi)| {
+                    let hex = |s: &str| parse_hex(s).ok();
+                    Some((hex(lo)?, hex(hi)?))
                 });
-                let Some(range) = range.filter(|(a, b)| a < b) else {
+                let Some(range) = range.filter(|(lo, hi)| lo < hi) else {
                     eprintln!("error: --interpret needs a hex range like 80000400-80100000");
-                    return ExitCode::from(2);
+                    return Err(ExitCode::from(2));
                 };
-                *INTERPRET.lock().unwrap() = Some(range);
+                a.interpret = Some(range);
             }
-            "--save" => save = Some(PathBuf::from(v)),
-            "--run" => run_config = Some(PathBuf::from(v)),
+            "--save" => a.save = Some(PathBuf::from(v)),
+            "--run" => a.run_config = Some(PathBuf::from(v)),
             "--frames" | "--capture-every" | "--capture-scale" => {
                 let Some(n) = number() else {
                     eprintln!("error: {flag} needs a number, not {v:?}");
-                    return ExitCode::from(2);
+                    return Err(ExitCode::from(2));
                 };
                 match flag {
-                    "--frames" => frames = Some(n),
-                    "--capture-every" => every = n,
-                    _ => scale = n.min(8) as u32,
+                    "--frames" => a.frames = Some(n),
+                    "--capture-every" => a.every = n,
+                    _ => a.scale = n.min(8) as u32,
                 }
             }
             _ => {
                 eprintln!("error: unknown option {flag}");
-                return ExitCode::from(2);
+                return Err(ExitCode::from(2));
             }
         }
     }
+    Ok(a)
+}
+
+/// Like [`main_with`], with the given command-line arguments.
+pub fn main_args(
+    game: Game,
+    devices: Option<Box<dyn devices::Devices>>,
+    args: Vec<String>,
+) -> ExitCode {
+    let Args {
+        rom_path,
+        mut symbols,
+        frames,
+        window,
+        run_config,
+        local,
+        capture,
+        every,
+        scale,
+        wav,
+        input,
+        save,
+        wide,
+        between,
+        ram_out,
+        interpret,
+    } = match parse_args(&args) {
+        Ok(a) => a,
+        Err(code) => return code,
+    };
     if devices.is_some() && (capture.is_some() || wav.is_some() || input.is_some()) {
         eprintln!("warning: --capture, --wav and --input only apply to the default devices");
     }
@@ -658,10 +753,12 @@ pub fn main_args(
         }
     };
     let mut cart = rom.bytes().to_vec();
+    // Only the copy the mods may patch is kept for the run.
+    drop(rom);
     mods::install(libs, &mut ctx, &mut cart, game.sha256);
     let rom_bytes: Arc<[u8]> = Arc::from(cart);
     ctx.mem.set_io(Io {
-        sp_mem: vec![0; 0x2000],
+        sp_mem: vec![0; SP_MEM_SIZE],
         rom: rom_bytes.clone(),
         regs: Default::default(),
         flash: Default::default(),
@@ -671,7 +768,7 @@ pub fn main_args(
     println!("replaced {} system routines", hooked.len());
     *NAMES.lock().unwrap() = names;
     let (snap_rom, snap_entry) = (rom_bytes.clone(), game.entry);
-    ctx.interpret = *INTERPRET.lock().unwrap();
+    ctx.interpret = interpret;
     interp::install(
         &mut ctx,
         Box::new(move |ram, addr| written_code(ram, &snap_rom, snap_entry, addr)),
@@ -728,16 +825,19 @@ pub fn main_args(
     );
     if window {
         return live::play(&run_config, media, move |devices| {
-            run_and_report(ctx, entry, rom_bytes, frames, devices, save, &local)
+            run_and_report(
+                ctx, entry, rom_bytes, frames, devices, save, &local, ram_out,
+            )
         });
     }
     let devices = devices.unwrap_or_else(|| Box::new(media));
     ExitCode::from(run_and_report(
-        ctx, entry, rom_bytes, frames, devices, save, &local,
+        ctx, entry, rom_bytes, frames, devices, save, &local, ram_out,
     ))
 }
 
 /// Runs the game to its end and prints the report; returns the exit code.
+#[allow(clippy::too_many_arguments)]
 fn run_and_report(
     ctx: &'static mut Ctx,
     entry: u32,
@@ -746,6 +846,7 @@ fn run_and_report(
     devices: Box<dyn devices::Devices>,
     save: save::Save,
     local: &std::path::Path,
+    ram_out: Option<PathBuf>,
 ) -> u8 {
     let rom = rom_bytes.clone();
     let (outcome, report, frames_run) = os::run(ctx, entry, rom_bytes, frames, devices, save);
@@ -768,7 +869,7 @@ fn run_and_report(
         (ctx.r[31] as u32).wrapping_sub(8)
     );
     print!("{device_summary}");
-    if let Some(p) = RAM_OUT.lock().unwrap().as_ref() {
+    if let Some(p) = &ram_out {
         if let Err(e) = std::fs::write(p, ctx.mem.bytes()) {
             eprintln!("warning: could not write RAM to {}: {e}", p.display());
         }

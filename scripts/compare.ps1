@@ -10,7 +10,8 @@
 #             one N64RUSTY_PLAYER_DATA names, so games set up by hand run.
 # -Frames     how long each game runs (default 4000).
 # Prints, per game, SAME or DIFF and each build's time. A DIFF means the
-# change altered what the game does (a run is otherwise repeatable).
+# change altered what the game does (a run is otherwise repeatable), or that
+# a build exited with a non-zero code (both codes are printed then).
 
 param(
     [Parameter(Mandatory = $true)][string]$Old,
@@ -47,6 +48,7 @@ if (-not $games) { throw "no .z64, .n64 or .v64 file in $Roms" }
 $bad = 0
 foreach ($g in $games) {
     $times = @{}
+    $codes = @{}
     foreach ($b in "old", "new") {
         $dir = Join-Path $work $b
         $ram = Join-Path $dir "ram.bin"
@@ -57,15 +59,20 @@ foreach ($g in $games) {
             -ArgumentList "`"$($g.FullName)`"", "--frames", $Frames, "--ram-out", "`"$ram`"" `
             -RedirectStandardOutput (Join-Path $dir "log.txt") -RedirectStandardError (Join-Path $dir "err.txt")
         $times[$b] = [math]::Round($t.Elapsed.TotalSeconds, 1)
+        $codes[$b] = $p.ExitCode
         if (-not (Test-Path -LiteralPath $ram)) { $times[$b] = "no RAM" }
     }
     $a = Get-FileHash (Join-Path $work "old\ram.bin") -ErrorAction SilentlyContinue
     $n = Get-FileHash (Join-Path $work "new\ram.bin") -ErrorAction SilentlyContinue
-    $same = $a -and $n -and $a.Hash -eq $n.Hash
+    # The RAM is written before the run's outcome is known, so a game that
+    # panics or hangs the same way in both builds shows only in the exit codes.
+    $exitOk = $codes["old"] -eq 0 -and $codes["new"] -eq 0
+    $same = $a -and $n -and $a.Hash -eq $n.Hash -and $exitOk
     $verdict = if ($same) { "SAME" } else { "DIFF" }
     Write-Host ("{0,-4} {1}  old {2} s, new {3} s" -f $verdict, $g.Name, $times["old"], $times["new"])
     if (-not $same) {
         $bad++
+        if (-not $exitOk) { Write-Host ("     exit codes: old {0}, new {1}" -f $codes["old"], $codes["new"]) }
         # This game's logs and RAM, before the next game's run replaces them.
         $keep = Join-Path $work ("game" + $bad)
         foreach ($b in "old", "new") {

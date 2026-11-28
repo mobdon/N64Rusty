@@ -15,8 +15,9 @@ pub struct Pad {
     pub connected: bool,
     /// Button bits, as the console reports them.
     pub buttons: u16,
-    /// Stick position, -128..127.
+    /// Stick position, -128..127: left to right.
     pub stick_x: i8,
+    /// Stick position, -128..127: down to up.
     pub stick_y: i8,
 }
 
