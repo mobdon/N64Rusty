@@ -15,7 +15,7 @@
 //! at priority 0 (the idle thread) is never resumed; it only exists to be
 //! preempted.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -185,6 +185,9 @@ pub struct State {
     ai: Ai,
     /// The baton holder saw the run end and will never run guest code again.
     halted: bool,
+    /// Message queues already warned about as unusable, so a thread
+    /// blocked on one does not warn again at every reschedule.
+    bad_queues: HashSet<u32>,
 }
 
 /// The audio interface's two-buffer queue, timed by the guest clock, so a
@@ -487,28 +490,41 @@ impl State {
     }
 }
 
+/// Largest message count a queue can have: libultra keeps it in an s32, and
+/// a negative one makes the queue always full, so it never holds a message.
+const MESG_COUNT_MAX: u32 = i32::MAX as u32;
+
 /// Puts a message on a guest queue if there is room, waking the
-/// highest-priority receiver. Returns false if the queue is full.
+/// highest-priority receiver. Returns false if the queue is full, or is not
+/// set up (warned about once).
 fn put_message(c: &mut Ctx, st: &mut State, mq: u32, msg: u32, jam: bool) -> bool {
     let valid = c.mem.read_u32(mq + 8);
     let first = c.mem.read_u32(mq + 12);
     let count = c.mem.read_u32(mq + 16);
     let buf = c.mem.read_u32(mq + 20);
-    if count == 0 || valid >= count {
+    if count == 0 || count > MESG_COUNT_MAX || valid >= count {
         return false;
     }
-    assert!(
-        first < count,
-        "message queue {mq:#010x} is not set up: valid {valid}, first {first}, count {count}, buffer {buf:#010x}, called from {:#010x}",
-        c.r[31] as u32
-    );
-    if jam {
-        let f = (first + count - 1) % count;
-        c.mem.write_u32(buf + 4 * f, msg);
-        c.mem.write_u32(mq + 12, f);
+    if first >= count {
+        let why = format!(
+            "is not set up: valid {valid}, first {first}, count {count}, buffer {buf:#010x}"
+        );
+        warn_bad_queue(c, st, mq, &why);
+        return false;
+    }
+    // The slot before the first (jam) or after the last; both below
+    // `count`, worked out without overflowing for any count.
+    let slot = if jam {
+        first.checked_sub(1).unwrap_or(count - 1)
     } else {
-        let slot = (first + valid) % count;
-        c.mem.write_u32(buf + 4 * slot, msg);
+        ((u64::from(first) + u64::from(valid)) % u64::from(count)) as u32
+    };
+    let Some(at) = slot_address(c, st, mq, buf, slot) else {
+        return false;
+    };
+    c.mem.write_u32(at, msg);
+    if jam {
+        c.mem.write_u32(mq + 12, slot);
     }
     c.mem.write_u32(mq + 8, valid + 1);
     let waiter = st
@@ -532,7 +548,16 @@ fn take_message(c: &mut Ctx, st: &mut State, mq: u32) -> Option<u32> {
     let first = c.mem.read_u32(mq + 12);
     let count = c.mem.read_u32(mq + 16);
     let buf = c.mem.read_u32(mq + 20);
-    let msg = c.mem.read_u32(buf + 4 * first);
+    // The same checks as put_message: a queue with no slots, or a first
+    // slot outside them, has no message to give.
+    if count == 0 || count > MESG_COUNT_MAX || first >= count {
+        let why = format!(
+            "is not set up: valid {valid}, first {first}, count {count}, buffer {buf:#010x}"
+        );
+        warn_bad_queue(c, st, mq, &why);
+        return None;
+    }
+    let msg = c.mem.read_u32(slot_address(c, st, mq, buf, first)?);
     c.mem.write_u32(mq + 12, (first + 1) % count);
     c.mem.write_u32(mq + 8, valid - 1);
     let waiter = st
@@ -545,6 +570,33 @@ fn take_message(c: &mut Ctx, st: &mut State, mq: u32) -> Option<u32> {
         st.make_ready(w);
     }
     Some(msg)
+}
+
+/// Bytes of one message slot in a queue's buffer.
+const MESSAGE_BYTES: u32 = 4;
+
+/// The address of `slot` in the queue buffer at `buf`, or none (warned
+/// about once) when that word is not aligned RAM.
+fn slot_address(c: &Ctx, st: &mut State, mq: u32, buf: u32, slot: u32) -> Option<u32> {
+    // Wraps as the library's compiled sll and addu do.
+    let at = buf.wrapping_add(slot.wrapping_mul(MESSAGE_BYTES));
+    let phys = (c.mem.kseg0(at) & 0x1FFF_FFFF) as usize;
+    if at.is_multiple_of(MESSAGE_BYTES) && phys + MESSAGE_BYTES as usize <= c.mem.bytes().len() {
+        return Some(at);
+    }
+    let why = format!("has slot {slot} at {at:#010x} (buffer {buf:#010x}), outside RAM");
+    warn_bad_queue(c, st, mq, &why);
+    None
+}
+
+/// Warns that the queue at `mq` cannot be used, the first time only.
+fn warn_bad_queue(c: &Ctx, st: &mut State, mq: u32, why: &str) {
+    if st.bad_queues.insert(mq) {
+        eprintln!(
+            "warning: message queue {mq:#010x} {why}, called from {:#010x}",
+            c.r[31] as u32
+        );
+    }
 }
 
 /// Posts the message registered for a system event, if any.
@@ -596,7 +648,7 @@ fn deliver_due(c: &mut Ctx, st: &mut State) {
             st.timers.insert(
                 k,
                 Timer {
-                    at: t.at + t.interval,
+                    at: due_at(t.at, t.interval),
                     ..t
                 },
             );
@@ -828,6 +880,7 @@ pub fn run(
             flash_page: [0xFF; 128],
             ai: Ai::default(),
             halted: false,
+            bad_queues: HashSet::new(),
         }),
         cv: Condvar::new(),
         ctx: AtomicPtr::new(ctx as *mut Ctx),
@@ -1136,6 +1189,13 @@ fn os_get_count(c: &mut Ctx) {
     ret(c, t);
 }
 
+/// The clock count `after` ticks past `now`. The library counts a timer's
+/// time relative to now, so one too far off for the 64-bit count simply
+/// never comes due: saturate rather than wrap to a time already past.
+fn due_at(now: u64, after: u64) -> u64 {
+    now.saturating_add(after)
+}
+
 fn os_set_timer(c: &mut Ctx) {
     let t = arg(c, 0);
     let countdown = arg64(c, 2);
@@ -1150,7 +1210,7 @@ fn os_set_timer(c: &mut Ctx) {
     c.mem.write_u64(t + 0x10, first);
     c.mem.write_u32(t + 0x18, mq);
     c.mem.write_u32(t + 0x1C, msg);
-    let at = c.clock + first;
+    let at = due_at(c.clock, first);
     lock().timers.insert(
         t,
         Timer {
@@ -1456,15 +1516,17 @@ fn run_pif(pif: &mut [u8; 64], pads: &[Pad; 4], save: &mut Save) {
                 let eeprom = save.eeprom().len();
                 let reply: Option<Vec<u8>> = if ch == 4 && eeprom > 0 {
                     // Status (16 Kbit or 4 Kbit), read or write one 8-byte block.
-                    let block = usize::from(pif[cmd + 1]) * 8;
-                    match pif[cmd] {
-                        0x00 | 0xFF => {
+                    // The block number is only sent when there are two
+                    // bytes out; a shorter block reads or writes nothing.
+                    let block = (tx >= 2).then(|| usize::from(pif[cmd + 1]) * 8);
+                    match (pif[cmd], block) {
+                        (0x00 | 0xFF, _) => {
                             Some(vec![0x00, if eeprom > 512 { 0xC0 } else { 0x80 }, 0x00])
                         }
-                        0x04 if block + 8 <= eeprom => {
+                        (0x04, Some(block)) if block + 8 <= eeprom => {
                             Some(save.eeprom()[block..block + 8].to_vec())
                         }
-                        0x05 if block + 8 <= eeprom && tx >= 10 => {
+                        (0x05, Some(block)) if block + 8 <= eeprom && tx >= 10 => {
                             let data = pif[cmd + 2..cmd + 10].to_vec();
                             save.eeprom_write(block, &data);
                             Some(vec![0x00])
@@ -1986,7 +2048,7 @@ mod tests {
         };
         assert_eq!(status(&mut Save::in_memory())[5] & 0x80, 0x80, "no reply");
         let mut save = Save::in_memory();
-        save.set_eeprom(0x800);
+        save.set_eeprom(0x800).unwrap();
         assert_eq!(status(&mut save)[7..10], [0x00, 0xC0, 0x00]);
         // Write block 3 (10 out, 1 back), then read it (2 out, 8 back).
         let mut pif = [0u8; 64];
@@ -2074,6 +2136,138 @@ mod tests {
         assert_eq!(c_float(0.0001, 'g', 6), "0.0001");
         assert_eq!(c_float(100.0, 'G', 6), "100");
         assert_eq!(c_float(-3.25, 'f', 1), "-3.2");
+    }
+
+    /// A state with nothing running and no retrace due.
+    fn idle_state() -> State {
+        State {
+            threads: BTreeMap::new(),
+            current: None,
+            seq: 0,
+            events: HashMap::new(),
+            vi: None,
+            timers: BTreeMap::new(),
+            next_vi: u64::MAX,
+            time_offset: 0,
+            frames: 0,
+            frame_limit: u64::MAX,
+            done: None,
+            rom: Arc::from(Vec::new()),
+            framebuffer: 0,
+            devices: Box::new(crate::devices::Headless),
+            save: Save::in_memory(),
+            dma_log: Vec::new(),
+            pif: [0; 64],
+            report: String::new(),
+            flash_page: [0xFF; 128],
+            ai: Ai::default(),
+            halted: false,
+            bad_queues: HashSet::new(),
+        }
+    }
+
+    /// Writes an OSMesgQueue's valid, first, count and buffer words.
+    fn set_queue(c: &mut Ctx, mq: u32, valid: u32, first: u32, count: u32, buf: u32) {
+        for (k, v) in [valid, first, count, buf].into_iter().enumerate() {
+            c.mem.write_u32(mq + 8 + 4 * k as u32, v);
+        }
+    }
+
+    #[test]
+    fn a_queue_that_is_not_set_up_gives_no_message() {
+        const MQ: u32 = 0x8000_0100;
+        const BUF: u32 = 0x8000_0200;
+        let mut c = Ctx::new(n64rusty_runtime::Memory::new(0x1000));
+        let mut st = idle_state();
+        set_queue(&mut c, MQ, 1, 0, 0, BUF);
+        assert_eq!(take_message(&mut c, &mut st, MQ), None, "no slots");
+        set_queue(&mut c, MQ, 1, 5, 2, BUF);
+        assert_eq!(take_message(&mut c, &mut st, MQ), None, "first past count");
+        // A set-up queue still gives its message and moves on.
+        set_queue(&mut c, MQ, 1, 1, 2, BUF);
+        c.mem.write_u32(BUF + 4, 0x1234);
+        assert_eq!(take_message(&mut c, &mut st, MQ), Some(0x1234));
+        assert_eq!(c.mem.read_u32(MQ + 12), 0, "first wraps");
+        assert_eq!(c.mem.read_u32(MQ + 8), 0, "none left");
+    }
+
+    #[test]
+    fn a_queue_that_is_not_set_up_takes_no_message_and_warns_once() {
+        const MQ: u32 = 0x8000_0100;
+        const BUF: u32 = 0x8000_0200;
+        let mut c = Ctx::new(n64rusty_runtime::Memory::new(0x1000));
+        let mut st = idle_state();
+        set_queue(&mut c, MQ, 0, 5, 2, BUF);
+        for jam in [false, true, false] {
+            assert!(!put_message(&mut c, &mut st, MQ, 7, jam), "jam {jam}");
+        }
+        assert_eq!(c.mem.read_u32(MQ + 8), 0, "nothing put");
+        assert_eq!(c.mem.read_u32(MQ + 12), 5, "first left alone");
+        assert_eq!(st.bad_queues.len(), 1, "one warning");
+        // A set-up queue still takes messages at both ends.
+        set_queue(&mut c, MQ, 0, 0, 2, BUF);
+        assert!(put_message(&mut c, &mut st, MQ, 1, false));
+        assert!(put_message(&mut c, &mut st, MQ, 2, true));
+        assert!(!put_message(&mut c, &mut st, MQ, 3, false), "full");
+        assert_eq!(c.mem.read_u32(MQ + 12), 1, "jam moved first back");
+        assert_eq!([c.mem.read_u32(BUF), c.mem.read_u32(BUF + 4)], [1, 2]);
+    }
+
+    #[test]
+    fn a_queue_buffer_outside_ram_is_skipped() {
+        const MQ: u32 = 0x8000_0100;
+        let mut c = Ctx::new(n64rusty_runtime::Memory::new(0x1000));
+        let mut st = idle_state();
+        set_queue(&mut c, MQ, 1, 0, 2, 0x8010_0000);
+        assert_eq!(take_message(&mut c, &mut st, MQ), None, "past RAM");
+        assert!(!put_message(&mut c, &mut st, MQ, 7, false), "past RAM");
+        set_queue(&mut c, MQ, 1, 0, 2, 0x8000_0202);
+        assert_eq!(take_message(&mut c, &mut st, MQ), None, "misaligned");
+        assert_eq!(c.mem.read_u32(MQ + 8), 1, "queue left alone");
+        assert_eq!(st.bad_queues.len(), 1, "one warning per queue");
+        // Slot 1 of a buffer at the top of the address space wraps to 0.
+        c.mem.write_u32(0, 0x55);
+        set_queue(&mut c, MQ, 1, 1, 2, 0xFFFF_FFFC);
+        assert_eq!(take_message(&mut c, &mut st, MQ), Some(0x55));
+        // A count past i32::MAX is negative to libultra: always full.
+        const MQ2: u32 = 0x8000_0180;
+        set_queue(&mut c, MQ2, 0x7FFF_FFFF, 0x8000_0001, u32::MAX, 0x8000_0200);
+        assert!(!put_message(&mut c, &mut st, MQ2, 7, false));
+        assert_eq!(take_message(&mut c, &mut st, MQ2), None);
+        assert_eq!(c.mem.read_u32(0x8000_0204), 0, "nothing written");
+    }
+
+    #[test]
+    fn a_timer_past_the_end_of_the_count_never_comes_due() {
+        assert_eq!(due_at(10, 5), 15);
+        assert_eq!(due_at(u64::MAX - 1, 5), u64::MAX);
+        // A periodic timer due now, whose next time is past the count.
+        let mut c = Ctx::new(n64rusty_runtime::Memory::new(0x1000));
+        let mut st = idle_state();
+        c.clock = u64::MAX - 5;
+        let t = Timer {
+            at: c.clock,
+            interval: 100,
+            mq: 0x8000_0100,
+            msg: 1,
+        };
+        st.timers.insert(0x8000_0400, t);
+        deliver_due(&mut c, &mut st);
+        assert_eq!(st.timers[&0x8000_0400].at, u64::MAX);
+    }
+
+    #[test]
+    fn an_eeprom_command_with_nothing_sent_gets_no_reply() {
+        let pads = [Pad::default(); 4];
+        let mut save = Save::in_memory();
+        save.set_eeprom(0x200).unwrap();
+        // Four empty channels, padding, then channel 4 at byte 61 with
+        // nothing sent and nothing back: its command byte would be 63.
+        let mut pif = [0xFFu8; 64];
+        pif[..4].fill(0);
+        pif[61..64].copy_from_slice(&[0x40, 0, 0x04]);
+        run_pif(&mut pif, &pads, &mut save);
+        assert_eq!(pif[62] & 0x80, 0x80, "no reply");
     }
 
     #[test]

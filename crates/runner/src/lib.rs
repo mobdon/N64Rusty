@@ -49,13 +49,21 @@ pub const RAM_SIZE_EXPANDED: usize = 0x80_0000;
 /// Whether this run has the Expansion Pak plugged in.
 static EXPANSION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Builds a context with RAM laid out as the boot code leaves it.
-pub fn boot(rom: &Rom, game: &Game) -> Ctx {
-    let size = if EXPANSION.load(std::sync::atomic::Ordering::Relaxed) {
+/// The game's own RAM size this run, without the mods' RAM above it.
+pub(crate) fn ram_size() -> usize {
+    if EXPANSION.load(std::sync::atomic::Ordering::Relaxed) {
         RAM_SIZE_EXPANDED
     } else {
         RAM_SIZE
-    };
+    }
+}
+
+/// Builds a context with RAM laid out as the boot code leaves it.
+///
+/// Fails when the ROM header's entry point lies outside RAM, since the boot
+/// segment could not be copied there.
+pub fn boot(rom: &Rom, game: &Game) -> Result<Ctx, String> {
+    let size = ram_size();
     let mut mem = Memory::new(
         size + if WITH_MODS.load(std::sync::atomic::Ordering::Relaxed) {
             MOD_RAM
@@ -65,6 +73,12 @@ pub fn boot(rom: &Rom, game: &Game) -> Ctx {
     );
     let seg = rom.boot_segment();
     let at = (rom.entry() & 0x1FFF_FFFF) as usize;
+    if at >= size {
+        return Err(format!(
+            "ROM entry point {:#010x} is outside RAM ({size:#x} bytes)",
+            rom.entry()
+        ));
+    }
     let n = seg.len().min(size - at);
     mem.bytes_mut()[at..at + n].copy_from_slice(&seg[..n]);
     // Boot information the boot code stores in low RAM for the system
@@ -90,7 +104,7 @@ pub fn boot(rom: &Rom, game: &Game) -> Ctx {
     (game.register)(&mut ctx);
     // A stack at the top of RAM until the game sets its own.
     ctx.r[29] = sx32(0x8000_0000 + size as u32 - 0x10);
-    ctx
+    Ok(ctx)
 }
 
 /// Function names for reports, from `name = 0xADDR;` lines in local files.
@@ -628,12 +642,21 @@ pub fn main_args(
     // A game with a cartridge EEPROM says so in its config, with the size
     // in bytes: `eeprom = 0x200` (4 Kbit) or `0x800` (16 Kbit).
     if let Some(&size) = by_name.get("eeprom") {
-        save.set_eeprom(size as usize);
+        if let Err(e) = save.set_eeprom(size as usize) {
+            eprintln!("error: config: {e}");
+            return ExitCode::from(2);
+        }
     }
 
     let libs = mods::load();
     WITH_MODS.store(!libs.is_empty(), std::sync::atomic::Ordering::Relaxed);
-    let mut ctx = boot(&rom, &game);
+    let mut ctx = match boot(&rom, &game) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: {}: {e}", rom_path.display());
+            return ExitCode::from(2);
+        }
+    };
     let mut cart = rom.bytes().to_vec();
     mods::install(libs, &mut ctx, &mut cart, game.sha256);
     let rom_bytes: Arc<[u8]> = Arc::from(cart);
@@ -822,5 +845,36 @@ mod tests {
         let path = std::env::temp_dir().join(format!("no-such-map-{}.txt", std::process::id()));
         let e = read_names(std::slice::from_ref(&path)).unwrap_err();
         assert!(e.contains(&path.display().to_string()), "{e}");
+    }
+
+    /// A big-endian test ROM whose header starts the game at `entry`.
+    fn rom_with_entry(entry: u32) -> Rom {
+        const TEST_ROM_SIZE: usize = 0x2000;
+        const ENTRY_WORD: usize = 0x08;
+        let mut b = vec![0u8; TEST_ROM_SIZE];
+        b[..4].copy_from_slice(&0x8037_1240u32.to_be_bytes());
+        b[ENTRY_WORD..ENTRY_WORD + 4].copy_from_slice(&entry.to_be_bytes());
+        b[n64rusty_rom::BOOT_SEGMENT_ROM] = 0xAB;
+        Rom::from_bytes(b).unwrap()
+    }
+
+    const TEST_GAME: Game = Game {
+        register: |_| {},
+        entry: 0,
+        sha256: "",
+    };
+
+    #[test]
+    fn boot_copies_the_boot_segment_to_the_entry_point() {
+        let ctx = boot(&rom_with_entry(0x8000_0400), &TEST_GAME).unwrap();
+        assert_eq!(ctx.mem.read_u8(0x8000_0400), 0xAB);
+    }
+
+    #[test]
+    fn boot_rejects_an_entry_point_outside_ram() {
+        let e = boot(&rom_with_entry(0x8FFF_0000), &TEST_GAME)
+            .err()
+            .expect("an entry past RAM fails");
+        assert!(e.contains("0x8fff0000"), "{e}");
     }
 }

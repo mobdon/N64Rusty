@@ -20,6 +20,8 @@ const SRAM_SIZE: usize = 0x8000;
 /// The most save memory kept: banked SRAM reaches past 0xC_0000. A write
 /// beyond is dropped, so a stray DMA cannot grow the save without bound.
 const SRAM_MAX: usize = 0x10_0000;
+/// The EEPROM sizes a cartridge carries: 4 Kbit and 16 Kbit.
+const EEPROM_SIZES: [usize; 2] = [0x200, 0x800];
 
 /// Save memory and the file that backs it.
 pub struct Save {
@@ -57,14 +59,21 @@ impl Save {
     }
 
     /// Fits an EEPROM of `size` bytes (512 or 2048), read from its file if
-    /// there is one; bytes never written read as 0xFF.
-    pub fn set_eeprom(&mut self, size: usize) {
+    /// there is one; bytes never written read as 0xFF. Fails on any other
+    /// size, since cartridges only carry those two.
+    pub fn set_eeprom(&mut self, size: usize) -> Result<(), String> {
+        if !EEPROM_SIZES.contains(&size) {
+            return Err(format!(
+                "eeprom = {size:#x}: an EEPROM is 0x200 (4 Kbit) or 0x800 (16 Kbit) bytes"
+            ));
+        }
         let mut data = self
             .eep_file()
             .and_then(|f| std::fs::read(f).ok())
             .unwrap_or_default();
         data.resize(size, 0xFF);
         self.eeprom = data;
+        Ok(())
     }
 
     /// The EEPROM's bytes, empty if there is none.
@@ -148,13 +157,23 @@ mod tests {
         let f = dir("eep").join("save.sra");
         let mut s = Save::open(&f).unwrap();
         assert!(s.eeprom().is_empty(), "none unless asked for");
-        s.set_eeprom(0x200);
+        s.set_eeprom(0x200).unwrap();
         assert_eq!(s.eeprom()[..2], [0xFF, 0xFF]);
         s.eeprom_write(8, &[1, 2, 3, 4, 5, 6, 7, 8]);
         let mut again = Save::open(&f).unwrap();
-        again.set_eeprom(0x200);
+        again.set_eeprom(0x200).unwrap();
         assert_eq!(again.eeprom()[8..16], [1, 2, 3, 4, 5, 6, 7, 8]);
         assert!(!f.exists(), "SRAM untouched");
+    }
+
+    #[test]
+    fn an_eeprom_of_another_size_is_refused() {
+        let mut s = Save::in_memory();
+        let e = s.set_eeprom(0x400).unwrap_err();
+        assert!(e.contains("0x400"), "{e}");
+        assert!(s.eeprom().is_empty(), "no EEPROM fitted");
+        s.set_eeprom(0x800).unwrap();
+        assert_eq!(s.eeprom().len(), 0x800);
     }
 
     #[test]

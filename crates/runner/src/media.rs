@@ -3,6 +3,7 @@
 //! audio tasks through the audio command interpreter (output optionally
 //! recorded to a WAV file). Nothing opens a window or plays sound.
 
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::BufWriter;
 use std::panic::{self, AssertUnwindSafe};
@@ -11,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use n64rusty_audio::{AudioRsp, Wav};
-use n64rusty_gfx::{write_png, Frame, Interpreter, Readback, Renderer};
+use n64rusty_gfx::{write_png, Frame, Image, Interpreter, Readback, RenderError, Renderer};
 use n64rusty_host::script::Player;
 use n64rusty_runtime::Ctx;
 
@@ -91,6 +92,8 @@ pub struct Media {
     saved: Vec<PathBuf>,
     last: Option<(u64, usize, usize)>,
     warnings: Vec<String>,
+    /// Sizes of drawn images already warned about as not read back.
+    readback_warned: HashSet<(u32, u32)>,
     /// Where each finished frame goes for a live window, if anywhere.
     shown: Option<Arc<Mutex<Option<Frame>>>>,
     /// With `N64RUSTY_PROFILE=n`, a profile line every n shown frames.
@@ -193,6 +196,7 @@ impl Media {
             saved: Vec::new(),
             last: None,
             warnings: Vec::new(),
+            readback_warned: HashSet::new(),
             shown: None,
             profile: Profile::from_env(),
         }
@@ -337,6 +341,8 @@ impl Media {
 struct GpuReadback<'a> {
     renderer: &'a mut Option<Renderer>,
     failed: &'a mut bool,
+    /// Sizes already warned about as not read back.
+    warned: &'a mut HashSet<(u32, u32)>,
     /// Widescreen setting of saved frames, restored after each read.
     wide: bool,
 }
@@ -364,7 +370,26 @@ impl Readback for GpuReadback<'_> {
         r.set_widescreen(false);
         let img = r.render(&f, width, height);
         r.set_widescreen(self.wide);
-        img.ok().map(|i| i.rgba)
+        readback_pixels(img, width, height, self.warned)
+    }
+}
+
+/// The pixels of a drawn image, or none after a warning, given once per
+/// size in `warned`, saying why it could not be read back.
+fn readback_pixels(
+    img: Result<Image, RenderError>,
+    width: u32,
+    height: u32,
+    warned: &mut HashSet<(u32, u32)>,
+) -> Option<Vec<u8>> {
+    match img {
+        Ok(i) => Some(i.rgba),
+        Err(e) => {
+            if warned.insert((width, height)) {
+                eprintln!("warning: drawn image {width}x{height} not read back: {e}");
+            }
+            None
+        }
     }
 }
 
@@ -433,6 +458,7 @@ impl Devices for Media {
         let mut rb = GpuReadback {
             renderer: &mut self.renderer,
             failed: &mut self.renderer_failed,
+            warned: &mut self.readback_warned,
             wide: self.wide,
         };
         let run = || gfx.run_readback(bytes, dl, &mut rb);
@@ -555,6 +581,23 @@ impl Devices for Media {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_drawn_image_that_cannot_be_read_back_is_warned_about_once_per_size() {
+        let mut warned = HashSet::new();
+        let bad = || Err(RenderError::Size("too big".into()));
+        assert_eq!(readback_pixels(bad(), 9000, 1, &mut warned), None);
+        assert_eq!(readback_pixels(bad(), 9000, 1, &mut warned), None);
+        assert_eq!(readback_pixels(bad(), 1, 9000, &mut warned), None);
+        assert_eq!(warned.len(), 2, "one warning per size");
+        let ok = Image {
+            width: 1,
+            height: 1,
+            rgba: vec![1, 2, 3, 4],
+        };
+        let pixels = readback_pixels(Ok(ok), 1, 1, &mut warned);
+        assert_eq!(pixels, Some(vec![1, 2, 3, 4]));
+    }
 
     #[test]
     fn script_drives_the_pads_by_retrace() {
