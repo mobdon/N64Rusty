@@ -64,7 +64,7 @@ pub struct Session<G> {
     done: bool,
     mode: Mode,
     replay: Option<Player>,
-    record: Option<(Recorder, File, usize)>,
+    record: Option<Recording>,
     record_error: Option<io::Error>,
     debug: Option<DebugPort>,
     held: [Option<Pad>; 4],
@@ -87,7 +87,7 @@ impl<G: Guest> Session<G> {
         let record = match &cfg.record {
             Some(path) => {
                 let file = File::create(path).map_err(|e| format!("{}: {e}", path.display()))?;
-                Some((Recorder::default(), file, 0))
+                Some(Recording::new(file))
             }
             None => None,
         };
@@ -177,17 +177,13 @@ impl<G: Guest> Session<G> {
 
     // Written as it goes, so the input that led to a crash is on disk.
     fn record(&mut self, pads: &Pads) {
-        let Some((rec, file, written)) = &mut self.record else {
+        let Some(rec) = &mut self.record else {
             return;
         };
-        rec.record(self.frame, pads);
-        let new = &rec.text()[*written..];
-        if !new.is_empty() && self.record_error.is_none() {
-            if let Err(e) = file.write_all(new.as_bytes()) {
-                self.record_error = Some(e);
-            }
+        if let Err(e) = rec.frame(self.frame, pads) {
+            // The first failure is kept; later frames are not written.
+            self.record_error.get_or_insert(e);
         }
-        *written = rec.text().len();
     }
 
     fn next_command(&mut self, block: bool) -> Option<(String, Sender<String>)> {
@@ -257,6 +253,41 @@ impl<G: Guest> Session<G> {
     fn step(&mut self, n: u64, reply: Sender<String>) {
         self.end_step();
         self.mode = Mode::Stepping(n, reply);
+    }
+}
+
+/// A run's input being recorded: each frame's script lines go straight to
+/// the file, so memory stays the same however long the run.
+struct Recording {
+    recorder: Recorder,
+    file: File,
+    /// One frame's lines, kept to reuse its memory.
+    lines: String,
+    /// A write failed: nothing more is written.
+    failed: bool,
+}
+
+impl Recording {
+    fn new(file: File) -> Recording {
+        Recording {
+            recorder: Recorder::default(),
+            file,
+            lines: String::new(),
+            failed: false,
+        }
+    }
+
+    /// Records `frame` and writes its lines; the first failure is returned
+    /// and stops later writes, which would leave a gap in the script.
+    fn frame(&mut self, frame: u64, pads: &Pads) -> io::Result<()> {
+        self.lines.clear();
+        self.recorder.record(frame, pads, &mut self.lines);
+        if self.failed || self.lines.is_empty() {
+            return Ok(());
+        }
+        self.file.write_all(self.lines.as_bytes()).inspect_err(|_| {
+            self.failed = true;
+        })
     }
 }
 
@@ -368,7 +399,7 @@ mod tests {
     /// A session recording into `file` instead of the file its config names.
     fn recording_into(file: File) -> Session<Count> {
         let mut s = Session::new(Count(0), &RunConfig::default()).unwrap();
-        s.record = Some((Recorder::default(), file, 0));
+        s.record = Some(Recording::new(file));
         s
     }
 
@@ -388,6 +419,30 @@ mod tests {
         assert!(on_disk.contains("0 1 - 0 0\n"), "{on_disk}");
         assert!(on_disk.contains("0 4 - 0 0\n"), "{on_disk}");
         assert_eq!(result.unwrap().0, 1);
+    }
+
+    #[test]
+    fn a_long_recording_goes_to_the_file_and_keeps_only_one_frame() {
+        let path = temp_file("record-long");
+        let mut s = recording_into(File::create(&path).unwrap());
+        const FRAMES: u64 = 1000;
+        for f in 0..FRAMES {
+            let mut live = Pads::default();
+            live[0].x = (f % 100) as i8; // a change every frame
+            assert_eq!(s.tick(&live, false), Tick::Ran);
+        }
+        let held = s.record.as_ref().unwrap().lines.len();
+        s.finish().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        // Header, four ports on frame 0, then port 1 on every later frame.
+        assert_eq!(text.lines().count() as u64, 1 + 4 + (FRAMES - 1));
+        assert!(
+            text.ends_with("999 1 - 99 0\n"),
+            "{}",
+            &text[text.len() - 40..]
+        );
+        assert!(held < 64, "{held} bytes of script kept in memory");
     }
 
     #[test]

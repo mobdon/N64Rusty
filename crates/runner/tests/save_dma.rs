@@ -53,7 +53,11 @@ fn save_block_read_changed_and_written_back() {
     ctx.register(ENTRY, game);
     ctx.r[29] = sx32(0x8000_0000 + RAM_SIZE as u32 - 0x10);
     let hooks = BTreeMap::from([("osEPiStartDma".to_string(), EPI_START_DMA)]);
-    assert_eq!(os::install(&mut ctx, &hooks), ["osEPiStartDma"]);
+    let mut settings = os::Settings::default();
+    assert_eq!(
+        os::install(&mut ctx, &hooks, &mut settings),
+        ["osEPiStartDma"]
+    );
     let ctx: &'static mut Ctx = Box::leak(Box::new(ctx));
     let (outcome, report, _) = os::run(
         ctx,
@@ -62,6 +66,7 @@ fn save_block_read_changed_and_written_back() {
         60,
         Box::new(n64rusty_runner::devices::Headless),
         Save::open(&file).unwrap(),
+        settings,
     );
     // With no other thread, the boot thread ending reads as a deadlock.
     assert!(

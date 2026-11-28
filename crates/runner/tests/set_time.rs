@@ -49,7 +49,8 @@ fn setting_the_time_back_keeps_retraces_coming() {
         ("osSetTime".to_string(), SET_TIME),
         ("osGetTime".to_string(), GET_TIME),
     ]);
-    os::install(&mut ctx, &hooks);
+    let mut settings = os::Settings::default();
+    os::install(&mut ctx, &hooks, &mut settings);
     let ctx: &'static mut Ctx = Box::leak(Box::new(ctx));
     let (outcome, report, frames) = os::run(
         ctx,
@@ -58,6 +59,7 @@ fn setting_the_time_back_keeps_retraces_coming() {
         13,
         Box::new(n64rusty_runner::devices::Headless),
         Save::in_memory(),
+        settings,
     );
     assert_eq!(frames, 13, "{outcome:?}\n{report}");
     assert!(TIME_AFTER.load(Ordering::SeqCst) < os::TICKS_PER_FRAME);

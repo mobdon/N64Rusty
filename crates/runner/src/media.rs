@@ -100,6 +100,9 @@ pub struct Media {
     shown: Option<Arc<Mutex<Option<Frame>>>>,
     /// With `N64RUSTY_PROFILE=n`, a profile line every n shown frames.
     profile: Option<Profile>,
+    /// The game's own RAM size, which RSP tasks may write (the mods' RAM
+    /// lies above it).
+    game_ram: usize,
 }
 
 /// Host time per part of a run, for the profile line.
@@ -254,7 +257,15 @@ impl Media {
             readback_warned: HashSet::new(),
             shown: None,
             profile: Profile::from_env(),
+            game_ram: crate::RAM_SIZE,
         }
+    }
+
+    /// Lets RSP tasks write the first `bytes` of RAM, the game's own (by
+    /// default [`crate::RAM_SIZE`]).
+    pub fn with_game_ram(mut self, bytes: usize) -> Self {
+        self.game_ram = bytes;
+        self
     }
 
     /// Saves frames at `scale` times the game's resolution (1 to 8).
@@ -498,7 +509,7 @@ impl Devices for Media {
         if kind == TASK_JPEG {
             let data = ctx.mem.read_u32(task + TASK_DATA_PTR);
             if data != 0 {
-                crate::jpeg::run(&mut ctx.mem, data);
+                crate::jpeg::run(&mut ctx.mem, data, self.game_ram);
             }
             return;
         }
@@ -543,6 +554,12 @@ impl Devices for Media {
         let Some(path) = &self.wav_path else {
             return;
         };
+        // The interface plays nothing before osAiSetFrequency sets its
+        // rate (libultra's DAC rate), and a WAV header needs one: the
+        // recording opens with the first buffer after that.
+        if self.rate == 0 {
+            return;
+        }
         let samples = samples(ctx, addr, len);
         let result = (|| {
             if self.wav.is_none() {
@@ -673,6 +690,34 @@ mod tests {
             (p[1].buttons, p[1].stick_x, p[1].stick_y),
             (n64rusty_host::pad::button::A, 40, -20)
         );
+    }
+
+    #[test]
+    fn a_recording_starts_once_the_game_sets_its_audio_rate() {
+        const RATE: u32 = 32000;
+        const BUFFER: u32 = 0x8000_0100;
+        let path = std::env::temp_dir().join(format!("n64rusty-wav-{}.wav", std::process::id()));
+        let mut c = Ctx::new(n64rusty_runtime::Memory::new(0x1000));
+        for k in 0..4 {
+            c.mem.write_u16(BUFFER + 2 * k, 0x1111 * (k as u16 + 1));
+        }
+        let mut m = Media::new(None, 60, Some(path.clone()), false, None);
+        // A buffer before the rate is set: nothing to record yet.
+        m.audio(&c, BUFFER, 8);
+        m.audio_rate(RATE);
+        m.audio(&c, BUFFER, 8);
+        let summary = m.summary();
+        let wav = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(!summary.contains("recording"), "{summary}");
+        assert_eq!(m.audio_failed, None);
+        assert_eq!(wav[24..28], RATE.to_le_bytes(), "the rate in the header");
+        assert_eq!(
+            wav.len(),
+            44 + 8,
+            "the header and the one buffer after the rate"
+        );
+        assert_eq!(wav[44..46], 0x1111u16.to_le_bytes());
     }
 
     #[test]

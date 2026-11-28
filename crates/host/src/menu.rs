@@ -32,10 +32,6 @@ pub enum Action {
     OpenModsFolder,
 }
 
-/// Set by a program with a start screen (the player): the Game menu then
-/// offers "All games...", which starts the program again with no ROM.
-pub static START_SCREEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 /// The `mods` folder next to the program.
 pub fn mods_dir() -> Option<std::path::PathBuf> {
     Some(crate::home()?.join("mods"))
@@ -65,7 +61,7 @@ pub fn mods() -> Vec<(std::path::PathBuf, bool)> {
 }
 
 /// A mod's name: its file name without `.off` and the library extension.
-fn mod_name(path: &std::path::Path) -> String {
+pub fn mod_name(path: &std::path::Path) -> String {
     let n = path.file_name().unwrap_or_default().to_string_lossy();
     let base = n.trim_end_matches(".off");
     base.rsplit_once('.').map_or(base, |(a, _)| a).to_string()
@@ -174,7 +170,7 @@ pub struct Menu;
 #[cfg(not(windows))]
 impl Menu {
     /// Never a menu here.
-    pub fn new(_: &Window, _: &WindowConfig) -> Option<Menu> {
+    pub fn new(_: &Window, _: &WindowConfig, _: bool) -> Option<Menu> {
         None
     }
     /// Never a choice here.
@@ -217,9 +213,11 @@ mod imp {
     }
 
     impl Menu {
-        /// Adds the menu bar to `window`, ticked as `cfg` says; `None` when
-        /// it is not a Win32 window or the bar cannot be made.
-        pub fn new(window: &Window, cfg: &WindowConfig) -> Option<Menu> {
+        /// Adds the menu bar to `window`, ticked as `cfg` says; with
+        /// `start_screen` (a program with one, the player) the Game menu also
+        /// offers "All games...", which starts the program again with no ROM.
+        /// `None` when it is not a Win32 window or the bar cannot be made.
+        pub fn new(window: &Window, cfg: &WindowConfig, start_screen: bool) -> Option<Menu> {
             let RawWindowHandle::Win32(h) = window.window_handle().ok()?.as_raw() else {
                 return None;
             };
@@ -277,8 +275,7 @@ mod imp {
             };
             let sep0 = PredefinedMenuItem::separator();
             let mut game: Vec<&dyn muda::IsMenuItem> = vec![&m.open];
-            let screens = super::START_SCREEN.load(std::sync::atomic::Ordering::Relaxed);
-            if screens {
+            if start_screen {
                 game.insert(0, &m.list);
             }
             if !m.games.is_empty() {
@@ -298,7 +295,7 @@ mod imp {
             view.extend(m.scales.iter().map(|i| i as &dyn muda::IsMenuItem));
             view.push(&m.full);
             let sep4 = PredefinedMenuItem::separator();
-            if screens {
+            if start_screen {
                 view.extend([&sep4 as &dyn muda::IsMenuItem, &m.settings_page]);
             }
             let refresh = Submenu::with_items("Refresh", true, &refresh).ok()?;
@@ -319,7 +316,7 @@ mod imp {
                 modm.push(&sep3);
             }
             modm.push(&m.mods_folder);
-            if screens {
+            if start_screen {
                 modm.push(&m.mods_page);
             }
             let modm = Submenu::with_items("Mods", true, &modm).ok()?;

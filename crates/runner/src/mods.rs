@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::Mutex;
 
-use n64rusty_mod_api::{Api, Hook, HookWith, INSTALL, VERSION, VERSION_FN};
+use n64rusty_mod_api::{Api, Hook, HookWith, HANDOFF_MAX, INSTALL, VERSION, VERSION_FN};
 use n64rusty_runtime::Ctx;
 
 /// Mod hooks by the guest address they replace, in load order: the last
@@ -45,6 +45,14 @@ static HANDOFF: Mutex<Option<Vec<u8>>> = Mutex::new(None);
 
 /// What a hooked address ran before the mods: a replaced system routine.
 static REPLACED: Mutex<Option<HashMap<u32, n64rusty_runtime::GuestFn>>> = Mutex::new(None);
+
+/// ROMs handed to mods by [`find_rom`], by SHA-256: each read once and kept
+/// until the program ends, so every call for it gets the same bytes. They
+/// are never freed, not even when the next game starts: a stopped run's
+/// thread may still be inside a hook reading them (`os::stop` gives up on a
+/// guest loop that makes no calls). A global because the mod API's
+/// functions are plain `extern "C"` ones.
+static FOUND_ROMS: Mutex<Option<HashMap<String, &'static [u8]>>> = Mutex::new(None);
 
 /// The mods turned on, loaded; the `mods` folder is made if missing, so
 /// players can find it.
@@ -123,12 +131,26 @@ fn runnable(path: &std::path::Path) -> std::path::PathBuf {
     }
 }
 
+/// The ROM with SHA-256 `sha`, read the first time it is asked for and the
+/// same bytes every time after (see [`FOUND_ROMS`]).
+fn found_rom(sha: &str) -> Option<&'static [u8]> {
+    let mut found = FOUND_ROMS.lock().unwrap_or_else(|e| e.into_inner());
+    let found = found.get_or_insert_with(HashMap::new);
+    if let Some(&rom) = found.get(sha) {
+        return Some(rom);
+    }
+    let rom: &'static [u8] = crate::find_rom(sha)?.leak();
+    found.insert(sha.to_string(), rom);
+    Some(rom)
+}
+
+/// The mod API's `find_rom`: each ROM is read once per program and stays
+/// valid for the whole run, as the API promises (see [`found_rom`]).
 extern "C" fn find_rom(sha: *const u8, sha_len: usize, len: *mut usize) -> *const u8 {
     // SAFETY: the mod passes a string it owns.
     let sha = unsafe { std::slice::from_raw_parts(sha, sha_len) };
-    match std::str::from_utf8(sha).ok().and_then(crate::find_rom) {
+    match std::str::from_utf8(sha).ok().and_then(found_rom) {
         Some(rom) => {
-            let rom = rom.leak();
             // SAFETY: the mod passes somewhere to write the length.
             unsafe { *len = rom.len() };
             rom.as_ptr()
@@ -143,6 +165,12 @@ extern "C" fn switch_game(
     data: *const u8,
     data_len: usize,
 ) -> bool {
+    // The documented limit holds for a mod that calls the raw field too,
+    // not only through `Api::switch_game`.
+    if data_len > HANDOFF_MAX {
+        println!("mod switch: {data_len} bytes of handoff data, more than {HANDOFF_MAX}");
+        return false;
+    }
     // SAFETY: the mod passes a string and bytes it owns.
     let (sha, data) = unsafe {
         (
@@ -513,6 +541,58 @@ mod tests {
         assert_eq!(unsafe { std::slice::from_raw_parts(p, len) }, data);
         install(Vec::new(), &mut c, &mut Vec::new(), "");
         assert!(handoff(&mut len).is_null());
+    }
+
+    /// A folder holding the smallest cartridge a ROM reads as, filled with
+    /// `fill`, as `other.z64`; returns the folder and the ROM's SHA-256.
+    fn other_rom(test: &str, fill: u8) -> (std::path::PathBuf, String) {
+        let dir = std::env::temp_dir().join(format!("n64rusty-{test}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cart = vec![fill; 0x101000];
+        cart[..4].copy_from_slice(&[0x80, 0x37, 0x12, 0x40]);
+        std::fs::write(dir.join("other.z64"), &cart).unwrap();
+        let sha = n64rusty_rom::Rom::from_bytes(cart).unwrap().sha256;
+        (dir, sha)
+    }
+
+    #[test]
+    fn a_switch_refuses_handoff_data_over_the_limit() {
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let (dir, sha) = other_rom("switch-limit", 0);
+        *crate::ROM_PATH.lock().unwrap() = Some(dir.join("played.z64"));
+        *NEXT_HANDOFF.lock().unwrap() = None;
+        crate::WINDOW.store(true, std::sync::atomic::Ordering::Relaxed);
+        let over = vec![7u8; HANDOFF_MAX + 1];
+        let refused = !switch_game(sha.as_ptr(), sha.len(), over.as_ptr(), over.len());
+        let asked_over = n64rusty_host::one_window::take_request();
+        let handed_over = NEXT_HANDOFF.lock().unwrap().take();
+        let full = vec![7u8; HANDOFF_MAX];
+        let taken = switch_game(sha.as_ptr(), sha.len(), full.as_ptr(), full.len());
+        crate::WINDOW.store(false, std::sync::atomic::Ordering::Relaxed);
+        let asked_full = n64rusty_host::one_window::take_request();
+        let handed_full = NEXT_HANDOFF.lock().unwrap().take();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(refused, "one byte over the limit");
+        assert_eq!((asked_over, handed_over), (None, None));
+        assert!(taken, "exactly the limit");
+        assert!(asked_full.is_some());
+        assert_eq!(handed_full, Some(full));
+    }
+
+    #[test]
+    fn find_rom_reads_a_rom_once_and_hands_back_the_same_bytes() {
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let (dir, sha) = other_rom("find-once", 1);
+        *crate::ROM_PATH.lock().unwrap() = Some(dir.join("played.z64"));
+        let (mut first_len, mut again_len) = (0, 0);
+        let first = find_rom(sha.as_ptr(), sha.len(), &mut first_len);
+        let again = find_rom(sha.as_ptr(), sha.len(), &mut again_len);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(!first.is_null());
+        assert_eq!(first, again, "the same bytes, not a new copy");
+        assert_eq!((first_len, again_len), (0x101000, 0x101000));
+        let missing = "00".repeat(32);
+        assert!(find_rom(missing.as_ptr(), missing.len(), &mut again_len).is_null());
     }
 
     #[test]

@@ -24,14 +24,16 @@ const TABLE_BYTES: u32 = 2 * 64;
 /// task's addresses are read the same way: always aligned and inside RAM.
 const SP_DRAM_ADDR_MASK: u32 = 0x00FF_FFF8;
 
-/// Runs the task whose data is at `data`.
-pub fn run(mem: &mut Memory, data: u32) {
+/// Runs the task whose data is at `data`. `game_ram` is the game's own
+/// RAM size (the mods' RAM above it is not the game's to write).
+pub fn run(mem: &mut Memory, data: u32, game_ram: usize) {
+    let ram_len = mem.bytes().len().min(game_ram);
     let rd = |m: &Memory, k: u32| (m.read_u32(data + 4 * k) & SP_DRAM_ADDR_MASK) | 0x8000_0000;
     let (addr, count, mode) = (rd(mem, 0), mem.read_u32(data + 4), mem.read_u32(data + 8));
     let tables = [rd(mem, 3), rd(mem, 4), rd(mem, 5)];
     if let Some(t) = tables
         .iter()
-        .find(|&&t| !fits_in_ram(mem, t, 1, TABLE_BYTES))
+        .find(|&&t| !fits_in_ram(ram_len, t, 1, TABLE_BYTES))
     {
         eprintln!(
             "warning: JPEG task at {data:#010x} skipped: its quantisation table at {t:#010x} runs past RAM"
@@ -44,7 +46,7 @@ pub fn run(mem: &mut Memory, data: u32) {
         .collect();
     let luma = if mode == 0 { 2 } else { 4 };
     let stride = BLOCK_BYTES * (luma + 2);
-    if !fits_in_ram(mem, addr, count, stride) {
+    if !fits_in_ram(ram_len, addr, count, stride) {
         eprintln!(
             "warning: JPEG task at {data:#010x} skipped: {count} macroblocks of {stride:#x} bytes at {addr:#010x} run past RAM"
         );
@@ -85,12 +87,12 @@ pub fn run(mem: &mut Memory, data: u32) {
 }
 
 /// Whether `count` blocks of `stride` bytes from KSEG0 address `addr` all
-/// lie in the game's RAM, so a bad task cannot run past it (or into the
-/// mods' RAM above it) or loop for ages.
-fn fits_in_ram(mem: &Memory, addr: u32, count: u32, stride: u32) -> bool {
+/// lie in the first `ram_len` bytes of RAM (the game's own), so a bad task
+/// cannot run past it (or into the mods' RAM above it) or loop for ages.
+fn fits_in_ram(ram_len: usize, addr: u32, count: u32, stride: u32) -> bool {
     let start = u64::from(addr & PHYS_MASK);
     let end = start + u64::from(count) * u64::from(stride);
-    end <= mem.bytes().len().min(crate::ram_size()) as u64
+    end <= ram_len as u64
 }
 
 /// Inverse DCT of one 8x8 block (natural order), level-shifted: luma comes
@@ -141,7 +143,7 @@ mod tests {
         for k in 1..4 {
             mem.write_u16(buf + 0x80 * k, 512);
         }
-        run(&mut mem, data);
+        run(&mut mem, data, crate::RAM_SIZE);
         assert_eq!(mem.read_u16(buf), 0x8421); // grey: 16 in each channel
         assert_eq!(mem.read_u16(buf + 2 * 15), 0xFFFF); // white, top right
     }
@@ -155,14 +157,14 @@ mod tests {
         mem.write_u16(buf, 512);
         for count in [u32::MAX, 0x100] {
             mem.write_u32(data + 4, count);
-            run(&mut mem, data);
+            run(&mut mem, data, crate::RAM_SIZE);
             assert_eq!(mem.read_u16(buf), 512, "{count} macroblocks: left alone");
         }
         // An address near the top of the 32-bit space cannot wrap into RAM.
         mem.write_u32(data, 0x1FFF_FF00);
         mem.write_u32(data + 4, 1);
-        run(&mut mem, data);
-        assert!(!fits_in_ram(&mem, 0x9FFF_FF00, 1, 0x300));
+        run(&mut mem, data, crate::RAM_SIZE);
+        assert!(!fits_in_ram(mem.bytes().len(), 0x9FFF_FF00, 1, 0x300));
     }
 
     #[test]
@@ -174,7 +176,7 @@ mod tests {
         mem.write_u32(data + 8, 2);
         mem.write_u32(data + 12, 0x0001_0000 - TABLE_BYTES / 2);
         mem.write_u16(buf, 512);
-        run(&mut mem, data);
+        run(&mut mem, data, crate::RAM_SIZE);
         assert_eq!(mem.read_u16(buf), 512, "left alone");
     }
 
@@ -189,15 +191,20 @@ mod tests {
         mem.write_u32(data + 16, 0x4000_2000);
         mem.write_u32(data + 20, 0x0000_2003);
         // Before, the odd addresses panicked as misaligned reads.
-        run(&mut mem, data);
+        run(&mut mem, data, crate::RAM_SIZE);
     }
 
     #[test]
     fn mods_ram_is_not_the_games() {
-        // Above the largest game RAM is only ever the mods' RAM.
-        let mem = Memory::new(crate::RAM_SIZE_EXPANDED + 0x1000);
-        let above = 0x8000_0000 | crate::RAM_SIZE_EXPANDED as u32;
-        assert!(!fits_in_ram(&mem, above, 1, 0x100));
-        assert!(fits_in_ram(&mem, 0x8000_0000, 1, 0x100));
+        // Above the game's RAM is only ever the mods' RAM.
+        let mut mem = Memory::new(crate::RAM_SIZE + crate::MOD_RAM);
+        let (data, buf) = (0x8000_0000u32, 0x8000_0000 | crate::RAM_SIZE as u32);
+        mem.write_u32(data, buf & PHYS_MASK);
+        mem.write_u32(data + 4, 1);
+        mem.write_u32(data + 8, 2);
+        mem.write_u16(buf, 512);
+        run(&mut mem, data, crate::RAM_SIZE);
+        assert_eq!(mem.read_u16(buf), 512, "the mods' RAM is left alone");
+        assert!(fits_in_ram(crate::RAM_SIZE, 0x8000_0000, 1, 0x100));
     }
 }

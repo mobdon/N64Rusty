@@ -377,6 +377,7 @@ pub fn play(
     screen.max_height = cfg.window.max_render_height;
     let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stopped = stopping.clone();
+    let screens = cfg.start_screen;
     let game = std::thread::Builder::new()
         .name("game".into())
         .spawn(move || {
@@ -386,8 +387,6 @@ pub fn play(
             }
             // A crash in a program with a start screen (the player) goes
             // back to it in the same window instead of closing everything.
-            let screens =
-                n64rusty_host::menu::START_SCREEN.load(std::sync::atomic::Ordering::Relaxed);
             if code != 0 && screens {
                 let m = crate::os::PANIC_MESSAGE
                     .lock()

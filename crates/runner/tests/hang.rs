@@ -35,6 +35,7 @@ fn call_free_loop_ends_as_a_hang() {
         u64::MAX,
         Box::new(n64rusty_runner::devices::Headless),
         Save::in_memory(),
+        os::Settings::default(),
     );
     let os::Outcome::Hang(report) = outcome else {
         panic!("expected a hang, got {outcome:?}");

@@ -65,6 +65,10 @@ pub struct RunConfig {
     pub window: WindowConfig,
     /// Where each of the four ports' input comes from.
     pub ports: [PortConfig; 4],
+    /// The program has a start screen (the player): the Game menu can go
+    /// back to it, and a crash returns to it. Set by the program, never
+    /// read from the file.
+    pub start_screen: bool,
 }
 
 /// The `[window]` table: how the game is shown.
@@ -166,6 +170,7 @@ impl Default for RunConfig {
             record: None,
             debug_port: None,
             window: WindowConfig::default(),
+            start_screen: false,
             ports: [
                 PortConfig {
                     keyboard: Some(KeyMap::default()),
@@ -281,6 +286,9 @@ impl RunConfig {
                 ));
             }
         }
+        for (n, entry) in cfg.window.hud.iter().enumerate() {
+            check_hud(entry).map_err(|e| format!("window hud entry {} {entry:?}: {e}", n + 1))?;
+        }
         if let Some(h) = cfg.window.max_render_height {
             if h < MIN_RENDER_HEIGHT {
                 return Err(format!(
@@ -309,6 +317,25 @@ impl RunConfig {
         }
         Ok(cfg)
     }
+}
+
+/// HUD sides: the window's left edge, and its right.
+const HUD_SIDES: [f32; 2] = [-1.0, 1.0];
+
+/// Checks one `hud` entry `[x0, y0, x1, y1, side]`: the renderer moves the
+/// pieces inside that box to the window's left (-1) or right (1) edge, so
+/// the box must be a real one and the side one of those two.
+fn check_hud(&[x0, y0, x1, y1, side]: &[f32; 5]) -> Result<(), String> {
+    if ![x0, y0, x1, y1, side].iter().all(|v| v.is_finite()) {
+        return Err("every value must be a finite number".into());
+    }
+    if x0 > x1 || y0 > y1 {
+        return Err("x0 must not be past x1, nor y0 past y1".into());
+    }
+    if !HUD_SIDES.contains(&side) {
+        return Err(format!("side {side} is not -1 (left) or 1 (right)"));
+    }
+    Ok(())
 }
 
 fn port(raw: RawPort) -> Result<PortConfig, String> {
@@ -374,6 +401,13 @@ mod tests {
         );
         // Off unless asked for: the window's own resolution.
         assert_eq!(WindowConfig::default().max_render_height, None);
+    }
+
+    #[test]
+    fn hud_entries_on_either_side_and_of_no_size_are_fine() {
+        let text = "[window]\nhud = [[0, 0, 150, 60, -1], [200, 10, 200, 10, 1]]";
+        let cfg = RunConfig::parse(text, Path::new("")).unwrap();
+        assert_eq!(cfg.window.hud.len(), 2);
     }
 
     #[test]
@@ -455,6 +489,16 @@ mod tests {
             ("[window]\nrefresh = inf", "between"),
             ("[window]\nrefresh = 0.5", "between"),
             ("[window]\nmax_render_height = 100", "below 240"),
+            ("[window]\nhud = [[0, 0, nan, 60, -1]]", "hud entry 1"),
+            ("[window]\nhud = [[0, 0, 150, inf, 1]]", "finite"),
+            ("[window]\nhud = [[0, 0, 150, 60, -inf]]", "finite"),
+            (
+                "[window]\nhud = [[0, 0, 1, 1, 1], [151, 0, 150, 60, 1]]",
+                "hud entry 2",
+            ),
+            ("[window]\nhud = [[0, 61, 150, 60, 1]]", "y0 past y1"),
+            ("[window]\nhud = [[0, 0, 150, 60, 0]]", "side 0 is not"),
+            ("[window]\nhud = [[0, 0, 150, 60, 0.5]]", "side 0.5 is not"),
             ("[window]\nmax_render_height = -1", "invalid value"),
             ("[[port]]\nsources = [\"mouse\"]", "unknown source"),
             (

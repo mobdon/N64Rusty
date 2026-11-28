@@ -17,7 +17,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use n64rusty_runtime::{sx32, Ctx, Flash, FlashOp, GuestFn};
@@ -256,8 +256,19 @@ pub struct State {
     framebuffer: u32,
     devices: Box<dyn Devices>,
     save: Save,
-    /// Cartridge DMA requests seen: (ROM offset, RAM address, length).
-    pub dma_log: Vec<(u32, u32, u32)>,
+    /// Cartridge DMA requests seen, each once, with the numbers of the
+    /// first and the latest request that made it. A game that streams
+    /// repeats the same few, so this stays as small as the distinct copies.
+    dma_log: HashMap<Dma, (u64, u64)>,
+    /// Cartridge DMA requests made, repeats included.
+    dma_count: u64,
+    /// What this run was set up with (flags and per-game config).
+    /// `int_mask` is read from [`Os::int_mask`], which needs no lock.
+    settings: Settings,
+    /// The RCP interrupt lines (MI mask, bits 16 to 21 of an `OSIntMask`)
+    /// as the game last set them; the CPU lines live in each thread's
+    /// Status.
+    rcp_mask: u32,
     /// The serial interface's 64 bytes of PIF RAM.
     pif: [u8; 64],
     /// Report text for a panic, filled by the panicking thread.
@@ -271,6 +282,41 @@ pub struct State {
     /// Message queues already warned about as unusable, so a thread
     /// blocked on one does not warn again at every reschedule.
     bad_queues: HashSet<u32>,
+}
+
+/// One cartridge DMA request: (ROM offset, RAM address, length).
+pub type Dma = (u32, u32, u32);
+
+/// The RCP interrupt lines a run starts with: all six enabled.
+const RCP_MASK_ALL: u32 = 0x3F;
+
+impl State {
+    /// Notes a cartridge DMA request.
+    fn log_dma(&mut self, dma: Dma) {
+        self.dma_count += 1;
+        let n = self.dma_count;
+        self.dma_log.entry(dma).or_insert((n, n)).1 = n;
+    }
+
+    /// The cartridge DMA requests seen, each once, ordered by the latest
+    /// request that made it (the last is the most recent).
+    fn dma_copies(&self) -> Vec<Dma> {
+        self.dma_copies_by(|&(_, latest)| latest)
+    }
+
+    /// The cartridge DMA requests seen, each once, ordered by the first
+    /// request that made it.
+    fn dma_copies_by_first(&self) -> Vec<Dma> {
+        self.dma_copies_by(|&(first, _)| first)
+    }
+
+    /// The copies in `dma_log`, ordered by `key` of their (first, latest)
+    /// request numbers.
+    fn dma_copies_by(&self, key: impl Fn(&(u64, u64)) -> u64) -> Vec<Dma> {
+        let mut copies: Vec<(u64, Dma)> = self.dma_log.iter().map(|(&d, n)| (key(n), d)).collect();
+        copies.sort_unstable();
+        copies.into_iter().map(|(_, d)| d).collect()
+    }
 }
 
 /// The audio interface's two-buffer queue, timed by the guest clock, so a
@@ -327,6 +373,9 @@ struct Os {
     state: Mutex<State>,
     cv: Condvar,
     ctx: AtomicPtr<Ctx>,
+    /// [`Settings::int_mask`], fixed for the run: read without the lock by
+    /// `interrupt`, which runs at every deadline.
+    int_mask: bool,
 }
 
 thread_local! {
@@ -392,15 +441,26 @@ pub struct Poke {
     pub bytes: u8,
 }
 
-static POKES: Mutex<Vec<Poke>> = Mutex::new(Vec::new());
-
-/// Where `--hash-out` writes one RAM hash per retrace.
-static HASH_OUT: Mutex<Option<std::io::BufWriter<std::fs::File>>> = Mutex::new(None);
-
-/// Makes the run write `frame hash` for RAM at every retrace, to compare
-/// two runs (determinism, or translated code against the interpreter).
-pub fn set_hash_out(file: std::fs::File) {
-    *HASH_OUT.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::io::BufWriter::new(file));
+/// What one run is set up with: debugging flags and per-game config
+/// values. [`run`] keeps them in that run's own state, so nothing carries
+/// over to the next game a player plays.
+#[derive(Debug, Default)]
+pub struct Settings {
+    /// Memory writes made at retraces (`--poke`).
+    pub pokes: Vec<Poke>,
+    /// Where `--hash-out` writes `frame hash` for RAM at every retrace, to
+    /// compare two runs (determinism, or translated code against the
+    /// interpreter).
+    pub hash_out: Option<std::io::BufWriter<std::fs::File>>,
+    /// The Status word this game's library gives new threads (config name
+    /// `thread_status`), or 0 for the usual one.
+    pub thread_status: u32,
+    /// Whether `os_set_int_mask` masks (a game asks with `int_mask` in its
+    /// config); otherwise it reports every line enabled and masks nothing.
+    pub int_mask: bool,
+    /// Whether each controller reports a Rumble Pak (a game asks with
+    /// `rumble` in its config; others see no pak).
+    pub rumble: bool,
 }
 
 /// A fast hash of RAM, 8 bytes at a time.
@@ -414,9 +474,9 @@ pub fn ram_hash(ram: &[u8]) -> u64 {
     })
 }
 
-fn write_hash(c: &Ctx, frame: u64) {
+fn write_hash(c: &Ctx, st: &mut State, frame: u64) {
     use std::io::Write;
-    if let Some(out) = HASH_OUT.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+    if let Some(out) = st.settings.hash_out.as_mut() {
         // A short file would read as two runs that differ: stop instead.
         if let Err(e) =
             writeln!(out, "{frame} {:016x}", ram_hash(c.mem.bytes())).and_then(|()| out.flush())
@@ -424,11 +484,6 @@ fn write_hash(c: &Ctx, frame: u64) {
             panic!("--hash-out: {e}");
         }
     }
-}
-
-/// Sets the memory writes this run makes.
-pub fn set_pokes(pokes: Vec<Poke>) {
-    *POKES.lock().unwrap_or_else(|e| e.into_inner()) = pokes;
 }
 
 /// Parses a poke script: `frame[-last] addr value [bytes]` per line, frame
@@ -465,8 +520,8 @@ pub fn parse_pokes(text: &str) -> Result<Vec<Poke>, String> {
     Ok(out)
 }
 
-fn apply_pokes(c: &mut Ctx, frame: u64) {
-    for p in POKES.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+fn apply_pokes(c: &mut Ctx, st: &State, frame: u64) {
+    for p in &st.settings.pokes {
         if (p.from..=p.to).contains(&frame) {
             match p.bytes {
                 1 => c.mem.write_u8(p.addr, p.value as u8),
@@ -710,8 +765,9 @@ fn deliver_due(c: &mut Ctx, st: &mut State) {
         flash_ops(c, st);
         st.next_vi += TICKS_PER_FRAME;
         st.frames += 1;
-        apply_pokes(c, st.frames);
-        write_hash(c, st.frames);
+        let frame = st.frames;
+        apply_pokes(c, st, frame);
+        write_hash(c, st, frame);
         st.devices.retrace(st.frames, st.framebuffer);
         if let Some((mq, msg, every)) = st.vi {
             if every > 0 && st.frames.is_multiple_of(u64::from(every)) {
@@ -748,9 +804,6 @@ fn deliver_due(c: &mut Ctx, st: &mut State) {
 const STATUS_BOOT: u32 = 0x3400_FF01;
 /// Status.FR: 64-bit floating-point registers.
 const STATUS_FR: u32 = 0x0400_0000;
-/// The Status word this game's library gives new threads (config name
-/// `thread_status`), or 0 for the usual one.
-static THREAD_STATUS: AtomicU32 = AtomicU32::new(0);
 /// COP0 Status a new thread starts with: CU1, all interrupt lines, IE.
 const STATUS_THREAD: u32 = 0x2000_FF01;
 
@@ -769,8 +822,11 @@ fn interrupt(c: &mut Ctx) {
     // timer's, IP7: osSetIntMask): try again on a later call.
     // shortcut: either line lets every event through; tell retraces from
     // timers if a game masks only one of them.
-    let masked = INT_MASK.load(Ordering::Relaxed) && c.cop0[12] & 0x8400 == 0;
-    if c.cop0[12] & 1 == 0 || masked {
+    if c.cop0[12] & 1 == 0 {
+        c.deadline = c.clock;
+        return;
+    }
+    if os().int_mask && c.cop0[12] & 0x8400 == 0 {
         c.deadline = c.clock;
         return;
     }
@@ -902,7 +958,7 @@ fn spawn_thread(id: u32, generation: u64) {
             // system library builds, whose Status has FR clear: doubles
             // live in even/odd register pairs.
             // A game whose library differs names its own status word.
-            let status = match THREAD_STATUS.load(Ordering::Relaxed) {
+            let status = match st.settings.thread_status {
                 0 => STATUS_THREAD,
                 s => s,
             };
@@ -941,11 +997,13 @@ pub fn run(
     frame_limit: u64,
     devices: Box<dyn Devices>,
     save: Save,
+    settings: Settings,
 ) -> (Outcome, String, u64) {
     ctx.on_deadline = Some(interrupt);
     ctx.cop0[12] = STATUS_BOOT;
     ctx.deadline = TICKS_PER_FRAME;
     // Never freed: a stopped run's parked threads keep waiting on its lock.
+    let int_mask = settings.int_mask;
     let this: &'static Os = Box::leak(Box::new(Os {
         state: Mutex::new(State {
             threads: BTreeMap::new(),
@@ -963,7 +1021,10 @@ pub fn run(
             framebuffer: 0,
             devices,
             save,
-            dma_log: Vec::new(),
+            dma_log: HashMap::new(),
+            dma_count: 0,
+            settings,
+            rcp_mask: RCP_MASK_ALL,
             pif: [0; 64],
             report: String::new(),
             flash_page: [0xFF; 128],
@@ -973,6 +1034,7 @@ pub fn run(
         }),
         cv: Condvar::new(),
         ctx: AtomicPtr::new(ctx as *mut Ctx),
+        int_mask,
     }));
     MINE.set(Some(this));
     LAST.store(this as *const Os as *mut Os, Ordering::Release);
@@ -1035,16 +1097,35 @@ fn boot_returned(s: &State) -> bool {
         && s.threads.values().all(|t| t.state == TState::Dead)
 }
 
+/// What a run did, for its report.
+pub struct Summary {
+    /// Video retraces run.
+    pub frames: u64,
+    /// The cartridge DMA requests seen, each once, ordered by the latest
+    /// request that made it.
+    pub dma: Vec<Dma>,
+    /// The same copies ordered by the first request that made each one:
+    /// the closest to the order the game asked for them in.
+    pub dma_by_first: Vec<Dma>,
+    /// Cartridge DMA requests made, repeats included.
+    pub dma_count: u64,
+    /// The guest threads and their states.
+    pub threads: String,
+    /// The devices' own report.
+    pub devices: String,
+}
+
 /// The DMA log and frame count after a run, for reports.
-pub fn summary() -> (u64, Vec<(u32, u32, u32)>, String, String) {
+pub fn summary() -> Summary {
     let mut st = lock();
-    let devices = st.devices.summary();
-    (
-        st.frames,
-        st.dma_log.clone(),
-        st.describe_threads(),
-        devices,
-    )
+    Summary {
+        frames: st.frames,
+        dma: st.dma_copies(),
+        dma_by_first: st.dma_copies_by_first(),
+        dma_count: st.dma_count,
+        threads: st.describe_threads(),
+        devices: st.devices.summary(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1389,7 +1470,7 @@ fn cart_copy(c: &mut Ctx, st: &mut State, dev: u32, ram: u32, len: u32) {
     for k in 0..n {
         bytes[at + k] = st.rom.get(off + k).copied().unwrap_or(0);
     }
-    st.dma_log.push((off as u32, ram, len));
+    st.log_dma((off as u32, ram, len));
     c.overlay_loaded(off as u32, ram, len);
 }
 
@@ -1512,30 +1593,27 @@ fn write_pads(c: &mut Ctx, at: u32, pads: &[Pad; 4]) {
     }
 }
 
-fn write_status(c: &mut Ctx, at: u32, pads: &[Pad; 4]) {
+fn write_status(c: &mut Ctx, at: u32, pads: &[Pad; 4], rumble: bool) {
     for (k, p) in pads.iter().enumerate() {
         let a = at + 4 * k as u32;
         c.mem.write_u16(a, if p.connected { 0x0005 } else { 0 });
         // Pak status: a Rumble Pak when the game's config asks for one, as
         // the controller itself answers (see `run_pif`).
-        c.mem.write_u8(
-            a + 2,
-            u8::from(p.connected && RUMBLE.load(Ordering::Relaxed)),
-        );
+        c.mem.write_u8(a + 2, u8::from(p.connected && rumble));
         c.mem.write_u8(a + 3, if p.connected { 0 } else { 8 });
     }
 }
 
 fn os_cont_init(c: &mut Ctx) {
     let (bits, status) = (arg(c, 1), arg(c, 2));
-    let pads = lock().devices.pads();
+    let (pads, rumble) = pads_and_rumble();
     let mask = pads
         .iter()
         .enumerate()
         .filter(|(_, p)| p.connected)
         .fold(0u8, |m, (k, _)| m | 1 << k);
     c.mem.write_u8(bits, mask);
-    write_status(c, status, &pads);
+    write_status(c, status, &pads, rumble);
     ret(c, 0);
 }
 
@@ -1551,6 +1629,12 @@ fn os_cont_start(c: &mut Ctx) {
     put_message(c, &mut st, mq, msg, false);
     let _st = reschedule(c, st);
     ret(c, 0);
+}
+
+/// The controllers now, and whether each reports a Rumble Pak.
+fn pads_and_rumble() -> ([Pad; 4], bool) {
+    let mut st = lock();
+    (st.devices.pads(), st.settings.rumble)
 }
 
 fn os_cont_get_read_data(c: &mut Ctx) {
@@ -1571,7 +1655,7 @@ fn os_si_raw_start_dma(c: &mut Ctx) {
         }
         let pads = st.devices.pads();
         let st = &mut *st;
-        run_pif(&mut st.pif, &pads, &mut st.save);
+        run_pif(&mut st.pif, &pads, &mut st.save, st.settings.rumble);
     } else {
         for (k, &b) in st.pif.iter().enumerate() {
             c.mem.write_u8(buf + k as u32, b);
@@ -1588,7 +1672,7 @@ fn os_si_raw_start_dma(c: &mut Ctx) {
 /// reads and writes answer with a bad data CRC, as an empty slot does, and
 /// the status says no pak. Channel 4 is the cartridge
 /// EEPROM, when the game has one (see `Save::set_eeprom`).
-fn run_pif(pif: &mut [u8; 64], pads: &[Pad; 4], save: &mut Save) {
+fn run_pif(pif: &mut [u8; 64], pads: &[Pad; 4], save: &mut Save, rumble: bool) {
     let (mut i, mut ch) = (0, 0);
     while i < 63 {
         match pif[i] {
@@ -1626,7 +1710,6 @@ fn run_pif(pif: &mut [u8; 64], pads: &[Pad; 4], save: &mut Save) {
                         _ => None,
                     }
                 } else {
-                    let rumble = RUMBLE.load(Ordering::Relaxed);
                     pad.and_then(|p| match pif[cmd] {
                         pif::STATUS | pif::RESET => Some(vec![0x05, 0x00, u8::from(rumble)]),
                         pif::READ_BUTTONS => Some(vec![
@@ -1689,8 +1772,8 @@ fn pak_crc(data: &[u8]) -> u8 {
 
 fn os_cont_get_query(c: &mut Ctx) {
     let out = arg(c, 0);
-    let pads = lock().devices.pads();
-    write_status(c, out, &pads);
+    let (pads, rumble) = pads_and_rumble();
+    write_status(c, out, &pads, rumble);
 }
 
 fn os_sp_task_start_go(c: &mut Ctx) {
@@ -1802,31 +1885,21 @@ fn os_inval_icache(c: &mut Ctx) {
     c.code_written(ram, len);
 }
 
-/// The RCP interrupt lines (MI mask, bits 16 to 21 of an `OSIntMask`) as
-/// the game last set them; the CPU lines live in each thread's Status.
-static RCP_MASK: AtomicU32 = AtomicU32::new(0x3F);
-
-/// Whether `os_set_int_mask` masks (a game asks with `int_mask` in its
-/// config); otherwise it reports every line enabled and masks nothing.
-static INT_MASK: AtomicBool = AtomicBool::new(false);
-
-/// Whether each controller reports a Rumble Pak (a game asks with `rumble`
-/// in its config; others see no pak, as before).
-static RUMBLE: AtomicBool = AtomicBool::new(false);
-
 /// osSetIntMask: the CPU interrupt lines go into the running thread's
 /// Status (bits 8 to 15), as on the console, so a game that masks them
 /// around a list walk is not interrupted there (see `interrupt`). Returns
 /// the mask before.
 fn os_set_int_mask(c: &mut Ctx) {
-    if !INT_MASK.load(Ordering::Relaxed) {
+    if !os().int_mask {
         ret(c, 0x003F_FF01);
         return;
     }
+    let mut st = lock();
     let new = arg(c, 0);
     let status = c.cop0[12];
-    let old = 1 | (status & 0xFF00) | (RCP_MASK.load(Ordering::Relaxed) << 16);
-    RCP_MASK.store((new >> 16) & 0x3F, Ordering::Relaxed);
+    let old = 1 | (status & 0xFF00) | (st.rcp_mask << 16);
+    st.rcp_mask = (new >> 16) & RCP_MASK_ALL;
+    drop(st);
     c.cop0[12] = (status & !0xFF00) | (new & 0xFF00);
     ret(c, old);
 }
@@ -1907,16 +1980,15 @@ pub const TLB_REFILL: &str = "tlb_refill";
 
 /// Installs the replacements over the routines found in `addrs`
 /// (role name and guest address). A name may come more than once: a game can
-/// link a library routine into two segments. Returns the names installed.
+/// link a library routine into two segments. Config values among them
+/// (`thread_status`, `int_mask`, `rumble`) go into `settings`, for [`run`].
+/// Returns the names installed.
 pub fn install<'a>(
     ctx: &mut Ctx,
     addrs: impl IntoIterator<Item = (&'a String, &'a u32)>,
+    settings: &mut Settings,
 ) -> Vec<String> {
     let mut done = Vec::new();
-    THREAD_STATUS.store(0, Ordering::Relaxed);
-    INT_MASK.store(false, Ordering::Relaxed);
-    RUMBLE.store(false, Ordering::Relaxed);
-    RCP_MASK.store(0x3F, Ordering::Relaxed);
     for (name, &a) in addrs {
         if let Some((_, f)) = HOOKS.iter().find(|(h, _)| h == name) {
             ctx.set_override(a, *f);
@@ -1925,13 +1997,13 @@ pub fn install<'a>(
             ctx.tlb_refill = a;
             done.push(name.clone());
         } else if name == "thread_status" {
-            THREAD_STATUS.store(a, Ordering::Relaxed);
+            settings.thread_status = a;
             done.push(name.clone());
         } else if name == "int_mask" {
-            INT_MASK.store(a != 0, Ordering::Relaxed);
+            settings.int_mask = a != 0;
             done.push(name.clone());
         } else if name == "rumble" {
-            RUMBLE.store(a != 0, Ordering::Relaxed);
+            settings.rumble = a != 0;
             done.push(name.clone());
         }
     }
@@ -1967,12 +2039,15 @@ mod tests {
     #[test]
     fn the_interrupt_mask_goes_into_status_and_holds_back_interrupts() {
         let mut c = Ctx::new(n64rusty_runtime::Memory::new(0x1000));
+        enter(idle_state(), &mut c);
         c.cop0[12] = STATUS_THREAD;
         // Without the config name nothing is masked.
         c.r[4] = 1;
         os_set_int_mask(&mut c);
         assert_eq!(c.cop0[12], STATUS_THREAD);
-        INT_MASK.store(true, Ordering::Relaxed);
+        let mut st = idle_state();
+        st.settings.int_mask = true;
+        enter(st, &mut c);
         c.r[4] = 1; // OS_IM_NONE
         os_set_int_mask(&mut c);
         assert_eq!(c.r[2] as u32, 0x003F_FF01, "the mask before");
@@ -1986,7 +2061,126 @@ mod tests {
         os_set_int_mask(&mut c);
         assert_eq!(c.cop0[12], STATUS_THREAD);
         assert_eq!(c.r[2] as u32, 1);
-        INT_MASK.store(false, Ordering::Relaxed);
+    }
+
+    /// Makes `st` the run of this test's thread, with `c` its context.
+    fn enter(st: State, c: &mut Ctx) {
+        let int_mask = st.settings.int_mask;
+        let run: &'static Os = Box::leak(Box::new(Os {
+            state: Mutex::new(st),
+            cv: Condvar::new(),
+            ctx: AtomicPtr::new(c as *mut Ctx),
+            int_mask,
+        }));
+        MINE.set(Some(run));
+    }
+
+    #[test]
+    fn a_runs_settings_come_from_its_config_and_start_over_for_the_next_run() {
+        let mut c = Ctx::new(n64rusty_runtime::Memory::new(0x1000));
+        let config = BTreeMap::from([
+            ("thread_status".to_string(), 0x2400_FF01),
+            ("int_mask".to_string(), 1),
+            ("rumble".to_string(), 1),
+        ]);
+        let mut first = Settings::default();
+        assert_eq!(install(&mut c, &config, &mut first).len(), 3);
+        assert_eq!(
+            (first.thread_status, first.int_mask, first.rumble),
+            (0x2400_FF01, true, true)
+        );
+        let mut next = Settings::default();
+        install(&mut c, &BTreeMap::new(), &mut next);
+        assert_eq!(
+            (next.thread_status, next.int_mask, next.rumble),
+            (0, false, false)
+        );
+    }
+
+    #[test]
+    fn the_rcp_mask_is_kept_per_run() {
+        const RCP_NONE: u32 = 0x0000_FF01;
+        let mut c = Ctx::new(n64rusty_runtime::Memory::new(0x1000));
+        let mut st = idle_state();
+        st.settings.int_mask = true;
+        enter(st, &mut c);
+        c.cop0[12] = STATUS_THREAD;
+        c.r[4] = RCP_NONE as u64;
+        os_set_int_mask(&mut c);
+        assert_eq!(lock().rcp_mask, 0, "this run masked every RCP line");
+        // A new run starts with every RCP line enabled.
+        let mut st = idle_state();
+        st.settings.int_mask = true;
+        enter(st, &mut c);
+        c.r[4] = RCP_NONE as u64;
+        os_set_int_mask(&mut c);
+        assert_eq!(c.r[2] as u32 >> 16, RCP_MASK_ALL, "the mask before");
+    }
+
+    #[test]
+    fn rumble_is_reported_only_when_the_run_has_it() {
+        let mut pads = [Pad::default(); 4];
+        pads[0].connected = true;
+        // Channel 0: status (1 out, 3 back).
+        let status = |rumble: bool| {
+            let mut pif = [0u8; 64];
+            pif[..6].copy_from_slice(&[1, 3, 0x00, 0xFF, 0xFF, 0xFF]);
+            pif[6] = 0xFE;
+            run_pif(&mut pif, &pads, &mut Save::in_memory(), rumble);
+            pif[3..6].to_vec()
+        };
+        assert_eq!(status(false), [0x05, 0x00, 0]);
+        assert_eq!(status(true), [0x05, 0x00, 1]);
+        let mut c = Ctx::new(n64rusty_runtime::Memory::new(0x1000));
+        write_status(&mut c, 0x8000_0100, &pads, true);
+        assert_eq!(c.mem.read_u8(0x8000_0102), 1, "pak status");
+        write_status(&mut c, 0x8000_0100, &pads, false);
+        assert_eq!(c.mem.read_u8(0x8000_0102), 0);
+    }
+
+    #[test]
+    fn pokes_and_hash_out_are_the_runs_own() {
+        let path = std::env::temp_dir().join(format!("n64rusty-hash-{}", std::process::id()));
+        let mut c = Ctx::new(n64rusty_runtime::Memory::new(0x1000));
+        let mut st = idle_state();
+        st.settings.pokes = vec![Poke {
+            from: 2,
+            to: 3,
+            addr: 0x8000_0010,
+            value: 0xAB,
+            bytes: 1,
+        }];
+        st.settings.hash_out = Some(std::io::BufWriter::new(
+            std::fs::File::create(&path).unwrap(),
+        ));
+        apply_pokes(&mut c, &st, 1);
+        assert_eq!(c.mem.read_u8(0x8000_0010), 0, "not yet");
+        apply_pokes(&mut c, &st, 3);
+        assert_eq!(c.mem.read_u8(0x8000_0010), 0xAB);
+        write_hash(&c, &mut st, 3);
+        drop(st);
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(text, format!("3 {:016x}\n", ram_hash(c.mem.bytes())));
+        // Another run without them writes nothing.
+        let mut other = idle_state();
+        let mut d = Ctx::new(n64rusty_runtime::Memory::new(0x1000));
+        apply_pokes(&mut d, &other, 3);
+        write_hash(&d, &mut other, 3);
+        assert_eq!(d.mem.read_u8(0x8000_0010), 0);
+    }
+
+    #[test]
+    fn a_repeated_dma_is_kept_once_as_its_latest_request() {
+        let mut st = idle_state();
+        let (a, b) = ((0x1000, 0x8010_0000, 0x100), (0x2000, 0x8020_0000, 0x100));
+        st.log_dma(a);
+        st.log_dma(b);
+        st.log_dma(a);
+        assert_eq!(st.dma_log.len(), 2, "each copy once");
+        assert_eq!(st.dma_count, 3, "every request counted");
+        assert_eq!(st.dma_copies(), [b, a], "the latest request last");
+        assert_eq!(st.dma_copies_by_first(), [a, b], "the first request first");
     }
 
     #[test]
@@ -1997,7 +2191,7 @@ mod tests {
             let mut pif = [0u8; 64];
             pif[..10].copy_from_slice(&[0, 0, 0, 0, 1, 3, 0x00, 0xFF, 0xFF, 0xFF]);
             pif[10] = 0xFE;
-            run_pif(&mut pif, &pads, save);
+            run_pif(&mut pif, &pads, save, false);
             pif
         };
         assert_eq!(status(&mut Save::in_memory())[5] & 0x80, 0x80, "no reply");
@@ -2008,12 +2202,12 @@ mod tests {
         let mut pif = [0u8; 64];
         pif[..4].copy_from_slice(&[0, 0, 0, 0]);
         pif[4..18].copy_from_slice(&[10, 1, 0x05, 3, 1, 2, 3, 4, 5, 6, 7, 8, 0xFF, 0xFE]);
-        run_pif(&mut pif, &pads, &mut save);
+        run_pif(&mut pif, &pads, &mut save, false);
         let mut pif = [0u8; 64];
         pif[..4].copy_from_slice(&[0, 0, 0, 0]);
         pif[4..8].copy_from_slice(&[2, 8, 0x04, 3]);
         pif[16] = 0xFE;
-        run_pif(&mut pif, &pads, &mut save);
+        run_pif(&mut pif, &pads, &mut save, false);
         assert_eq!(pif[8..16], [1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
@@ -2110,7 +2304,10 @@ mod tests {
             framebuffer: 0,
             devices: Box::new(crate::devices::Headless),
             save: Save::in_memory(),
-            dma_log: Vec::new(),
+            dma_log: HashMap::new(),
+            dma_count: 0,
+            settings: Settings::default(),
+            rcp_mask: RCP_MASK_ALL,
             pif: [0; 64],
             report: String::new(),
             flash_page: [0xFF; 128],
@@ -2220,7 +2417,7 @@ mod tests {
         let mut pif = [0xFFu8; 64];
         pif[..4].fill(0);
         pif[61..64].copy_from_slice(&[0x40, 0, 0x04]);
-        run_pif(&mut pif, &pads, &mut save);
+        run_pif(&mut pif, &pads, &mut save, false);
         assert_eq!(pif[62] & 0x80, 0x80, "no reply");
     }
 
@@ -2248,19 +2445,19 @@ mod tests {
             1, 3, 0x00, 0xFF, 0xFF, 0xFF, 1, 4, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE,
         ];
         pif[..block.len()].copy_from_slice(&block);
-        run_pif(&mut pif, &pads, &mut Save::in_memory());
+        run_pif(&mut pif, &pads, &mut Save::in_memory(), false);
         assert_eq!(pif[3..6], [0x05, 0x00, 0x00]);
         assert_eq!(pif[7] & 0x80, 0x80);
         // Port 1: buttons.
         let mut pif = [0u8; 64];
         pif[..8].copy_from_slice(&[1, 4, 0x01, 0, 0, 0, 0, 0xFE]);
-        run_pif(&mut pif, &pads, &mut Save::in_memory());
+        run_pif(&mut pif, &pads, &mut Save::in_memory(), false);
         assert_eq!(pif[3..7], [0x10, 0x00, 5, 0xFD]);
         // Port 1: pak read (3 out, 33 back) answers with a bad CRC.
         let mut pif = [0u8; 64];
         pif[..5].copy_from_slice(&[3, 33, 0x02, 0x00, 0x00]);
         pif[38] = 0xFE;
-        run_pif(&mut pif, &pads, &mut Save::in_memory());
+        run_pif(&mut pif, &pads, &mut Save::in_memory(), false);
         assert_eq!(pif[37], 0xFF);
     }
 
@@ -2628,7 +2825,7 @@ mod tests {
         assert_eq!(ram_bytes(&c, DMA_RAM, 8), [0xAA; 8], "the rest of the ROM");
         assert_eq!(ram_bytes(&c, DMA_RAM + 8, 8), [0; 8], "past its end");
         assert_eq!(
-            st.dma_log,
+            st.dma_copies(),
             [(FROM, DMA_RAM, 0x10)],
             "logged as a ROM offset"
         );

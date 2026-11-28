@@ -183,6 +183,16 @@ impl Controller {
         std::mem::take(&mut self.start_screen)
     }
 
+    /// Lets go of every button, stick, trigger and the hat, as when the
+    /// app loses focus and their releases never arrive. A pending start
+    /// screen request stays.
+    pub fn release_all(&mut self) {
+        *self = Controller {
+            start_screen: self.start_screen,
+            ..Default::default()
+        };
+    }
+
     /// Takes in a window event; true if it was the controller's.
     pub fn event(&mut self, event: &WindowEvent) -> bool {
         match event {
@@ -347,6 +357,22 @@ mod tests {
             c.pad().buttons & (button::C_UP | button::R),
             button::C_UP | button::R
         );
+    }
+
+    #[test]
+    fn releasing_all_lets_go_of_every_input() {
+        let mut c = Controller {
+            buttons: button::A,
+            left: (0.9, 0.0),
+            right: (-0.9, 0.0),
+            triggers: (1.0, 1.0),
+            hat: (0.0, 1.0),
+            start_screen: true,
+            ..Default::default()
+        };
+        c.release_all();
+        assert_eq!(c.pad(), Pad::default());
+        assert!(c.wants_start_screen(), "a pending start screen was lost");
     }
 
     #[test]

@@ -40,6 +40,7 @@ fn run(ctx: &'static mut Ctx, frames: u64) -> (os::Outcome, u64) {
         frames,
         Box::new(n64rusty_runner::devices::Headless),
         Save::in_memory(),
+        os::Settings::default(),
     );
     (outcome, frames)
 }

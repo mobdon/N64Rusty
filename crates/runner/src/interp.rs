@@ -8,20 +8,37 @@
 //! `record_run`), so the next translate covers it.
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use n64rusty_refcpu::{Cpu, Stop};
 use n64rusty_runtime::Ctx;
 
-/// First-run snapshots of the RAM around each interpreted function: entry
-/// address to (start of the snapshot, bytes).
-static SEEN: Mutex<BTreeMap<u32, (u32, Vec<u8>)>> = Mutex::new(BTreeMap::new());
+/// Interpreted functions: entry address to (start, length) of the RAM
+/// snapshot saved for it when first run. The bytes themselves go to disk
+/// then (see [`install`]), so a run that interprets every call does not keep
+/// up to 8 MiB of RAM for each function.
+pub(crate) type Seen = BTreeMap<u32, (u32, usize)>;
+
+/// This run's [`Seen`]. A global because `Ctx::on_missing` is a plain
+/// `fn(&mut Ctx, u32)`.
+static SEEN: Mutex<Seen> = Mutex::new(BTreeMap::new());
 
 /// The RAM range to save around a function, given RAM and its address.
 pub(crate) type Snapshot = Box<dyn Fn(&[u8], u32) -> Option<(u32, u32)> + Send>;
 
-static REGION: Mutex<Option<Snapshot>> = Mutex::new(None);
+/// How this run saves the code it interprets.
+struct Saver {
+    /// The RAM range to save for a function.
+    region: Snapshot,
+    /// The folder the snapshots go to, as `<start>_<entry>.bin`.
+    images: PathBuf,
+    /// Whether a failed write has been reported (once per run).
+    warned: bool,
+}
+
+static SAVER: Mutex<Option<Saver>> = Mutex::new(None);
 
 /// Where the interpreter last left its own RAM path (a device register, a
 /// TLB address, a bad pointer): the instruction a crash there is at.
@@ -40,18 +57,61 @@ fn watch_addr() -> Option<usize> {
     Some((a & 0x1FFF_FFFC) as usize)
 }
 
-/// Makes `ctx` interpret calls to untranslated code; `region` gives the RAM
-/// range to save for a function it runs.
-pub(crate) fn install(ctx: &mut Ctx, region: Snapshot) {
-    *REGION.lock().unwrap() = Some(region);
+/// Makes `ctx` interpret calls to untranslated code. `region` gives the RAM
+/// range to save for a function it runs; the bytes are written to `images`
+/// when the function first runs, as `<start>_<entry>.bin`.
+pub(crate) fn install(ctx: &mut Ctx, region: Snapshot, images: PathBuf) {
+    *SAVER.lock().unwrap() = Some(Saver {
+        region,
+        images,
+        warned: false,
+    });
     // Saved for this game's run log only, not the one played before.
     SEEN.lock().unwrap().clear();
     ctx.on_missing = Some(run);
 }
 
-/// The functions interpreted so far, with their saved RAM.
-pub(crate) fn seen() -> BTreeMap<u32, (u32, Vec<u8>)> {
+/// The functions interpreted so far, with their saved RAM ranges.
+pub(crate) fn seen() -> Seen {
     SEEN.lock().unwrap().clone()
+}
+
+/// Writes `bytes`, the RAM from `lo` around the function at `entry`, to
+/// `images`.
+fn save_image(images: &Path, lo: u32, entry: u32, bytes: &[u8]) -> std::io::Result<PathBuf> {
+    let path = images.join(format!("{lo:08x}_{entry:08x}.bin"));
+    std::fs::create_dir_all(images)?;
+    std::fs::write(&path, bytes)?;
+    Ok(path)
+}
+
+/// Saves the RAM around `entry` as it is now, and returns the (start,
+/// length) to record. A failed write is reported once and recorded as
+/// length 0, so the run log never names an image that is not there.
+fn snapshot(ctx: &Ctx, entry: u32) -> (u32, usize) {
+    let mut saver = SAVER.lock().unwrap();
+    let Some(saver) = saver.as_mut() else {
+        return (entry, 0);
+    };
+    let (lo, hi) = (saver.region)(ctx.mem.bytes(), entry).unwrap_or((entry, entry));
+    let at = |a: u32| (ctx.mem.kseg0(a) & 0x1FFF_FFFF) as usize;
+    let bytes = ctx.mem.bytes().get(at(lo)..at(hi)).unwrap_or_default();
+    if bytes.is_empty() {
+        return (lo, 0);
+    }
+    match save_image(&saver.images, lo, entry, bytes) {
+        Ok(_) => (lo, bytes.len()),
+        Err(e) => {
+            if !saver.warned {
+                saver.warned = true;
+                eprintln!(
+                    "warning: could not save interpreted code to {}: {e} (later failures not shown)",
+                    saver.images.display()
+                );
+            }
+            (lo, 0)
+        }
+    }
 }
 
 fn load(cpu: &mut Cpu, c: &Ctx) {
@@ -71,18 +131,9 @@ fn run(ctx: &mut Ctx, entry: u32) {
     // Code `--interpret` sends here may have a translation: nothing to save.
     let translated = ctx.interpret.is_some() && ctx.has_translation(entry);
     let mut seen = SEEN.lock().unwrap();
-    if !translated {
-        seen.entry(entry).or_insert_with(|| {
-            let region = REGION
-                .lock()
-                .unwrap()
-                .as_ref()
-                .and_then(|f| f(ctx.mem.bytes(), entry));
-            let (lo, hi) = region.unwrap_or((entry, entry));
-            let at = |a: u32| (ctx.mem.kseg0(a) & 0x1FFF_FFFF) as usize;
-            let bytes = ctx.mem.bytes().get(at(lo)..at(hi)).unwrap_or_default();
-            (lo, bytes.to_vec())
-        });
+    if !translated && !seen.contains_key(&entry) {
+        let saved = snapshot(ctx, entry);
+        seen.insert(entry, saved);
     }
     drop(seen);
     let mut cpu = Cpu::new(Vec::new());
@@ -253,8 +304,81 @@ mod tests {
     use super::*;
     use n64rusty_runtime::{sx32, Memory};
 
+    /// The tests share the installed snapshot rule and the saved snapshots:
+    /// one at a time.
+    static ONE: Mutex<()> = Mutex::new(());
+
+    /// An empty folder for one test's saved images.
+    fn images_dir(test: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("n64rusty-interp-{test}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn each_function_is_saved_as_it_was_when_first_run() {
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        const BLOB: u32 = 0x8000_4000;
+        const BLOB_END: u32 = BLOB + 0x20;
+        let images = images_dir("first-run");
+        let mut ctx = Ctx::new(Memory::new(0x10000));
+        // Two functions, each `jr ra; nop`, in one blob of written code.
+        for f in [BLOB, BLOB + 0x10] {
+            ctx.mem.write_u32(f, 0x03E0_0008);
+        }
+        install(
+            &mut ctx,
+            Box::new(|_, _| Some((BLOB, BLOB_END))),
+            images.clone(),
+        );
+        ctx.r[31] = sx32(0x8000_0F00);
+        ctx.call(BLOB);
+        // The blob changes after the first function ran, before the second.
+        ctx.mem.write_u32(BLOB + 0x08, 0x1234_5678);
+        ctx.r[31] = sx32(0x8000_0F00);
+        ctx.call(BLOB + 0x10);
+        // Changed again, then the first runs again: its image stays.
+        ctx.mem.write_u32(BLOB + 0x0C, 0x9ABC_DEF0);
+        ctx.r[31] = sx32(0x8000_0F00);
+        ctx.call(BLOB);
+        let seen = seen();
+        assert_eq!(seen[&BLOB], (BLOB, 0x20));
+        assert_eq!(seen[&(BLOB + 0x10)], (BLOB, 0x20));
+        let image = |name: &str| std::fs::read(images.join(name)).unwrap();
+        let (first, second) = (
+            image("80004000_80004000.bin"),
+            image("80004000_80004010.bin"),
+        );
+        assert_eq!(first[..4], 0x03E0_0008u32.to_be_bytes());
+        assert_eq!(first[0x08..0x10], [0; 8], "as it was when first run");
+        assert_eq!(second[0x08..0x0C], 0x1234_5678u32.to_be_bytes());
+        assert_eq!(second[0x0C..0x10], [0; 4]);
+        std::fs::remove_dir_all(images).unwrap();
+    }
+
+    #[test]
+    fn a_failed_save_records_nothing_to_translate() {
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ctx = Ctx::new(Memory::new(0x10000));
+        ctx.mem.write_u32(0x8000_4000, 0x03E0_0008);
+        // A file where the folder should be: the write fails.
+        let images = images_dir("failed-save");
+        std::fs::write(&images, b"not a folder").unwrap();
+        install(&mut ctx, Box::new(|_, a| Some((a, a + 32))), images.clone());
+        ctx.r[31] = sx32(0x8000_0F00);
+        ctx.call(0x8000_4000);
+        assert_eq!(
+            seen()[&0x8000_4000],
+            (0x8000_4000, 0),
+            "no image, no length"
+        );
+        std::fs::remove_file(images).unwrap();
+    }
+
     #[test]
     fn untranslated_code_runs_and_calls_translated_code() {
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
         fn translated(c: &mut Ctx) {
             c.r[2] = 41;
         }
@@ -275,17 +399,22 @@ mod tests {
             ctx.mem.write_u32(0x8000_1000 + 4 * k as u32, *w);
         }
         ctx.register(0x8000_2000, translated);
-        install(&mut ctx, Box::new(|_, a| Some((a, a + 32))));
+        install(
+            &mut ctx,
+            Box::new(|_, a| Some((a, a + 32))),
+            images_dir("other"),
+        );
         ctx.r[29] = sx32(0x8000_8000);
         ctx.r[31] = sx32(0x8000_0F00);
         ctx.call(0x8000_1000);
         assert_eq!(ctx.r[2], 42);
         assert_eq!(ctx.r[29], sx32(0x8000_8000));
-        assert_eq!(seen()[&0x8000_1000].1.len(), 32);
+        assert_eq!(seen()[&0x8000_1000], (0x8000_1000, 32));
     }
 
     #[test]
     fn calls_into_saved_image_code_run_its_translation() {
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
         fn translated(c: &mut Ctx) {
             c.r[2] = 41;
         }
@@ -316,7 +445,11 @@ mod tests {
         );
         // The same snapshot rule as the other test: they run in parallel and
         // share the installed rule.
-        install(&mut ctx, Box::new(|_, a| Some((a, a + 32))));
+        install(
+            &mut ctx,
+            Box::new(|_, a| Some((a, a + 32))),
+            images_dir("other"),
+        );
         ctx.r[29] = sx32(0x8000_8000);
         ctx.r[31] = sx32(0x8000_0F00);
         ctx.call(0x8000_3000);
@@ -325,13 +458,18 @@ mod tests {
 
     #[test]
     fn cop0_moves_go_through_the_runtime() {
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
         let mut ctx = Ctx::new(Memory::new(0x10000));
         // mtc0 a0,Status; mfc0 v0,Status; jr ra; nop
         let code = [0x4084_6000u32, 0x4002_6000, 0x03E0_0008, 0];
         for (k, w) in code.iter().enumerate() {
             ctx.mem.write_u32(0x8000_3000 + 4 * k as u32, *w);
         }
-        install(&mut ctx, Box::new(|_, a| Some((a, a + 32))));
+        install(
+            &mut ctx,
+            Box::new(|_, a| Some((a, a + 32))),
+            images_dir("other"),
+        );
         ctx.r[4] = 0x1234;
         ctx.r[31] = sx32(0x8000_0F00);
         ctx.call(0x8000_3000);

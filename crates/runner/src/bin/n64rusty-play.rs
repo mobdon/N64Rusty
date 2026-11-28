@@ -25,7 +25,7 @@ use std::process::ExitCode;
 use n64rusty_host::launcher::Page;
 use n64rusty_host::one_window::Next;
 use n64rusty_rom::{signature, Rom};
-use n64rusty_runner::{main_args, os, read_names, routine_list, Game, ROM_EXTENSIONS};
+use n64rusty_runner::{main_args_with_start_screen, os, read_names, routine_list, Game, ROM_EXTENSIONS};
 
 /// Files built into the player (see build.rs): fingerprints and routine
 /// lists for games the fingerprints alone cannot set up.
@@ -40,9 +40,33 @@ mod built {
 /// built-in one.
 const FROM_MAP: &str = "// from a symbol map";
 
-/// How [`routines`] starts its error for a ROM no fingerprint matches, which
-/// [`friendly`] tells apart from a file that is not a ROM.
+/// How [`routines`] starts its error for a ROM no fingerprint matches.
 const NOT_SET_UP: &str = "no system routines found";
+
+/// Why a game cannot start, so [`friendly`] tells the player the right
+/// thing.
+#[derive(Debug)]
+enum CannotPlay {
+    /// The file could not be read as an N64 ROM.
+    NotARom(String),
+    /// A ROM, but no fingerprint matches its system routines yet.
+    NotSetUp(String),
+    /// Anything else: a symbol map, folder or config that cannot be used.
+    Other(String),
+}
+
+impl std::fmt::Display for CannotPlay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (CannotPlay::NotARom(e) | CannotPlay::NotSetUp(e) | CannotPlay::Other(e)) = self;
+        f.write_str(e)
+    }
+}
+
+impl From<String> for CannotPlay {
+    fn from(e: String) -> Self {
+        CannotPlay::Other(e)
+    }
+}
 
 /// The run.toml key of widescreen HUD areas: a run.toml without it is
 /// replaced by the built-in one.
@@ -125,8 +149,6 @@ fn play(args: &mut Vec<String>, dir: &Path, plain: bool) -> ExitCode {
     if let (false, Some(built)) = (settings.exists(), built::get("settings.toml")) {
         let _ = std::fs::write(&settings, built);
     }
-    // Its Game menu can go back to the start screen.
-    n64rusty_host::menu::START_SCREEN.store(true, std::sync::atomic::Ordering::Relaxed);
     if args.first().is_none_or(|a| a.starts_with("--")) {
         let recent = n64rusty_host::menu::recent_roms();
         let page = match args.as_slice() {
@@ -223,21 +245,57 @@ fn play_on(args: &mut Vec<String>, dir: &Path, mut plain: bool) -> ExitCode {
 }
 
 /// What a player is told when a game cannot start.
-fn friendly(error: &str) -> String {
-    if error.contains(NOT_SET_UP) {
-        "This game has not been set up for N64Rusty yet, so it cannot run. \
-         Pick another game."
-            .into()
-    } else {
-        format!("This file could not be opened as an N64 game.\n\n{error}")
+fn friendly(error: &CannotPlay) -> String {
+    match error {
+        CannotPlay::NotSetUp(_) => "This game has not been set up for N64Rusty yet, so it \
+                                    cannot run. Pick another game."
+            .into(),
+        CannotPlay::NotARom(e) => {
+            format!("This file could not be opened as an N64 game.\n\n{e}")
+        }
+        CannotPlay::Other(e) => format!("This game could not be started.\n\n{e}"),
     }
 }
 
 #[test]
 fn a_game_not_set_up_yet_gets_a_plain_message() {
     let e = "no system routines found in this ROM, so it cannot run yet (x has 3 fingerprints)";
-    assert!(friendly(e).contains("not been set up"));
-    assert!(friendly("game.z64: not an N64 ROM").contains("not an N64 ROM"));
+    assert!(friendly(&CannotPlay::NotSetUp(e.into())).contains("not been set up"));
+    let not_rom = friendly(&CannotPlay::NotARom("game.z64: not an N64 ROM".into()));
+    assert!(not_rom.contains("could not be opened as an N64 game"));
+    assert!(not_rom.contains("not an N64 ROM"));
+}
+
+#[test]
+fn only_a_file_that_is_not_a_rom_is_called_one() {
+    let e = "typo.map: The system cannot find the file specified.".to_string();
+    let told = friendly(&CannotPlay::from(e));
+    assert!(
+        !told.contains("could not be opened as an N64 game"),
+        "{told}"
+    );
+    assert!(told.contains("typo.map"));
+}
+
+#[test]
+fn a_bad_symbols_path_for_a_real_rom_is_not_called_a_bad_rom() {
+    let dir = std::env::temp_dir().join(format!("n64rusty-bad-symbols-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // The smallest cartridge a ROM reads as: big-endian magic, zeros.
+    let mut cart = vec![0u8; 0x101000];
+    cart[..4].copy_from_slice(&[0x80, 0x37, 0x12, 0x40]);
+    let rom = dir.join("game.z64");
+    std::fs::write(&rom, &cart).unwrap();
+    let missing = dir.join("typo.map");
+    let mut args = vec![
+        rom.display().to_string(),
+        "--symbols".into(),
+        missing.display().to_string(),
+    ];
+    let e = played(&mut args, &dir, false).unwrap_err();
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert!(matches!(e, CannotPlay::Other(_)), "{e:?}");
+    assert!(e.to_string().contains("typo.map"), "{e}");
 }
 
 /// The start screen's games: those played before, then every ROM in `dir`
@@ -254,12 +312,12 @@ fn games(dir: &Path) -> Vec<PathBuf> {
 
 /// Plays the ROM `args` starts with. `Err` when it cannot start: not a ROM,
 /// or a game the player cannot set up yet.
-fn played(args: &mut Vec<String>, dir: &Path, plain: bool) -> Result<ExitCode, String> {
+fn played(args: &mut Vec<String>, dir: &Path, plain: bool) -> Result<ExitCode, CannotPlay> {
     let recent = dir.join("recent.txt");
     let rom = std::fs::read(&args[0])
         .map_err(|e| e.to_string())
         .and_then(|b| Rom::from_bytes(b).map_err(|e| e.to_string()))
-        .map_err(|e| format!("{}: {e}", args[0]))?;
+        .map_err(|e| CannotPlay::NotARom(format!("{}: {e}", args[0])))?;
     let local = dir.join("games").join(&rom.sha256);
     routines(args, dir, &rom, &local)?;
     // Remembered once it is known to be a ROM the player can set up.
@@ -308,13 +366,13 @@ fn played(args: &mut Vec<String>, dir: &Path, plain: bool) -> Result<ExitCode, S
         entry: rom.entry(),
         sha256: rom.sha256.clone().leak(),
     };
-    Ok(main_args(game, None, std::mem::take(args)))
+    Ok(main_args_with_start_screen(game, std::mem::take(args)))
 }
 
 /// Makes sure the game has a routine list: from `--symbols` maps (also
 /// adding their fingerprints to `routines.txt`), or found with the
 /// fingerprints when there is none yet.
-fn routines(args: &[String], dir: &Path, rom: &Rom, local: &Path) -> Result<(), String> {
+fn routines(args: &[String], dir: &Path, rom: &Rom, local: &Path) -> Result<(), CannotPlay> {
     let err = |p: &Path, e: std::io::Error| format!("{}: {e}", p.display());
     std::fs::create_dir_all(local).map_err(|e| err(local, e))?;
     let config = local.join("config.toml");
@@ -349,7 +407,7 @@ fn routines(args: &[String], dir: &Path, rom: &Rom, local: &Path) -> Result<(), 
     if let Some(list) = built::get(&format!("games/{}/config.toml", rom.sha256)) {
         // Also replaces a list an older player found by fingerprint.
         if !have.is_some_and(|h| h.starts_with(FROM_MAP)) {
-            return std::fs::write(&config, list).map_err(|e| err(&config, e));
+            return std::fs::write(&config, list).map_err(|e| err(&config, e).into());
         }
         return Ok(());
     }
@@ -368,17 +426,17 @@ fn routines(args: &[String], dir: &Path, rom: &Rom, local: &Path) -> Result<(), 
         config.display()
     );
     if found.is_empty() {
-        return Err(format!(
+        return Err(CannotPlay::NotSetUp(format!(
             "{NOT_SET_UP} in this ROM, so it cannot run yet ({} has {} fingerprints)",
             prints.display(),
             known.lines().count()
-        ));
+        )));
     }
     let list: String = found
         .iter()
         .map(|(a, n)| format!("{n} = {a:#010x}\n"))
         .collect();
-    std::fs::write(&config, list).map_err(|e| err(&config, e))
+    std::fs::write(&config, list).map_err(|e| err(&config, e).into())
 }
 
 /// Writes `config` with the routines named in the symbol `maps` and returns

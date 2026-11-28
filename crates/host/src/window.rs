@@ -186,6 +186,32 @@ impl<G: Guest> App<G> {
         }
     }
 
+    /// The window gained or lost focus. A phone pauses the game while it
+    /// is away.
+    fn focus(&mut self, focused: bool) {
+        if !focused {
+            self.release_input();
+        }
+        if cfg!(target_os = "android") {
+            self.away = !focused;
+        }
+    }
+
+    /// The app went out of sight (Android: suspended): the game pauses.
+    fn leave(&mut self) {
+        self.away = true;
+        self.release_input();
+    }
+
+    /// Lets go of every held key and controller input: releases are lost
+    /// while the window is unfocused or the app suspended, and a press must
+    /// never stay stuck down afterwards.
+    fn release_input(&mut self) {
+        self.keys.clear();
+        #[cfg(target_os = "android")]
+        self.pad.release_all();
+    }
+
     fn live_pads(&mut self) -> Pads {
         let mut pads = Pads::default();
         let gilrs = &mut self.gilrs;
@@ -259,7 +285,7 @@ impl<G: Guest> ApplicationHandler for App<G> {
         };
         match window {
             Ok(window) => {
-                self.menu = Menu::new(&window, &self.cfg.window);
+                self.menu = Menu::new(&window, &self.cfg.window, self.cfg.start_screen);
                 self.attach(window.clone());
                 self.window = Some(window);
                 self.view();
@@ -298,22 +324,13 @@ impl<G: Guest> ApplicationHandler for App<G> {
                     self.keys.remove(&key);
                 }
             }
-            WindowEvent::Focused(focused) => {
-                // Key releases are lost while unfocused; never leave a key
-                // stuck down. A phone pauses the game while it is away.
-                if !focused {
-                    self.keys.clear();
-                }
-                if cfg!(target_os = "android") {
-                    self.away = !focused;
-                }
-            }
+            WindowEvent::Focused(focused) => self.focus(focused),
             _ => {}
         }
     }
 
     fn suspended(&mut self, _: &ActiveEventLoop) {
-        self.away = true;
+        self.leave();
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
@@ -356,5 +373,58 @@ impl<G: Guest> ApplicationHandler for App<G> {
             next = next.min(r.next());
         }
         event_loop.set_control_flow(ControlFlow::WaitUntil(next));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Idle;
+    impl Guest for Idle {
+        fn frame(&mut self, _: u64, _: &Pads) {}
+    }
+
+    fn app() -> App<Idle> {
+        let cfg = RunConfig::default();
+        App {
+            session: Session::new(Idle, &cfg).unwrap(),
+            pacer: Pacer::new(cfg.frame_rate, Instant::now()),
+            cfg,
+            redraw: None,
+            window: None,
+            menu: None,
+            keys: HashSet::from([KeyCode::KeyJ, KeyCode::KeyW]),
+            gilrs: None,
+            named: Vec::new(),
+            error: None,
+            #[cfg(target_os = "android")]
+            pad: Default::default(),
+            away: false,
+        }
+    }
+
+    #[test]
+    fn losing_focus_lets_go_of_held_keys() {
+        let mut a = app();
+        a.focus(true);
+        assert_eq!(a.keys.len(), 2, "gaining focus dropped held keys");
+        a.focus(false);
+        assert!(a.keys.is_empty());
+        assert_eq!(a.live_pads(), Pads::default());
+    }
+
+    #[test]
+    fn being_suspended_lets_go_of_held_keys_and_pauses() {
+        let mut a = app();
+        assert_ne!(
+            a.live_pads(),
+            Pads::default(),
+            "the held keys did not press"
+        );
+        a.leave();
+        assert!(a.away);
+        assert!(a.keys.is_empty());
+        assert_eq!(a.live_pads(), Pads::default());
     }
 }

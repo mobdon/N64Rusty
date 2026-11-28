@@ -101,34 +101,33 @@ impl Player {
     }
 }
 
-/// Records the controller states of each frame, writing only changes.
+/// The first line of a recorded script.
+pub const RECORD_HEADER: &str = "# n64rusty input script: frame port buttons x y\n";
+
+/// Records the controller states of each frame as script lines, writing
+/// only changes. It keeps only the last frame's states, so a long run's
+/// recording costs no memory: the caller streams each frame's lines out.
 #[derive(Default)]
 pub struct Recorder {
     last: Option<Pads>,
-    text: String,
 }
 
 impl Recorder {
-    /// Takes in the states of `frame`, writing the ports that changed.
-    pub fn record(&mut self, frame: u64, pads: &Pads) {
-        if self.text.is_empty() {
-            self.text
-                .push_str("# n64rusty input script: frame port buttons x y\n");
+    /// Takes in the states of `frame` and appends its lines to `out`: the
+    /// header first on the first frame, then the ports that changed.
+    pub fn record(&mut self, frame: u64, pads: &Pads, out: &mut String) {
+        if self.last.is_none() {
+            out.push_str(RECORD_HEADER);
         }
         for (port, pad) in pads.iter().enumerate() {
             // The first frame writes every port, so a replay starts from a known state.
             if self.last.map_or(true, |last| last[port] != *pad) {
                 let buttons = ButtonNames(pad.buttons);
                 let line = format!("{frame} {} {buttons} {} {}\n", port + 1, pad.x, pad.y);
-                self.text.push_str(&line);
+                out.push_str(&line);
             }
         }
         self.last = Some(*pads);
-    }
-
-    /// The script so far, header first.
-    pub fn text(&self) -> &str {
-        &self.text
     }
 }
 
@@ -167,13 +166,31 @@ mod tests {
             })
             .collect();
         let mut rec = Recorder::default();
+        let mut text = String::new();
         for (f, pads) in frames.iter().enumerate() {
-            rec.record(f as u64, pads);
+            rec.record(f as u64, pads, &mut text);
         }
-        let mut player = Player::new(parse(rec.text()).unwrap());
+        assert!(text.starts_with(RECORD_HEADER));
+        let mut player = Player::new(parse(&text).unwrap());
         for (f, pads) in frames.iter().enumerate() {
             assert_eq!(player.pads_at(f as u64), *pads, "frame {f}");
         }
+    }
+
+    #[test]
+    fn a_frame_like_the_last_adds_nothing() {
+        let mut rec = Recorder::default();
+        let mut first = String::new();
+        rec.record(0, &Pads::default(), &mut first);
+        assert_eq!(first.lines().count(), 1 + 4, "{first}");
+        let mut same = String::new();
+        rec.record(1, &Pads::default(), &mut same);
+        assert_eq!(same, "");
+        let mut pads = Pads::default();
+        pads[2].buttons = button::B;
+        let mut changed = String::new();
+        rec.record(2, &pads, &mut changed);
+        assert_eq!(changed, "2 3 B 0 0\n");
     }
 
     #[test]
