@@ -7,12 +7,29 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::Mutex;
 
-use n64rusty_mod_api::{Api, Hook, INSTALL, VERSION, VERSION_FN};
+use n64rusty_mod_api::{Api, Hook, HookWith, INSTALL, VERSION, VERSION_FN};
 use n64rusty_runtime::Ctx;
 
 /// Mod hooks by the guest address they replace, in load order: the last
 /// runs first, and its `call_original` reaches the one before.
-static HOOKS: Mutex<Option<HashMap<u32, Vec<Hook>>>> = Mutex::new(None);
+static HOOKS: Mutex<Option<HashMap<u32, Vec<ModHook>>>> = Mutex::new(None);
+
+/// A mod's hook, with the data it was set with if any; the data is kept as
+/// an address so [`HOOKS`] stays `Send`.
+#[derive(Clone, Copy)]
+enum ModHook {
+    Plain(Hook),
+    With(HookWith, usize),
+}
+
+impl ModHook {
+    fn run(self, c: *mut c_void) {
+        match self {
+            ModHook::Plain(h) => h(c),
+            ModHook::With(h, data) => h(c, data as *mut c_void),
+        }
+    }
+}
 
 thread_local! {
     /// The hooked calls running on this thread: the address and which of
@@ -156,6 +173,14 @@ extern "C" fn handoff(len: *mut usize) -> *const u8 {
 }
 
 extern "C" fn set_override(addr: u32, hook: Hook) {
+    add_hook(addr, ModHook::Plain(hook));
+}
+
+extern "C" fn set_override_with(addr: u32, hook: HookWith, data: *mut c_void) {
+    add_hook(addr, ModHook::With(hook, data as usize));
+}
+
+fn add_hook(addr: u32, hook: ModHook) {
     HOOKS
         .lock()
         .unwrap()
@@ -166,7 +191,7 @@ extern "C" fn set_override(addr: u32, hook: Hook) {
 }
 
 /// The hooks on `addr`, copied: hooks call back in here.
-fn chain(addr: u32) -> Vec<Hook> {
+fn chain(addr: u32) -> Vec<ModHook> {
     HOOKS
         .lock()
         .unwrap()
@@ -192,7 +217,7 @@ extern "C" fn call_original(c: *mut c_void, addr: u32) {
     let Some(i) = below else {
         return original(ctx(c), addr);
     };
-    chain(addr)[i](c);
+    chain(addr)[i].run(c);
     // Back to the calling hook, which may call the original again.
     STACK.with_borrow_mut(|s| {
         if let Some(top) = s.last_mut() {
@@ -226,7 +251,7 @@ fn dispatch(c: &mut Ctx) {
         return original(c, addr);
     };
     STACK.with_borrow_mut(|s| s.push((addr, hooks.len() - 1)));
-    last(c as *mut Ctx as *mut c_void);
+    last.run(c as *mut Ctx as *mut c_void);
     STACK.with_borrow_mut(|s| s.pop());
 }
 
@@ -296,6 +321,7 @@ pub fn install(
         regs,
         switch_game,
         handoff,
+        set_override_with,
     }));
     for (name, lib) in libs {
         // SAFETY: the mod API's documented signature.
@@ -354,7 +380,7 @@ mod tests {
 
     /// Runs the game's call of [`CHAINED`] (its own function marks `o`)
     /// with `hooks` set in load order; returns the marks.
-    fn run_chain(hooks: &[Hook]) -> Vec<char> {
+    fn run_chain(hooks: &[ModHook]) -> Vec<char> {
         fn orig(_: &mut Ctx) {
             seen('o');
         }
@@ -364,7 +390,7 @@ mod tests {
         let mut c = Ctx::new(n64rusty_runtime::Memory::new(16));
         c.set_override(CHAINED, orig);
         for h in hooks {
-            set_override(CHAINED, *h);
+            add_hook(CHAINED, *h);
         }
         route(&mut c);
         c.call(CHAINED);
@@ -374,13 +400,19 @@ mod tests {
     #[test]
     fn hooks_on_one_address_chain_in_load_order() {
         let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
-        assert_eq!(run_chain(&[a, b]), ['B', 'A', 'o']);
+        assert_eq!(
+            run_chain(&[ModHook::Plain(a), ModHook::Plain(b)]),
+            ['B', 'A', 'o']
+        );
     }
 
     #[test]
     fn a_hook_that_skips_the_original_ends_the_chain() {
         let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
-        assert_eq!(run_chain(&[a, b_alone]), ['B']);
+        assert_eq!(
+            run_chain(&[ModHook::Plain(a), ModHook::Plain(b_alone)]),
+            ['B']
+        );
     }
 
     #[test]
@@ -392,6 +424,46 @@ mod tests {
         set_override(CHAINED, b);
         drop_hooks_since(&before);
         assert_eq!(hooked()[&CHAINED], 1);
+    }
+
+    /// A mod's state, handed to its hooks as data.
+    static MARK: char = 'D';
+    extern "C" fn with(c: *mut c_void, data: *mut c_void) {
+        // SAFETY: set with `&MARK` below.
+        seen(*unsafe { n64rusty_mod_api::state::<char>(data) });
+        call_original(c, CHAINED);
+    }
+    fn mark() -> usize {
+        &MARK as *const char as usize
+    }
+
+    #[test]
+    fn a_data_hook_gets_its_data() {
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(run_chain(&[ModHook::With(with, mark())]), ['D', 'o']);
+    }
+
+    #[test]
+    fn plain_and_data_hooks_chain_in_load_order() {
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let hooks = [
+            ModHook::Plain(a),
+            ModHook::With(with, mark()),
+            ModHook::Plain(b),
+        ];
+        assert_eq!(run_chain(&hooks), ['B', 'D', 'A', 'o']);
+    }
+
+    #[test]
+    fn a_declined_mod_drops_its_data_hook() {
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        *HOOKS.lock().unwrap() = None;
+        set_override(CHAINED, a);
+        let before = hooked();
+        set_override_with(CHAINED, with, mark() as *mut c_void);
+        drop_hooks_since(&before);
+        assert_eq!(hooked()[&CHAINED], 1);
+        assert!(matches!(chain(CHAINED)[..], [ModHook::Plain(_)]));
     }
 
     #[test]
