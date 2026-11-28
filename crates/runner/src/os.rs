@@ -2309,4 +2309,387 @@ mod tests {
         run_pif(&mut pif, &pads, &mut Save::in_memory());
         assert_eq!(pif[37], 0xFF);
     }
+
+    const QUEUE: u32 = 0x8000_0100;
+    const QUEUE_BUF: u32 = 0x8000_0200;
+
+    /// The queue's valid and first words.
+    fn valid_and_first(c: &Ctx, mq: u32) -> (u32, u32) {
+        (c.mem.read_u32(mq + 8), c.mem.read_u32(mq + 12))
+    }
+
+    /// Takes every message left on the queue, in order.
+    fn drain(c: &mut Ctx, st: &mut State, mq: u32) -> Vec<u32> {
+        std::iter::from_fn(|| take_message(c, st, mq)).collect()
+    }
+
+    #[test]
+    fn a_queue_ring_wraps_from_its_last_slot_to_its_first() {
+        let mut c = Ctx::new(n64rusty_runtime::Memory::new(0x1000));
+        let mut st = idle_state();
+        // Empty, with the next message going into the last of three slots.
+        set_queue(&mut c, QUEUE, 0, 2, 3, QUEUE_BUF);
+        for m in [1, 2, 3] {
+            assert!(put_message(&mut c, &mut st, QUEUE, m, false), "message {m}");
+        }
+        let slots = [0, 4, 8].map(|o| c.mem.read_u32(QUEUE_BUF + o));
+        assert_eq!(slots, [2, 3, 1], "slot 2, then slots 0 and 1");
+        assert_eq!(
+            drain(&mut c, &mut st, QUEUE),
+            [1, 2, 3],
+            "first in, first out"
+        );
+        assert_eq!(valid_and_first(&c, QUEUE), (0, 2), "first went round once");
+    }
+
+    #[test]
+    fn a_jammed_message_comes_out_before_the_ones_sent_earlier() {
+        // libultra osJamMesg: first = (first + count - 1) % count.
+        let mut c = Ctx::new(n64rusty_runtime::Memory::new(0x1000));
+        let mut st = idle_state();
+        set_queue(&mut c, QUEUE, 0, 0, 4, QUEUE_BUF);
+        assert!(put_message(&mut c, &mut st, QUEUE, 1, false));
+        assert!(put_message(&mut c, &mut st, QUEUE, 2, false));
+        assert!(put_message(&mut c, &mut st, QUEUE, 9, true));
+        assert_eq!(
+            valid_and_first(&c, QUEUE),
+            (3, 3),
+            "first wrapped back to the last slot"
+        );
+        assert_eq!(c.mem.read_u32(QUEUE_BUF + 12), 9);
+        assert!(put_message(&mut c, &mut st, QUEUE, 8, true));
+        assert_eq!(
+            drain(&mut c, &mut st, QUEUE),
+            [8, 9, 1, 2],
+            "latest jam first"
+        );
+    }
+
+    #[test]
+    fn a_full_queue_takes_no_message_until_a_receive_frees_a_slot() {
+        let mut c = Ctx::new(n64rusty_runtime::Memory::new(0x1000));
+        let mut st = idle_state();
+        set_queue(&mut c, QUEUE, 0, 0, 2, QUEUE_BUF);
+        assert!(put_message(&mut c, &mut st, QUEUE, 1, false));
+        assert!(put_message(&mut c, &mut st, QUEUE, 2, false));
+        for jam in [false, true] {
+            assert!(
+                !put_message(&mut c, &mut st, QUEUE, 7, jam),
+                "full, jam {jam}"
+            );
+        }
+        assert_eq!(valid_and_first(&c, QUEUE), (2, 0), "queue left alone");
+        assert_eq!(take_message(&mut c, &mut st, QUEUE), Some(1));
+        assert!(
+            put_message(&mut c, &mut st, QUEUE, 3, false),
+            "a slot is free"
+        );
+        assert_eq!(c.mem.read_u32(QUEUE_BUF), 3, "into the slot just freed");
+        assert_eq!(drain(&mut c, &mut st, QUEUE), [2, 3]);
+        assert!(st.bad_queues.is_empty(), "a full queue is not a bad one");
+    }
+
+    /// A guest thread blocked on `wait`, for seeing whom a queue wakes.
+    fn blocked_thread(id: u32, pri: i32, wait: Wait) -> Thread {
+        Thread {
+            id,
+            pri,
+            state: TState::Waiting(wait),
+            entry: 0,
+            arg: 0,
+            sp: 0,
+            spawned: false,
+            regs: None,
+            seq: 0,
+            generation: 0,
+            cv: Arc::new(Condvar::new()),
+        }
+    }
+
+    fn add_threads(st: &mut State, threads: impl IntoIterator<Item = Thread>) {
+        st.threads.extend(threads.into_iter().map(|t| (t.id, t)));
+    }
+
+    const OTHER_QUEUE: u32 = 0x8000_0180;
+
+    #[test]
+    fn a_receive_wakes_only_the_highest_priority_sender_blocked_on_that_queue() {
+        // libultra osRecvMesg pops the queue's fullqueue, kept in priority order.
+        let mut c = Ctx::new(n64rusty_runtime::Memory::new(0x1000));
+        let mut st = idle_state();
+        add_threads(
+            &mut st,
+            [
+                blocked_thread(10, 5, Wait::Send(QUEUE)),
+                blocked_thread(20, 9, Wait::Send(QUEUE)),
+                blocked_thread(30, 50, Wait::Send(OTHER_QUEUE)),
+                blocked_thread(40, 60, Wait::Recv(QUEUE)),
+            ],
+        );
+        set_queue(&mut c, QUEUE, 1, 0, 1, QUEUE_BUF);
+        assert_eq!(take_message(&mut c, &mut st, QUEUE), Some(0));
+        assert_eq!(st.threads[&20].state, TState::Ready);
+        assert_eq!(st.threads[&10].state, TState::Waiting(Wait::Send(QUEUE)));
+        assert_eq!(
+            st.threads[&30].state,
+            TState::Waiting(Wait::Send(OTHER_QUEUE))
+        );
+        assert_eq!(st.threads[&40].state, TState::Waiting(Wait::Recv(QUEUE)));
+    }
+
+    #[test]
+    fn a_send_wakes_only_the_highest_priority_receiver_blocked_on_that_queue() {
+        // libultra osSendMesg pops the queue's mtqueue, kept in priority order.
+        let mut c = Ctx::new(n64rusty_runtime::Memory::new(0x1000));
+        let mut st = idle_state();
+        add_threads(
+            &mut st,
+            [
+                blocked_thread(10, 9, Wait::Recv(QUEUE)),
+                blocked_thread(20, 5, Wait::Recv(QUEUE)),
+                blocked_thread(30, 50, Wait::Recv(OTHER_QUEUE)),
+            ],
+        );
+        set_queue(&mut c, QUEUE, 0, 0, 2, QUEUE_BUF);
+        assert!(put_message(&mut c, &mut st, QUEUE, 1, false));
+        assert_eq!(st.threads[&10].state, TState::Ready);
+        assert_eq!(st.threads[&20].state, TState::Waiting(Wait::Recv(QUEUE)));
+        assert_eq!(
+            st.threads[&30].state,
+            TState::Waiting(Wait::Recv(OTHER_QUEUE))
+        );
+    }
+
+    const TIMER: u32 = 0x8000_0400;
+    const TIMER_MSG: u32 = 0x77;
+
+    /// A state with one timer on [`QUEUE`], due at `at`.
+    fn state_with_timer(c: &mut Ctx, at: u64, interval: u64) -> State {
+        let mut st = idle_state();
+        set_queue(c, QUEUE, 0, 0, 8, QUEUE_BUF);
+        let t = Timer {
+            at,
+            interval,
+            mq: QUEUE,
+            msg: TIMER_MSG,
+        };
+        st.timers.insert(TIMER, t);
+        st
+    }
+
+    #[test]
+    fn a_periodic_timer_posts_and_re_arms_one_interval_later() {
+        // libultra __osTimerInterrupt: t->value = t->interval, then re-inserted.
+        const AT: u64 = 1000;
+        const INTERVAL: u64 = 500;
+        let mut c = Ctx::new(n64rusty_runtime::Memory::new(0x1000));
+        let mut st = state_with_timer(&mut c, AT, INTERVAL);
+        c.clock = AT - 1;
+        deliver_due(&mut c, &mut st);
+        assert_eq!(valid_and_first(&c, QUEUE).0, 0, "not due yet");
+        for n in 1..=3 {
+            c.clock = st.timers[&TIMER].at;
+            deliver_due(&mut c, &mut st);
+            assert_eq!(valid_and_first(&c, QUEUE).0, n, "post {n}");
+            assert_eq!(st.timers[&TIMER].at, AT + n as u64 * INTERVAL);
+        }
+        assert_eq!(drain(&mut c, &mut st, QUEUE), [TIMER_MSG; 3]);
+    }
+
+    #[test]
+    #[ignore = "bug: a late periodic timer re-arms from its due time, not from when it is serviced as libultra does"]
+    fn a_late_periodic_timer_re_arms_one_interval_after_it_is_serviced() {
+        // libultra __osTimerInterrupt sets value = interval relative to the
+        // count it read, so a late timer fires once, not once per lost period.
+        const AT: u64 = 1000;
+        const INTERVAL: u64 = 500;
+        const LATE_BY: u64 = 3 * INTERVAL + 1;
+        let mut c = Ctx::new(n64rusty_runtime::Memory::new(0x1000));
+        let mut st = state_with_timer(&mut c, AT, INTERVAL);
+        c.clock = AT + LATE_BY;
+        deliver_due(&mut c, &mut st);
+        assert_eq!(st.timers[&TIMER].at, c.clock + INTERVAL);
+        deliver_due(&mut c, &mut st);
+        assert_eq!(valid_and_first(&c, QUEUE).0, 1, "one post, no backlog");
+    }
+
+    #[test]
+    fn a_one_shot_timer_posts_once_and_is_gone() {
+        let mut c = Ctx::new(n64rusty_runtime::Memory::new(0x1000));
+        let mut st = state_with_timer(&mut c, 1000, 0);
+        c.clock = 5000;
+        deliver_due(&mut c, &mut st);
+        deliver_due(&mut c, &mut st);
+        assert!(st.timers.is_empty());
+        assert_eq!(drain(&mut c, &mut st, QUEUE), [TIMER_MSG]);
+    }
+
+    /// PI bus address of the SRAM and flash save chips.
+    const SAVE_BUS: u32 = crate::save::SRAM_BASE;
+    /// PI bus address of cartridge ROM.
+    const CART_BUS: u32 = 0x1000_0000;
+    const PI_READ: u32 = 0;
+    const PI_WRITE: u32 = 1;
+    const DMA_RAM: u32 = 0x8000_0400;
+    /// Flash modes: the top byte of the mode command (libultra osFlash*).
+    const FLASH_READ: u8 = 0xF0;
+    const FLASH_ID: u8 = 0xE1;
+    const FLASH_PAGE_BUFFER: u8 = 0xB4;
+    const FLASH_PAGE: usize = 128;
+
+    /// A context whose save chip is flash, set to `mode`; `None` for SRAM.
+    fn ctx_with_save_chip(mode: Option<u8>) -> Ctx {
+        let mut c = Ctx::new(n64rusty_runtime::Memory::new(0x1000));
+        let mut flash = Flash::default();
+        if let Some(m) = mode {
+            flash.used = true;
+            flash.mode = m;
+        }
+        c.mem.set_io(n64rusty_runtime::Io {
+            sp_mem: vec![0; 0x2000],
+            rom: Arc::from(Vec::new()),
+            regs: Default::default(),
+            flash,
+        });
+        c
+    }
+
+    fn ram_bytes(c: &Ctx, at: u32, n: usize) -> Vec<u8> {
+        (0..n as u32).map(|k| c.mem.read_u8(at + k)).collect()
+    }
+
+    fn put_ram(c: &mut Ctx, at: u32, bytes: &[u8]) {
+        for (k, &b) in bytes.iter().enumerate() {
+            c.mem.write_u8(at + k as u32, b);
+        }
+    }
+
+    fn saved(st: &State, off: usize, n: usize) -> Vec<u8> {
+        let mut out = vec![0; n];
+        st.save.read(off, &mut out);
+        out
+    }
+
+    fn flash_ops_queue(c: &mut Ctx) -> &mut Vec<FlashOp> {
+        &mut c.mem.io_mut().unwrap().flash.ops
+    }
+
+    #[test]
+    fn flash_read_mode_reads_the_array_at_twice_the_bus_offset() {
+        // libultra osFlashReadArray halves the array offset for the bus.
+        const BUS_OFFSET: u32 = 0x100;
+        let mut c = ctx_with_save_chip(Some(FLASH_READ));
+        let mut st = idle_state();
+        st.save
+            .write(2 * BUS_OFFSET as usize, &[1, 2, 3, 4, 5, 6, 7, 8]);
+        pi_dma(&mut c, &mut st, PI_READ, SAVE_BUS + BUS_OFFSET, DMA_RAM, 8);
+        assert_eq!(ram_bytes(&c, DMA_RAM, 8), [1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn flash_id_mode_reads_the_chip_id() {
+        // libultra osFlashReadId DMAs exactly 8 bytes of ID.
+        let mut c = ctx_with_save_chip(Some(FLASH_ID));
+        let mut st = idle_state();
+        pi_dma(&mut c, &mut st, PI_READ, SAVE_BUS, DMA_RAM, 8);
+        assert_eq!(ram_bytes(&c, DMA_RAM, 8), Flash::ID);
+    }
+
+    #[test]
+    fn a_flash_page_write_fills_the_buffer_and_a_program_stores_it() {
+        // libultra osFlashWriteBuffer DMAs 128 bytes; osFlashWriteArray programs them.
+        const PAGE_AT: usize = 3 * FLASH_PAGE;
+        let page: Vec<u8> = (0..FLASH_PAGE as u8).map(|i| i | 0x80).collect();
+        let mut c = ctx_with_save_chip(Some(FLASH_PAGE_BUFFER));
+        let mut st = idle_state();
+        put_ram(&mut c, DMA_RAM, &page);
+        pi_dma(
+            &mut c,
+            &mut st,
+            PI_WRITE,
+            SAVE_BUS,
+            DMA_RAM,
+            FLASH_PAGE as u32,
+        );
+        assert_eq!(st.flash_page.as_slice(), page.as_slice());
+        assert_eq!(
+            saved(&st, PAGE_AT, FLASH_PAGE),
+            [0; FLASH_PAGE],
+            "not stored yet"
+        );
+        flash_ops_queue(&mut c).push(FlashOp::Program { offset: PAGE_AT });
+        flash_ops(&mut c, &mut st);
+        assert_eq!(saved(&st, PAGE_AT, FLASH_PAGE), page);
+        assert!(flash_ops_queue(&mut c).is_empty(), "each op applied once");
+    }
+
+    #[test]
+    fn a_flash_erase_sets_its_bytes_to_ff_before_a_later_read() {
+        const SECTOR: usize = 0x4000;
+        let mut c = ctx_with_save_chip(Some(FLASH_READ));
+        let mut st = idle_state();
+        st.save.write(0, &[0x12; 16]);
+        st.save.write(SECTOR, &[0x34; 16]);
+        flash_ops_queue(&mut c).push(FlashOp::Erase {
+            offset: 0,
+            len: SECTOR,
+        });
+        // The DMA applies the pending erase first.
+        pi_dma(&mut c, &mut st, PI_READ, SAVE_BUS, DMA_RAM, 8);
+        assert_eq!(ram_bytes(&c, DMA_RAM, 8), [0xFF; 8]);
+        assert_eq!(saved(&st, SECTOR, 16), [0x34; 16], "next sector kept");
+    }
+
+    #[test]
+    fn a_dma_write_to_flash_outside_page_buffer_mode_changes_nothing() {
+        let mut c = ctx_with_save_chip(Some(FLASH_READ));
+        let mut st = idle_state();
+        put_ram(&mut c, DMA_RAM, &[0x55; 8]);
+        pi_dma(&mut c, &mut st, PI_WRITE, SAVE_BUS, DMA_RAM, 8);
+        assert_eq!(saved(&st, 0, 8), [0; 8]);
+        assert_eq!(st.flash_page, [0xFF; FLASH_PAGE], "page buffer untouched");
+    }
+
+    #[test]
+    fn sram_dma_writes_and_reads_back_at_the_bus_offset() {
+        const BUS_OFFSET: u32 = 0x10;
+        let mut c = ctx_with_save_chip(None);
+        let mut st = idle_state();
+        put_ram(&mut c, DMA_RAM, &[9, 8, 7, 6]);
+        pi_dma(&mut c, &mut st, PI_WRITE, SAVE_BUS + BUS_OFFSET, DMA_RAM, 4);
+        assert_eq!(saved(&st, BUS_OFFSET as usize, 4), [9, 8, 7, 6]);
+        put_ram(&mut c, DMA_RAM, &[0; 4]);
+        pi_dma(&mut c, &mut st, PI_READ, SAVE_BUS + BUS_OFFSET, DMA_RAM, 4);
+        assert_eq!(ram_bytes(&c, DMA_RAM, 4), [9, 8, 7, 6]);
+    }
+
+    #[test]
+    fn cart_copy_fills_with_zeros_past_the_end_of_the_rom() {
+        const ROM_LEN: usize = 0x10;
+        const FROM: u32 = 8;
+        let mut c = Ctx::new(n64rusty_runtime::Memory::new(0x1000));
+        let mut st = idle_state();
+        st.rom = Arc::from(vec![0xAA; ROM_LEN]);
+        put_ram(&mut c, DMA_RAM, &[0x55; 0x10]);
+        pi_dma(&mut c, &mut st, PI_READ, CART_BUS + FROM, DMA_RAM, 0x10);
+        assert_eq!(ram_bytes(&c, DMA_RAM, 8), [0xAA; 8], "the rest of the ROM");
+        assert_eq!(ram_bytes(&c, DMA_RAM + 8, 8), [0; 8], "past its end");
+        assert_eq!(
+            st.dma_log,
+            [(FROM, DMA_RAM, 0x10)],
+            "logged as a ROM offset"
+        );
+    }
+
+    #[test]
+    fn a_dma_write_to_cartridge_rom_is_dropped() {
+        let mut c = Ctx::new(n64rusty_runtime::Memory::new(0x1000));
+        let mut st = idle_state();
+        st.rom = Arc::from(vec![0xAA; 0x10]);
+        put_ram(&mut c, DMA_RAM, &[0x55; 0x10]);
+        pi_dma(&mut c, &mut st, PI_WRITE, CART_BUS, DMA_RAM, 0x10);
+        assert_eq!(*st.rom, [0xAA; 0x10]);
+        assert!(st.dma_log.is_empty(), "not a copy into RAM");
+        assert_eq!(ram_bytes(&c, DMA_RAM, 0x10), [0x55; 0x10]);
+    }
 }

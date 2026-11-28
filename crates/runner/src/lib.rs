@@ -877,4 +877,441 @@ mod tests {
             .expect("an entry past RAM fails");
         assert!(e.contains("0x8fff0000"), "{e}");
     }
+
+    /// Where the test ROM's header starts the game, in KSEG0.
+    const TEST_ENTRY: u32 = 0x8000_0400;
+    /// Bytes in a small test ROM: header and boot code, then 4 KiB of boot
+    /// segment.
+    const TEST_ROM_LEN: usize = 0x2000;
+
+    /// A big-endian test ROM of `len` bytes that starts the game at
+    /// `entry`, with every boot segment byte set by `fill` from its index.
+    fn rom_filled(entry: u32, len: usize, fill: impl Fn(usize) -> u8) -> Rom {
+        let mut b = vec![0u8; len];
+        b[..4].copy_from_slice(&0x8037_1240u32.to_be_bytes());
+        b[8..12].copy_from_slice(&entry.to_be_bytes());
+        for (i, x) in b[n64rusty_rom::BOOT_SEGMENT_ROM..].iter_mut().enumerate() {
+            *x = fill(i);
+        }
+        Rom::from_bytes(b).unwrap()
+    }
+
+    #[test]
+    fn boot_copies_every_byte_of_the_boot_segment() {
+        let rom = rom_filled(TEST_ENTRY, TEST_ROM_LEN, |i| (i as u8) | 1);
+        let ctx = boot(&rom, &TEST_GAME).unwrap();
+        let seg = rom.boot_segment();
+        let last = seg.len() as u32 - 1;
+        assert_eq!(ctx.mem.read_u8(TEST_ENTRY), seg[0]);
+        assert_eq!(ctx.mem.read_u8(TEST_ENTRY + last), seg[last as usize]);
+        assert_eq!(ctx.mem.read_u8(TEST_ENTRY + last + 1), 0, "nothing past it");
+    }
+
+    #[test]
+    fn boot_loads_a_kseg1_entry_point_at_the_same_physical_address() {
+        const KSEG1_ENTRY: u32 = 0xA000_0400;
+        let rom = rom_filled(KSEG1_ENTRY, TEST_ROM_LEN, |_| 0x5A);
+        let ctx = boot(&rom, &TEST_GAME).unwrap();
+        assert_eq!(ctx.mem.read_u8(TEST_ENTRY), 0x5A);
+    }
+
+    #[test]
+    fn boot_clips_a_boot_segment_that_runs_past_the_top_of_ram() {
+        const NEAR_TOP: u32 = 0x8000_0000 + RAM_SIZE as u32 - 0x100;
+        let rom = rom_filled(NEAR_TOP, TEST_ROM_LEN, |i| (i as u8) | 1);
+        let ctx = boot(&rom, &TEST_GAME).expect("an entry inside RAM boots");
+        assert_eq!(ctx.mem.read_u8(NEAR_TOP + 0xFF), 0xFF, "last byte of RAM");
+    }
+
+    #[test]
+    fn boot_stores_the_boot_information_libultra_reads() {
+        // libultra's osTvType, osRomBase, osResetType, osVersion and
+        // osMemSize live at these low-RAM addresses (os.h, boot.s).
+        const OS_TV_TYPE: u32 = 0x8000_0300;
+        const OS_ROM_BASE: u32 = 0x8000_0308;
+        const OS_RESET_TYPE: u32 = 0x8000_030C;
+        const OS_VERSION: u32 = 0x8000_0314;
+        const OS_MEM_SIZE: u32 = 0x8000_0318;
+        const TV_TYPE_NTSC: u32 = 1;
+        const ROM_BASE_KSEG1: u32 = 0xB000_0000;
+        const RESET_COLD: u32 = 0;
+        let ctx = boot(&rom_with_entry(TEST_ENTRY), &TEST_GAME).unwrap();
+        assert_eq!(ctx.mem.read_u32(OS_TV_TYPE), TV_TYPE_NTSC);
+        assert_eq!(ctx.mem.read_u32(OS_ROM_BASE), ROM_BASE_KSEG1);
+        assert_eq!(ctx.mem.read_u32(OS_RESET_TYPE), RESET_COLD);
+        assert_eq!(ctx.mem.read_u32(OS_VERSION), 0);
+        assert_eq!(ctx.mem.read_u32(OS_MEM_SIZE), RAM_SIZE as u32);
+    }
+
+    #[test]
+    fn boot_starts_the_stack_16_bytes_below_the_top_of_ram() {
+        // The HLE runner's own convention (boot: "A stack at the top of RAM until
+        // the game sets its own"); real IPL3 enters with sp = 0xA4001FF0 in SP IMEM.
+        const STACK_TOP: u32 = 0x8000_0000 + RAM_SIZE as u32 - 0x10;
+        let ctx = boot(&rom_with_entry(TEST_ENTRY), &TEST_GAME).unwrap();
+        assert_eq!(
+            ctx.r[29],
+            sx32(STACK_TOP),
+            "sign-extended, as a 32-bit address is"
+        );
+    }
+
+    #[test]
+    fn boot_registers_the_games_functions() {
+        const FN_ADDR: u32 = 0x8000_1000;
+        let game = Game {
+            register: |c| c.register(FN_ADDR, |_| {}),
+            ..TEST_GAME
+        };
+        let ctx = boot(&rom_with_entry(TEST_ENTRY), &game).unwrap();
+        assert!(ctx.has_function(FN_ADDR));
+    }
+
+    /// Bytes of zeros that end a stretch of written code.
+    const ZERO_GAP: usize = 4096;
+    /// The most written code [`written_code`] reports on each side.
+    const WRITTEN_MAX: usize = 4 << 20;
+
+    /// RAM of `len` zero bytes with `code` written at physical `at`.
+    fn ram_with_code(len: usize, at: usize, code: &[u8]) -> Vec<u8> {
+        let mut ram = vec![0u8; len];
+        ram[at..at + code.len()].copy_from_slice(code);
+        ram
+    }
+
+    #[test]
+    fn written_code_is_none_for_the_boot_images_own_bytes() {
+        let rom = rom_filled(TEST_ENTRY, TEST_ROM_LEN, |i| (i as u8) | 1);
+        let seg = rom.boot_segment();
+        let ram = ram_with_code(0x10_000, 0x400, seg);
+        assert_eq!(
+            written_code(&ram, rom.bytes(), TEST_ENTRY, 0x8000_0500),
+            None
+        );
+    }
+
+    #[test]
+    fn written_code_reaches_out_to_the_zero_runs_on_both_sides() {
+        let rom = rom_filled(TEST_ENTRY, TEST_ROM_LEN, |_| 1);
+        let ram = ram_with_code(0x10_000, 0x6000, &[0xAA; 0x100]);
+        assert_eq!(
+            written_code(&ram, rom.bytes(), TEST_ENTRY, 0x8000_6040),
+            Some((0x8000_6000, 0x8000_6100))
+        );
+    }
+
+    #[test]
+    fn written_code_differs_from_the_boot_image_even_inside_its_range() {
+        // Code the game unpacked over its own boot image is the game's.
+        // A boot segment from 0x400 to 0xF400, with other code at 0x6000.
+        let rom = rom_filled(TEST_ENTRY, 0x10_000, |_| 1);
+        let ram = ram_with_code(0x10_000, 0x6000, &[0xAA; 0x100]);
+        assert_eq!(
+            written_code(&ram, rom.bytes(), TEST_ENTRY, 0x8000_6000),
+            Some((0x8000_6000, 0x8000_6100))
+        );
+    }
+
+    #[test]
+    fn written_code_spans_zero_gaps_shorter_than_4_kib() {
+        let rom = rom_filled(TEST_ENTRY, TEST_ROM_LEN, |_| 1);
+        let mut ram = ram_with_code(0x10_000, 0x6000, &[0xAA; 0x100]);
+        // Padding between two functions, one word short of a gap.
+        let second = 0x6100 + ZERO_GAP - 4;
+        ram[second..second + 0x100].fill(0xBB);
+        assert_eq!(
+            written_code(&ram, rom.bytes(), TEST_ENTRY, 0x8000_6000),
+            Some((0x8000_6000, 0x8000_0000 + second as u32 + 0x100))
+        );
+    }
+
+    #[test]
+    fn written_code_keeps_the_segment_of_the_address() {
+        let rom = rom_filled(TEST_ENTRY, TEST_ROM_LEN, |_| 1);
+        let ram = ram_with_code(0x10_000, 0x6000, &[0xAA; 0x100]);
+        assert_eq!(
+            written_code(&ram, rom.bytes(), TEST_ENTRY, 0xA000_6043),
+            Some((0xA000_6000, 0xA000_6100)),
+            "KSEG1, and a misaligned address rounds down to its word"
+        );
+    }
+
+    #[test]
+    fn written_code_stops_at_the_ends_of_ram() {
+        let rom = rom_filled(TEST_ENTRY, TEST_ROM_LEN, |_| 1);
+        let ram = vec![0xAAu8; 0x10_000];
+        assert_eq!(
+            written_code(&ram, rom.bytes(), TEST_ENTRY, 0x8000_6000),
+            Some((0x8000_0000, 0x8001_0000))
+        );
+    }
+
+    #[test]
+    fn written_code_is_none_with_less_than_64_bytes_of_ram_left() {
+        let rom = rom_filled(TEST_ENTRY, TEST_ROM_LEN, |_| 1);
+        let ram = vec![0xAAu8; 0x10_000];
+        assert!(
+            written_code(&ram, rom.bytes(), TEST_ENTRY, 0x8000_FFC0).is_some(),
+            "exactly 64 bytes left is enough"
+        );
+        assert_eq!(
+            written_code(&ram, rom.bytes(), TEST_ENTRY, 0x8000_FFC4),
+            None
+        );
+        assert_eq!(
+            written_code(&ram, rom.bytes(), TEST_ENTRY, 0x8010_0000),
+            None,
+            "past RAM"
+        );
+    }
+
+    #[test]
+    fn written_code_reports_at_most_4_mib_on_each_side() {
+        let rom = rom_filled(TEST_ENTRY, TEST_ROM_LEN, |_| 1);
+        let ram = vec![0xAAu8; 2 * WRITTEN_MAX + 0x10_0000];
+        let at = WRITTEN_MAX + 0x8_0000;
+        assert_eq!(
+            written_code(&ram, rom.bytes(), TEST_ENTRY, 0x8000_0000 + at as u32),
+            Some((
+                0x8000_0000 + (at - WRITTEN_MAX) as u32,
+                0x8000_0000 + (at + WRITTEN_MAX) as u32
+            ))
+        );
+    }
+
+    /// A fresh, empty per-game folder for one test's run logs.
+    fn run_folder(test: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("n64rusty-runlog-{test}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The first line [`record_run`] writes to `dma.txt`.
+    const DMA_HEADER: &str = "# rom ram length: cartridge copies seen in headless runs\n";
+
+    /// A run that stopped at a call to untranslated code at `addr`, worded
+    /// as the runtime's panic is.
+    fn call_to_unknown(addr: u32) -> os::Outcome {
+        os::Outcome::Panic(format!(
+            "call to unknown guest function {addr:#010x} from 0x80001234"
+        ))
+    }
+
+    fn read_log(dir: &std::path::Path, name: &str) -> String {
+        std::fs::read_to_string(dir.join(name)).unwrap()
+    }
+
+    /// The lines of `missing.txt`. Code another test ran in the shared
+    /// interpreter adds lines of its own, so tests look only for theirs.
+    fn missing_lines(dir: &std::path::Path) -> Vec<String> {
+        let text = std::fs::read_to_string(dir.join("missing.txt")).unwrap_or_default();
+        text.lines().map(str::to_string).collect()
+    }
+
+    /// Asserts that `missing.txt` has `line`.
+    fn assert_missing(dir: &std::path::Path, line: &str) {
+        let lines = missing_lines(dir);
+        assert!(lines.iter().any(|l| l == line), "{line:?} not in {lines:?}");
+    }
+
+    #[test]
+    fn record_run_keeps_old_dma_rows_and_adds_new_ones_once() {
+        let dir = run_folder("dma-merge");
+        std::fs::write(
+            dir.join("dma.txt"),
+            "# an older header\n0x00001000 0x80001000 0x100\n",
+        )
+        .unwrap();
+        let dma = [(0x2000, 0x8010_0000, 0x100), (0x1000, 0x8000_1000, 0x100)];
+        record_run(
+            &dir,
+            &dma,
+            &os::Outcome::Frames(1),
+            &[0; 0x1000],
+            &[],
+            TEST_ENTRY,
+        )
+        .unwrap();
+        assert_eq!(
+            read_log(&dir, "dma.txt"),
+            format!("{DMA_HEADER}0x00001000 0x80001000 0x100\n0x00002000 0x80100000 0x100\n")
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn record_run_names_the_copy_that_put_missing_code_there() {
+        const ROM_AT: usize = 0x2000;
+        const RAM_AT: usize = 0x10_0000;
+        const LEN: usize = 0x100;
+        let dir = run_folder("missing-copy");
+        let rom: Vec<u8> = (0..ROM_AT + LEN).map(|i| (i as u8) | 1).collect();
+        let ram = ram_with_code(0x20_0000, RAM_AT, &rom[ROM_AT..]);
+        let dma = [(ROM_AT as u32, 0x8010_0000, LEN as u32)];
+        record_run(
+            &dir,
+            &dma,
+            &call_to_unknown(0x8010_0040),
+            &ram,
+            &rom,
+            TEST_ENTRY,
+        )
+        .unwrap();
+        assert_missing(&dir, "0x80100040 0x00002000 0x80100000 0x100");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn record_run_saves_code_written_over_a_copy_as_an_image() {
+        const RAM_AT: usize = 0x10_0000;
+        const LEN: usize = 0x100;
+        let dir = run_folder("missing-written");
+        let rom: Vec<u8> = (0..0x2100).map(|i| (i as u8) | 1).collect();
+        // The game unpacked other code over what the copy brought in.
+        let ram = ram_with_code(0x20_0000, RAM_AT, &[0xEE; LEN]);
+        let dma = [(0x2000, 0x8010_0000, LEN as u32)];
+        record_run(
+            &dir,
+            &dma,
+            &call_to_unknown(0x8010_0040),
+            &ram,
+            &rom,
+            TEST_ENTRY,
+        )
+        .unwrap();
+        assert_missing(&dir, "0x80100040 0xffffffff 0x80100000 0x100");
+        let image = std::fs::read(dir.join("images").join("80100000_80100040.bin")).unwrap();
+        assert_eq!(image, [0xEE; LEN]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn record_run_writes_boot_image_code_with_a_zero_copy() {
+        let dir = run_folder("missing-boot");
+        let rom = rom_filled(TEST_ENTRY, TEST_ROM_LEN, |i| (i as u8) | 1);
+        let ram = ram_with_code(0x10_000, 0x400, rom.boot_segment());
+        record_run(
+            &dir,
+            &[],
+            &call_to_unknown(0x8000_0500),
+            &ram,
+            rom.bytes(),
+            TEST_ENTRY,
+        )
+        .unwrap();
+        assert_missing(&dir, "0x80000500 0x00000000 0x00000000 0x0");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn record_run_keeps_old_missing_lines_and_skips_a_null_call() {
+        const OLD: &str = "0x80200000 0x00000000 0x00000000 0x0";
+        let dir = run_folder("missing-merge");
+        std::fs::write(dir.join("missing.txt"), format!("{OLD}\n")).unwrap();
+        let rom = rom_filled(TEST_ENTRY, TEST_ROM_LEN, |i| (i as u8) | 1);
+        let ram = ram_with_code(0x10_000, 0x400, rom.boot_segment());
+        record_run(
+            &dir,
+            &[],
+            &call_to_unknown(0),
+            &ram,
+            rom.bytes(),
+            TEST_ENTRY,
+        )
+        .unwrap();
+        assert_missing(&dir, OLD);
+        let lines = missing_lines(&dir);
+        let null = lines.iter().find(|l| l.starts_with("0x00000000 "));
+        assert_eq!(null, None, "a null pointer is not code");
+        record_run(
+            &dir,
+            &[],
+            &call_to_unknown(0x8000_0500),
+            &ram,
+            rom.bytes(),
+            TEST_ENTRY,
+        )
+        .unwrap();
+        assert_missing(&dir, OLD);
+        assert_missing(&dir, "0x80000500 0x00000000 0x00000000 0x0");
+        let lines = missing_lines(&dir);
+        assert!(lines.is_sorted(), "kept in order: {lines:?}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The exit code `main_args` gives for a command line it refuses.
+    const USAGE_ERROR: u8 = 2;
+
+    fn run_with(args: &[&str]) -> ExitCode {
+        main_args(
+            TEST_GAME,
+            None,
+            args.iter().map(|a| a.to_string()).collect(),
+        )
+    }
+
+    #[test]
+    fn main_args_refuses_a_command_line_without_a_rom() {
+        assert_eq!(run_with(&[]), ExitCode::from(USAGE_ERROR));
+        assert_eq!(run_with(&["--frames", "1"]), ExitCode::from(USAGE_ERROR));
+    }
+
+    /// A missing ROM also gives exit 2, so exit 2 alone does not show which
+    /// check refused. `--hash-out` after the bad flag creates its file only if
+    /// parsing went past the bad flag; a correct parse stops first.
+    fn assert_refused_at(args: &[&str], case: &str) {
+        let probe =
+            std::env::temp_dir().join(format!("n64rusty-hash-probe-{case}-{}", std::process::id()));
+        let probe_arg = probe.to_string_lossy().into_owned();
+        let mut all = args.to_vec();
+        all.extend(["--hash-out", probe_arg.as_str()]);
+        let code = run_with(&all);
+        let parsed_past = probe.exists();
+        let _ = std::fs::remove_file(&probe);
+        assert_eq!(code, ExitCode::from(USAGE_ERROR), "{case}");
+        assert!(!parsed_past, "{case}: parsing went past the bad argument");
+    }
+
+    #[test]
+    fn main_args_refuses_an_unknown_option() {
+        assert_refused_at(&["game.z64", "--no-such-flag", "1"], "unknown-option");
+    }
+
+    #[test]
+    fn main_args_refuses_an_option_without_its_value() {
+        assert_eq!(
+            run_with(&["game.z64", "--frames"]),
+            ExitCode::from(USAGE_ERROR)
+        );
+    }
+
+    #[test]
+    fn main_args_refuses_a_count_that_is_not_a_number() {
+        for flag in ["--frames", "--capture-every", "--capture-scale"] {
+            assert_refused_at(&["game.z64", flag, "ten"], &flag[2..]);
+        }
+    }
+
+    #[test]
+    fn main_args_refuses_an_interpret_range_that_is_empty_or_not_hex() {
+        for (case, range) in [
+            ("reversed", "80100000-80000400"),
+            ("empty", "80000400-80000400"),
+            ("not-hex", "zz-80000400"),
+            ("no-dash", "80000400"),
+        ] {
+            assert_refused_at(&["game.z64", "--interpret", range], case);
+        }
+    }
+
+    #[test]
+    fn main_args_refuses_a_rom_file_it_cannot_read() {
+        let path = std::env::temp_dir().join(format!("no-such-rom-{}.z64", std::process::id()));
+        assert_eq!(
+            run_with(&[&path.to_string_lossy()]),
+            ExitCode::from(USAGE_ERROR)
+        );
+    }
 }
