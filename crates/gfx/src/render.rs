@@ -39,6 +39,8 @@ pub enum RenderError {
     NoAdapter(String),
     Device(String),
     Readback(String),
+    /// A size or pixel buffer the device cannot take; nothing was drawn.
+    Size(String),
 }
 
 impl fmt::Display for RenderError {
@@ -47,6 +49,7 @@ impl fmt::Display for RenderError {
             RenderError::NoAdapter(e) => write!(f, "no graphics adapter: {e}"),
             RenderError::Device(e) => write!(f, "graphics device: {e}"),
             RenderError::Readback(e) => write!(f, "reading the image back: {e}"),
+            RenderError::Size(e) => write!(f, "bad size: {e}"),
         }
     }
 }
@@ -55,6 +58,8 @@ impl std::error::Error for RenderError {}
 
 const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+/// Bytes in one RGBA8 pixel.
+const BYTES_PER_PIXEL: u64 = 4;
 /// Bytes per draw in the uniform buffer (five vec4s, padded to the
 /// guaranteed dynamic-offset alignment).
 const UNIFORM_STRIDE: u64 = 256;
@@ -540,8 +545,21 @@ impl Renderer {
     /// Draw `frame` at `width` x `height` pixels and read it back. The
     /// frame's native framebuffer is scaled to fill the image.
     pub fn render(&mut self, frame: &Frame, width: u32, height: u32) -> Result<Image, RenderError> {
+        self.check_size("image", width, height)?;
         let (target, encoder) = self.draw(frame, &frame.transforms, width, height);
         self.read_back(encoder, &target)
+    }
+
+    /// An error unless the device can make a `width` x `height` texture
+    /// named `what`.
+    fn check_size(&self, what: &str, width: u32, height: u32) -> Result<(), RenderError> {
+        let max = self.device.limits().max_texture_dimension_2d;
+        if width == 0 || height == 0 || width > max || height > max {
+            return Err(RenderError::Size(format!(
+                "{what} of {width} x {height}: each side must be 1 to {max}"
+            )));
+        }
+        Ok(())
     }
 
     /// Submits `encoder` and reads `target` back.
@@ -555,7 +573,13 @@ impl Renderer {
         let row = width * 4;
         let padded =
             row.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-        let need = (padded * height) as u64;
+        let need = u64::from(padded) * u64::from(height);
+        let max = self.device.limits().max_buffer_size;
+        if need > max {
+            return Err(RenderError::Size(format!(
+                "a {width} x {height} image needs {need} bytes to read back, the device allows {max}"
+            )));
+        }
         let readback = match self.readback_buf.take() {
             Some(b) if b.size() >= need => b,
             _ => self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -592,9 +616,10 @@ impl Renderer {
         let data = readback
             .get_mapped_range(..)
             .map_err(|e| RenderError::Readback(e.to_string()))?;
-        let mut rgba = Vec::with_capacity((row * height) as usize);
+        // In usize: a 32768-pixel square is 4 GiB, past u32.
+        let mut rgba = Vec::with_capacity(row as usize * height as usize);
         for y in 0..height {
-            let start = (y * padded) as usize;
+            let start = y as usize * padded as usize;
             rgba.extend_from_slice(&data[start..start + row as usize]);
         }
         drop(data);
@@ -1559,6 +1584,7 @@ impl Renderer {
         height: u32,
         rect: (u32, u32, u32, u32),
     ) -> Result<(), RenderError> {
+        self.check_pixels(rgba, (w, h), rect)?;
         let Some(texture) = self.surface_texture(win, width, height) else {
             return Ok(());
         };
@@ -1593,6 +1619,35 @@ impl Renderer {
         blit.record(&self.device, &mut encoder, &src, &view, rect);
         self.queue.submit([encoder.finish()]);
         self.queue.present(texture);
+        Ok(())
+    }
+
+    /// An error unless `rgba` holds exactly `w` x `h` pixels the device can
+    /// take, and `rect` is a place wgpu accepts to show them.
+    fn check_pixels(
+        &self,
+        rgba: &[u8],
+        (w, h): (u32, u32),
+        (x, y, rw, rh): (u32, u32, u32, u32),
+    ) -> Result<(), RenderError> {
+        self.check_size("picture", w, h)?;
+        let want = u64::from(w) * u64::from(h) * BYTES_PER_PIXEL;
+        if rgba.len() as u64 != want {
+            return Err(RenderError::Size(format!(
+                "a {w} x {h} picture has {} bytes, not {want}",
+                rgba.len()
+            )));
+        }
+        let max = u64::from(self.device.limits().max_texture_dimension_2d);
+        // wgpu's set_viewport: each side at most the largest texture, and
+        // the far edge below twice that.
+        let far = |at: u32, len: u32| u64::from(at) + u64::from(len) >= 2 * max;
+        if u64::from(rw) > max || u64::from(rh) > max || far(x, rw) || far(y, rh) {
+            return Err(RenderError::Size(format!(
+                "place {rw} x {rh} at ({x}, {y}): sides must be at most {max}, edges below {}",
+                2 * max
+            )));
+        }
         Ok(())
     }
 
@@ -1671,6 +1726,7 @@ impl Renderer {
         width: u32,
         height: u32,
     ) -> Result<Image, RenderError> {
+        self.check_size("image", width, height)?;
         let dst = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("letterboxed"),
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
@@ -1727,5 +1783,31 @@ mod tests {
         assert_eq!(pipe_key(&state(0x0001)).shader.alpha_test, 1);
         assert_eq!(pipe_key(&state(0x3000)).shader.alpha_test, 2);
         assert_eq!(pipe_key(&state(0x3049)).shader.alpha_test, 3);
+    }
+
+    #[test]
+    fn pixels_to_show_must_match_their_size() {
+        let r = match Renderer::new() {
+            Ok(r) => r,
+            Err(e) if std::env::var_os("N64RUSTY_REQUIRE_GPU").is_none() => {
+                eprintln!("skipping: {e}");
+                return;
+            }
+            Err(e) => panic!("{e}"),
+        };
+        let max = r.device.limits().max_texture_dimension_2d;
+        let rgba = vec![0u8; 4 * 3 * BYTES_PER_PIXEL as usize];
+        let ok = |px: &[u8], size, rect| r.check_pixels(px, size, rect).is_ok();
+        assert!(ok(&rgba, (4, 3), (0, 0, 8, 6)));
+        // Larger than the window, as a start screen in a small one is.
+        assert!(ok(&rgba, (4, 3), (10, 10, max, max)));
+        assert!(!ok(&rgba[1..], (4, 3), (0, 0, 8, 6)), "short");
+        assert!(
+            !ok(&[rgba.as_slice(), &[0; 4]].concat(), (4, 3), (0, 0, 8, 6)),
+            "long"
+        );
+        assert!(!ok(&[], (0, 0), (0, 0, 8, 6)), "empty");
+        assert!(!ok(&rgba, (4, 3), (0, 0, max + 1, 6)), "too wide");
+        assert!(!ok(&rgba, (4, 3), (max, 0, max, 6)), "too far");
     }
 }

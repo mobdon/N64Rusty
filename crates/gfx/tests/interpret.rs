@@ -99,6 +99,38 @@ fn matrix_stack_push_multiply_pop() {
 }
 
 #[test]
+fn a_push_past_the_matrix_stack_is_warned_and_still_loads_the_top() {
+    // The stack holds 32 matrices, the first already there.
+    const ROOM: usize = 31;
+    let mut a = n64rusty_gfx::IDENTITY;
+    a[3] = [1.0, 2.0, 3.0, 1.0];
+    let pushes = |n: usize| {
+        let mut ram = Ram::default();
+        let verts = ram.vertices(&[v(0, 0, 0, [255; 4])]);
+        let (ident, ma) = (ram.matrix(n64rusty_gfx::IDENTITY), ram.matrix(a));
+        let mut dl = Dl::default();
+        setup(&mut ram, &mut dl);
+        for _ in 0..n {
+            dl.mtx(ident, PUSH);
+        }
+        dl.mtx(ma, PUSH | LOAD).vtx(verts, 1, 0).end();
+        let addr = ram.dl(&dl);
+        run(&ram, addr)
+    };
+    let full = pushes(ROOM - 1);
+    assert!(full.warnings.is_empty(), "{:?}", full.warnings);
+    let over = pushes(ROOM);
+    assert_eq!(over.warnings.len(), 1, "{:?}", over.warnings);
+    assert!(
+        over.warnings[0].contains("matrix push"),
+        "{:?}",
+        over.warnings
+    );
+    // As before: the load still replaces the top.
+    assert_eq!(over.transforms[0].modelview, a);
+}
+
+#[test]
 fn segments_calls_and_branches() {
     let mut ram = Ram::default();
     let verts = ram.vertices(&[v(0, 0, 0, [255; 4]); 3]);
@@ -782,6 +814,55 @@ fn a_texture_of_another_pixel_size_inside_a_drawn_image_is_not_read_back() {
     let mut rb = Solid { asked: Vec::new() };
     it.run_readback(&mut ram.bytes, addr, &mut rb).unwrap();
     assert!(rb.asked.is_empty());
+}
+
+/// Hands back red pixels, `extra` bytes more (or fewer) than asked for.
+struct Sized {
+    extra: isize,
+}
+
+impl n64rusty_gfx::Readback for Sized {
+    fn read(&mut self, _: &Frame, _: u32, width: u32, height: u32) -> Option<Vec<u8>> {
+        let mut px = [255, 0, 0, 255].repeat((width * height) as usize + 1);
+        px.truncate(((width * height * 4) as isize + self.extra) as usize);
+        Some(px)
+    }
+}
+
+#[test]
+fn a_read_back_of_the_wrong_length_writes_nothing() {
+    for extra in [-4, 4, 0] {
+        let mut ram = Ram::default();
+        let drawn = ram.put(&[0; 8 * 6 * 2]);
+        let after = ram.put(&[0xAA; 16]);
+        let mut dl = Dl::default();
+        setup(&mut ram, &mut dl);
+        dl.cimg(drawn, 8)
+            .other_modes(CYCLE_1, 0)
+            .tex_rect(0, [0, 0, 8, 6], [0, 0], [1 << 10, 1 << 10])
+            .timg(0, 2, 8, drawn)
+            .load_block(7, 16)
+            .end();
+        let addr = ram.dl(&dl);
+        let mut it = Interpreter::new();
+        it.run_readback(&mut ram.bytes, addr, &mut Sized { extra })
+            .unwrap();
+        let f = it.take_frame();
+        let first = u16::from_be_bytes([ram.bytes[drawn as usize], ram.bytes[drawn as usize + 1]]);
+        let at = after as usize;
+        assert_eq!(ram.bytes[at..at + 16], [0xAA; 16], "nothing past the image");
+        if extra == 0 {
+            assert_eq!(first, 0xF801, "a right-sized read back still lands");
+            assert!(f.warnings.is_empty(), "{:?}", f.warnings);
+        } else {
+            assert_eq!(first, 0, "extra {extra}: nothing written");
+            assert!(
+                f.warnings.iter().any(|w| w.contains("not read back")),
+                "extra {extra}: {:?}",
+                f.warnings
+            );
+        }
+    }
 }
 
 /// Notes each read: the image, its size and how many draws it was given.

@@ -372,6 +372,22 @@ fn window_path_draws_at_full_screen_sizes() {
 }
 
 #[test]
+fn a_size_the_device_cannot_take_is_an_error_not_a_crash() {
+    let Some(mut r) = renderer() else { return };
+    let mut ram = Ram::default();
+    let dl = scene(&mut ram, |_, _| {});
+    let f = frame(&mut ram, &dl);
+    for (w, h) in [(0, 240), (320, 0), (u32::MAX, 240), (320, u32::MAX)] {
+        let bad = |e| matches!(e, Err(n64rusty_gfx::RenderError::Size(_)));
+        assert!(bad(r.render(&f, w, h)), "render {w} x {h}");
+        assert!(bad(r.render_letterboxed(&f, w, h)), "letterboxed {w} x {h}");
+    }
+    // The renderer still draws a good size after.
+    assert_px(&r.render(&f, 320, 240).unwrap(), 5, 5, BLUE);
+    assert_px(&r.render_letterboxed(&f, 320, 240).unwrap(), 5, 5, BLUE);
+}
+
+#[test]
 fn widescreen_shows_the_sides_and_keeps_shapes() {
     let Some(mut r) = renderer() else { return };
     let mut ram = Ram::default();

@@ -43,6 +43,8 @@ impl std::error::Error for GfxError {}
 const VTX_BUFFER: usize = 32;
 const DL_STACK: usize = 18;
 const MTX_STACK: usize = 32;
+/// Bytes per pixel a [`Readback`] hands back (RGBA8).
+const RGBA_BYTES: usize = 4;
 const MAX_COMMANDS: usize = 1 << 20;
 const MAX_WARNINGS: usize = 64;
 /// Largest background side `G_BG_COPY` draws, in texels. The 2D
@@ -571,6 +573,10 @@ impl Interpreter {
             let top = *self.modelview.last().unwrap();
             if push && self.modelview.len() < MTX_STACK {
                 self.modelview.push(top);
+            } else if push {
+                self.warn(format!(
+                    "matrix push at {at:#010x} dropped: the stack holds {MTX_STACK}; the top is replaced"
+                ));
             }
             *self.modelview.last_mut().unwrap() = if load { m } else { mat_mul(&m, &top) };
         }
@@ -1010,6 +1016,16 @@ impl Interpreter {
         let Some(px) = rb.read(&frame, a, d.width, d.height) else {
             return;
         };
+        let want = d.width as usize * d.height as usize * RGBA_BYTES;
+        if px.len() != want {
+            self.warn(format!(
+                "drawn image {a:#010x} not read back: {} bytes for {} x {}, not {want}",
+                px.len(),
+                d.width,
+                d.height
+            ));
+            return;
+        }
         for (i, p) in px.as_chunks::<4>().0.iter().enumerate() {
             put_pixel(ram, a, siz, i as u32, *p);
         }
