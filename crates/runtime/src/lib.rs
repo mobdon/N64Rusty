@@ -419,9 +419,15 @@ impl Ctx {
         }
     }
 
-    /// MTC0. Writes are stored; none of them has a side effect yet.
+    /// MTC0. Writes are stored; a write to Wired (6) also resets Random.
     pub fn mtc0(&mut self, n: usize, v: u64) {
+        const WIRED: usize = 6;
+        const RANDOM_TOP: usize = 31;
         self.cop0[n] = v as u32;
+        if n == WIRED {
+            // VR4300 manual, Wired register: a write sets Random to its upper bound.
+            self.tlb_random = RANDOM_TOP;
+        }
     }
 
     /// TLBR (1), TLBWI (2), TLBWR (6) and TLBP (8), on COP0 Index (0),
@@ -431,9 +437,14 @@ impl Ctx {
         let index = (self.cop0[0] & 31) as usize;
         match funct {
             1 => {
+                const GLOBAL: u32 = 1;
                 for (k, &n) in REGS.iter().enumerate() {
                     self.cop0[n] = self.tlb[index][k];
                 }
+                // VR4300 manual, TLBR: the entry keeps one G (Lo0.G AND Lo1.G), read into both.
+                let g = self.cop0[2] & self.cop0[3] & GLOBAL;
+                self.cop0[2] = self.cop0[2] & !GLOBAL | g;
+                self.cop0[3] = self.cop0[3] & !GLOBAL | g;
             }
             2 | 6 => {
                 // Random counts down from 31 to Wired (COP0 6) and wraps.
@@ -997,7 +1008,6 @@ mod tlb_tests {
     }
 
     #[test]
-    #[ignore = "bug: TLBR returns each EntryLo's own G bit, not the entry's single G (Lo0.G AND Lo1.G)"]
     fn tlbr_gives_both_entrylo_the_entrys_one_global_bit() {
         // VR4300 manual, TLBR: the entry's G bit is written into both
         // EntryLo0 and EntryLo1; TLBWI stores G as Lo0.G AND Lo1.G.
@@ -1051,7 +1061,6 @@ mod tlb_tests {
     }
 
     #[test]
-    #[ignore = "bug: writing Wired (MTC0 6) does not reset Random to 31"]
     fn writing_wired_resets_random_to_31() {
         // VR4300 manual, Wired register: a write also sets Random to its
         // upper bound, 31.
