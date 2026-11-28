@@ -849,3 +849,47 @@ fn strip_loads_of_a_narrow_image_read_it_once_and_never_the_wide_one_at_its_addr
     it.run_readback(&mut ram.bytes, addr, &mut rb).unwrap();
     assert_eq!(rb.asked, [(img, 4, 7, 1), (img, 16, 12, 1)]);
 }
+
+/// Runs one `G_BG_COPY` of a 16-bit background `w` x `h` texels in size
+/// (as the guest RAM names it) on the 2D microcode.
+fn bg_copy(w: u16, h: u16) -> Frame {
+    let mut ram = Ram::default();
+    let data = ram.put(b"RSP Gfx ucode S2DEX  fifo 2.05");
+    let image = ram.put(&[0x07, 0xC1].repeat(4));
+    let mut bg = Vec::new();
+    // imageX, imageW, frameX, frameW, imageY, imageH, frameY, frameH (u10.2).
+    for v in [0, w, 0, w, 0, h, 0, h] {
+        bg.extend(v.wrapping_mul(4).to_be_bytes());
+    }
+    bg.extend(image.to_be_bytes());
+    bg.extend([0, 0, 0, 2]); // imageLoad, then RGBA (0) 16-bit (2)
+    let bg = ram.put(&bg);
+    let mut dl = Dl::default();
+    dl.raw(0x0A << 24, bg).end();
+    let addr = ram.dl(&dl);
+    let mut it = Interpreter::new();
+    it.set_microcode_data(Some(data));
+    it.run(&ram.bytes, addr).expect("display list runs");
+    it.take_frame()
+}
+
+#[test]
+fn a_background_is_drawn_as_one_texture() {
+    let f = bg_copy(2, 2);
+    assert!(f.warnings.is_empty(), "{:?}", f.warnings);
+    assert_eq!(f.textures.len(), 1);
+    assert_eq!(f.textures[0].rgba.len(), 2 * 2 * 4);
+    assert_eq!(f.draws().count(), 1);
+}
+
+#[test]
+fn a_background_of_no_size_or_too_big_is_not_drawn() {
+    // 1025 is past the u10.2 sizes; 16383 would ask for about 1 GiB.
+    for (w, h) in [(0, 2), (2, 0), (1025, 1), (16383, 16383)] {
+        let f = bg_copy(w, h);
+        assert_eq!(f.warnings.len(), 1, "{w}x{h}: {:?}", f.warnings);
+        assert!(f.warnings[0].contains("not drawn"), "{:?}", f.warnings);
+        assert!(f.textures.is_empty(), "{w}x{h}");
+        assert_eq!(f.draws().count(), 0, "{w}x{h}");
+    }
+}

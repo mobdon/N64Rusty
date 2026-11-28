@@ -45,6 +45,14 @@ const DL_STACK: usize = 18;
 const MTX_STACK: usize = 32;
 const MAX_COMMANDS: usize = 1 << 20;
 const MAX_WARNINGS: usize = 64;
+/// Largest background side `G_BG_COPY` draws, in texels. The 2D
+/// microcode's background holds its sizes as u10.2 (at most 1024 texels); a
+/// larger one is a bad pointer or garbage, and would ask for a huge texture.
+const MAX_BG_SIZE: u32 = 1024;
+/// Most colour images kept ready to read back. Games draw into a few frame
+/// buffers and pictures; the oldest goes first past this, so a game that
+/// keeps drawing into new addresses does not keep a frame for each.
+const MAX_DRAWN: usize = 64;
 
 // Geometry mode bits (F3DEX2).
 const G_CULL_FRONT: u32 = 0x0200;
@@ -131,6 +139,9 @@ pub struct Interpreter {
     /// Drop a drawn image's record once it has not been drawn into for this
     /// many handed-over frames (see [`Interpreter::set_readback_frames`]).
     readback_frames: Option<u32>,
+    /// The running list reads drawn images back ([`Interpreter::run_readback`]):
+    /// only then are draws noted in `drawn` and frames kept for them.
+    reading_back: bool,
 }
 
 /// A colour image drawn on the GPU and not yet read back.
@@ -254,6 +265,7 @@ impl Interpreter {
             },
             drawn: Vec::new(),
             readback_frames: None,
+            reading_back: false,
         }
     }
 
@@ -332,6 +344,7 @@ impl Interpreter {
     ) -> Result<(), GfxError> {
         let mut pc = self.phys(addr);
         let mut stack: Vec<u32> = Vec::new();
+        self.reading_back = rb.is_some();
         // Every task starts on its own (3D) microcode.
         self.ucode_2d = false;
         self.normals_apart = false;
@@ -887,6 +900,26 @@ impl Interpreter {
     }
 
     fn push(&mut self, state: RenderState, verts: &[Vertex]) {
+        if self.reading_back {
+            self.note_drawn();
+        }
+        let first = self.frame.vertices.len() as u32;
+        self.frame.vertices.extend_from_slice(verts);
+        if let Some(Command::Draw(d)) = self.frame.commands.last_mut() {
+            if d.state == state && d.first + d.count == first {
+                d.count += verts.len() as u32;
+                return;
+            }
+        }
+        self.frame.commands.push(Command::Draw(Draw {
+            first,
+            count: verts.len() as u32,
+            state,
+        }));
+    }
+
+    /// Notes that the colour image is drawn into, for a later read back.
+    fn note_drawn(&mut self) {
         // The image's height is the scissor's bottom (the game draws inside
         // it), else a guess from its width.
         let (image, width, siz) = self.cimg;
@@ -908,29 +941,25 @@ impl Interpreter {
                 d.read = false;
                 self.drawn.push(d);
             }
-            None => self.drawn.push(Drawn {
-                image,
-                width,
-                siz,
-                height: h,
-                frame: None,
-                read: false,
-                age: 0,
-            }),
-        }
-        let first = self.frame.vertices.len() as u32;
-        self.frame.vertices.extend_from_slice(verts);
-        if let Some(Command::Draw(d)) = self.frame.commands.last_mut() {
-            if d.state == state && d.first + d.count == first {
-                d.count += verts.len() as u32;
-                return;
+            None => {
+                if self.drawn.len() >= MAX_DRAWN {
+                    let forgotten = self.drawn.remove(0);
+                    self.warn(format!(
+                        "drawn image {:#010x} forgotten: more than {MAX_DRAWN} drawn images",
+                        forgotten.image
+                    ));
+                }
+                self.drawn.push(Drawn {
+                    image,
+                    width,
+                    siz,
+                    height: h,
+                    frame: None,
+                    read: false,
+                    age: 0,
+                })
             }
         }
-        self.frame.commands.push(Command::Draw(Draw {
-            first,
-            count: verts.len() as u32,
-            state,
-        }));
     }
 
     /// Reads back a colour image drawn on the GPU that the coming texture
@@ -1120,6 +1149,13 @@ impl Interpreter {
             return Ok(());
         }
         let (w, ht) = (u32::from(image_w / 4), u32::from(image_h / 4));
+        let fits = |side: u32| (1..=MAX_BG_SIZE).contains(&side);
+        if !fits(w) || !fits(ht) {
+            self.warn(format!(
+                "background {w}x{ht} not drawn at {at:#010x}: sides must be 1 to {MAX_BG_SIZE}"
+            ));
+            return Ok(());
+        }
         let mut rgba = Vec::with_capacity((w * ht * 4) as usize);
         for i in 0..w * ht {
             let c = rgba5551(rd16(rdram, image + 2 * i, at)?);
@@ -1303,4 +1339,65 @@ fn rd32(ram: &[u8], a: u32, at: u32) -> Result<u32, GfxError> {
         rd8(ram, a + 2, at)?,
         rd8(ram, a + 3, at)?,
     ]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reads back nothing: these lists load no texture.
+    struct NoReadback;
+
+    impl Readback for NoReadback {
+        fn read(&mut self, _: &Frame, _: u32, _: u32, _: u32) -> Option<Vec<u8>> {
+            None
+        }
+    }
+
+    /// A list drawing a 1-cycle rectangle into each of `images` colour
+    /// images, 8 pixels wide, at the start of a RAM it returns.
+    fn rects_into(images: usize) -> Vec<u8> {
+        const IMAGES_AT: u32 = 0x10000;
+        let mut words = Vec::new();
+        for k in 0..images as u32 {
+            let cimg = (0xFF << 24) | (2 << 19) | (8 - 1);
+            let fill_rect = (0xF6 << 24) | ((4 * 4) << 12) | (4 * 4);
+            words.extend([cimg, IMAGES_AT + k * 0x100, fill_rect, 0]);
+        }
+        words.extend([0xDF << 24, 0]);
+        let mut ram: Vec<u8> = words.iter().flat_map(|w| w.to_be_bytes()).collect();
+        ram.resize(0x2_0000, 0);
+        ram
+    }
+
+    #[test]
+    fn a_list_run_without_read_back_keeps_no_drawn_images_or_frames() {
+        let ram = rects_into(2);
+        let mut it = Interpreter::new();
+        it.run(&ram, 0).unwrap();
+        assert_eq!(it.take_frame().draws().count(), 2);
+        assert!(it.drawn.is_empty());
+    }
+
+    #[test]
+    fn a_list_run_with_read_back_keeps_a_frame_for_its_drawn_images() {
+        let mut ram = rects_into(2);
+        let mut it = Interpreter::new();
+        it.run_readback(&mut ram, 0, &mut NoReadback).unwrap();
+        it.take_frame();
+        assert_eq!(it.drawn.len(), 2);
+        assert!(it.drawn.iter().all(|d| d.frame.is_some()));
+    }
+
+    #[test]
+    fn drawn_images_past_the_limit_forget_the_oldest() {
+        let mut ram = rects_into(MAX_DRAWN + 1);
+        let mut it = Interpreter::new();
+        it.run_readback(&mut ram, 0, &mut NoReadback).unwrap();
+        assert_eq!(it.drawn.len(), MAX_DRAWN);
+        assert_eq!(it.drawn[0].image, 0x10100, "the first image is gone");
+        let warnings = &it.take_frame().warnings;
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("0x00010000 forgotten"), "{warnings:?}");
+    }
 }
