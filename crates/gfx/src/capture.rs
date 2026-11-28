@@ -31,6 +31,7 @@ pub struct Capture {
 }
 
 impl Capture {
+    /// Save the frames numbered `frames` into `dir`, at native size.
     pub fn new(dir: impl Into<PathBuf>, frames: impl IntoIterator<Item = u64>) -> Self {
         Self {
             dir: dir.into(),

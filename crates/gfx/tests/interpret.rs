@@ -340,7 +340,7 @@ fn one_command_draws_four_triangles_by_5_bit_vertex_numbers() {
 #[test]
 fn a_3d_microcode_followed_in_ram_by_the_2d_one_stays_3d() {
     let mut ram = Ram::default();
-    // As in Majora's Mask: the 2D microcode's data, with its own name, right
+    // As in some retail games: the 2D microcode's data, with its own name, right
     // after the 3D one's.
     let data = ram.put(b"RSP Gfx ucode F3DZEX.NoN fifo 2.08J");
     ram.put(b"RSP Gfx ucode S2DEX  fifo 2.05");

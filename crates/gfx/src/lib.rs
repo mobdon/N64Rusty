@@ -21,6 +21,7 @@
 //! or game speed: the game still produces exactly one [`Frame`] per frame.
 
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
 mod capture;
 mod combiner;
@@ -42,15 +43,20 @@ pub type Mat4 = [[f32; 4]; 4];
 /// microcode does.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Viewport {
+    /// Half the viewport size, x and y.
     pub scale: [f32; 2],
+    /// The viewport centre, x and y.
     pub trans: [f32; 2],
 }
 
 /// The matrices a group of vertices was loaded with.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Transform {
+    /// The model-view matrix (top of the matrix stack).
     pub modelview: Mat4,
+    /// The projection matrix.
     pub projection: Mat4,
+    /// The viewport the vertices were loaded with.
     pub viewport: Viewport,
     /// Physical address of the vertex-load command that used this
     /// transform. Display lists are usually rebuilt from the same code each
@@ -61,6 +67,7 @@ pub struct Transform {
 /// One vertex of a recorded triangle, still in object space.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Vertex {
+    /// Position in object space.
     pub pos: [f32; 3],
     /// Index into [`Frame::transforms`].
     pub transform: u32,
@@ -73,7 +80,9 @@ pub struct Vertex {
 /// A decoded texture, ready to upload.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Texture {
+    /// Width in texels.
     pub width: u32,
+    /// Height in texels.
     pub height: u32,
     /// RGBA8, row-major.
     pub rgba: Vec<u8>,
@@ -81,10 +90,14 @@ pub struct Texture {
     pub wrap: [Wrap; 2],
 }
 
+/// How a texture coordinate outside the texture is folded back in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Wrap {
+    /// The texture repeats.
     Repeat,
+    /// The texture repeats, every other copy mirrored.
     Mirror,
+    /// The edge texel is stretched outwards.
     Clamp,
 }
 
@@ -99,14 +112,18 @@ pub struct RenderState {
     pub other_l: u32,
     /// Microcode geometry mode (depth buffer, culling, lighting).
     pub geometry: u32,
+    /// Primitive colour (`SETPRIMCOLOR`), 0 to 1.
     pub prim: [f32; 4],
     /// Primitive LOD fraction, set with the primitive colour.
     pub prim_lod: f32,
     /// K5 of the colour conversion constants (`SETCONVERT`), 0 to 1: a
     /// colour combiner input, which games also use as a constant factor.
     pub k5: f32,
+    /// Environment colour (`SETENVCOLOR`), 0 to 1.
     pub env: [f32; 4],
+    /// Blend colour (`SETBLENDCOLOR`), 0 to 1.
     pub blend: [f32; 4],
+    /// Fog colour (`SETFOGCOLOR`), 0 to 1.
     pub fog: [f32; 4],
     /// The microcode's fog multiplier and offset (`G_MW_FOG`): with fog on in
     /// the geometry mode a vertex's shade alpha is `ndc z * mul + off`, 0 to 255.
@@ -134,13 +151,16 @@ pub struct RenderState {
 pub struct Draw {
     /// First vertex in [`Frame::vertices`]; three vertices per triangle.
     pub first: u32,
+    /// Number of vertices.
     pub count: u32,
+    /// The state every triangle of the run was drawn with.
     pub state: RenderState,
 }
 
 /// What the renderer does, in order.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Command {
+    /// Draw a run of triangles.
     Draw(Draw),
     /// The game filled the depth buffer (a fill rectangle into the depth
     /// image), which on a GPU is a depth clear.
@@ -155,9 +175,13 @@ pub struct Frame {
     /// Address of the colour image the frame is drawn into (the last one
     /// set). Draws into other images (render-to-texture) are skipped.
     pub color_image: u32,
+    /// The transforms the vertices point at.
     pub transforms: Vec<Transform>,
+    /// Every recorded vertex, three per triangle.
     pub vertices: Vec<Vertex>,
+    /// The textures draws point at.
     pub textures: Vec<Texture>,
+    /// What to do, in order.
     pub commands: Vec<Command>,
     /// Commands that were skipped, with their address.
     pub warnings: Vec<String>,
@@ -169,6 +193,8 @@ pub struct Frame {
     /// Height of the colour image when known (an image read back); 0
     /// means the usual 4:3 shape.
     pub image_height: u32,
+    /// Warnings past the limit on [`Frame::warnings`], not kept.
+    pub warnings_dropped: u32,
 }
 
 impl Frame {
@@ -177,7 +203,7 @@ impl Frame {
         if self.image_height != 0 {
             return self.image_height;
         }
-        (self.width * 3 / 4).max(1)
+        image_height(self.width)
     }
 
     /// The draws, in order.
@@ -252,6 +278,12 @@ fn jumped(a: &Transform, b: &Transform) -> bool {
     }
 }
 
+/// Height of a colour image of `width`, which the RDP does not know: the
+/// usual 4:3 shape.
+pub(crate) fn image_height(width: u32) -> u32 {
+    (width * 3 / 4).max(1)
+}
+
 /// Multiply two N64 matrices (`a` applied first).
 pub fn mat_mul(a: &Mat4, b: &Mat4) -> Mat4 {
     let mut r = [[0.0; 4]; 4];
@@ -263,6 +295,7 @@ pub fn mat_mul(a: &Mat4, b: &Mat4) -> Mat4 {
     r
 }
 
+/// The identity matrix.
 pub const IDENTITY: Mat4 = [
     [1.0, 0.0, 0.0, 0.0],
     [0.0, 1.0, 0.0, 0.0],

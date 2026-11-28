@@ -7,7 +7,9 @@ use std::fmt::Write;
 /// inputs `[a, b, c, d]` and the alpha inputs `[a, b, c, d]`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Combiner {
+    /// Colour inputs `[a, b, c, d]` of cycle 0 and cycle 1.
     pub color: [[u8; 4]; 2],
+    /// Alpha inputs `[a, b, c, d]` of cycle 0 and cycle 1.
     pub alpha: [[u8; 4]; 2],
 }
 
@@ -24,6 +26,7 @@ const ALPHA: [[(u32, u32); 4]; 2] = [
 ];
 
 impl Combiner {
+    /// Decode the raw `SETCOMBINE` bits (`(w0 & 0xFFFFFF) << 32 | w1`).
     pub fn from_raw(raw: u64) -> Self {
         let f = |(sh, w): (u32, u32)| ((raw >> sh) & ((1 << w) - 1)) as u8;
         Self {
@@ -32,6 +35,8 @@ impl Combiner {
         }
     }
 
+    /// Encode back into the raw `SETCOMBINE` bits; the inverse of
+    /// [`Combiner::from_raw`].
     pub const fn to_raw(self) -> u64 {
         let mut raw = 0u64;
         let mut cyc = 0;

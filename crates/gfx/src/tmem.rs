@@ -402,12 +402,6 @@ fn wrap_mask(c: u32, mask: u32, cm: u32) -> u32 {
     }
 }
 
-impl Hash for Texture {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        (self.width, self.height, &self.rgba, self.wrap).hash(state);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

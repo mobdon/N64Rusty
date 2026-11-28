@@ -7,18 +7,30 @@ use std::fmt;
 
 use crate::tmem::Tmem;
 use crate::{
-    mat_mul, Command, Draw, Frame, Mat4, RenderState, Transform, Vertex, Viewport, IDENTITY,
+    image_height, mat_mul, Command, Draw, Frame, Mat4, RenderState, Transform, Vertex, Viewport,
+    IDENTITY,
 };
 
 /// A display list could not be followed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GfxError {
     /// A read went past the end of guest RAM.
-    OutOfRange { addr: u32, at: u32 },
+    OutOfRange {
+        /// The address read.
+        addr: u32,
+        /// The command that read it.
+        at: u32,
+    },
     /// Display-list calls nested deeper than the microcode allows.
-    StackOverflow { at: u32 },
+    StackOverflow {
+        /// The call that went too deep.
+        at: u32,
+    },
     /// The list did not end within the command budget (a loop).
-    TooLong { at: u32 },
+    TooLong {
+        /// Where the list had got to.
+        at: u32,
+    },
 }
 
 impl fmt::Display for GfxError {
@@ -59,13 +71,103 @@ const MAX_BG_SIZE: u32 = 1024;
 const MAX_DRAWN: usize = 64;
 
 // Geometry mode bits (F3DEX2).
-const G_CULL_FRONT: u32 = 0x0200;
-const G_CULL_BACK: u32 = 0x0400;
+pub(crate) const G_ZBUFFER: u32 = 0x0001;
+pub(crate) const G_CULL_FRONT: u32 = 0x0200;
+pub(crate) const G_CULL_BACK: u32 = 0x0400;
+/// Shade colours are blended across a triangle (Gouraud), not flat.
+pub(crate) const G_SHADING_SMOOTH: u32 = 0x0020_0000;
 const G_LIGHTING: u32 = 0x0002_0000;
 const G_TEXTURE_GEN: u32 = 0x0004_0000;
 const G_TEXTURE_GEN_LINEAR: u32 = 0x0008_0000;
 /// Other modes (high word): texture perspective correction on.
 const G_TP_PERSP: u32 = 1 << 19;
+/// Other modes (high word): the texture filter field (0: point sampled).
+pub(crate) const G_MDSFT_TEXTFILT: u32 = 12;
+
+// Cycle types (other modes, high word, bits 20-21).
+pub(crate) const G_CYC_2CYCLE: u32 = 1;
+pub(crate) const G_CYC_COPY: u32 = 2;
+pub(crate) const G_CYC_FILL: u32 = 3;
+
+/// The cycle type in the high other-modes word `other_h`.
+pub(crate) fn cycle_type(other_h: u32) -> u32 {
+    (other_h >> 20) & 3
+}
+
+// Command numbers (the top byte of w0), F3DEX2.
+const G_SPNOOP: u32 = 0x00;
+const G_VTX: u32 = 0x01;
+const G_MODIFYVTX: u32 = 0x02;
+const G_CULLDL: u32 = 0x03;
+const G_BRANCH_Z: u32 = 0x04;
+const G_TRI1: u32 = 0x05;
+const G_TRI2: u32 = 0x06;
+const G_QUAD: u32 = 0x07;
+/// Four triangles in one command (a microcode some games use): the low
+/// four bits of the command number are part of the first triangle.
+const G_TRI4_FIRST: u32 = 0x10;
+const G_TRI4_LAST: u32 = 0x1F;
+const G_TEXTURE: u32 = 0xD7;
+const G_POPMTX: u32 = 0xD8;
+const G_GEOMETRYMODE: u32 = 0xD9;
+const G_MTX: u32 = 0xDA;
+const G_MOVEWORD: u32 = 0xDB;
+const G_MOVEMEM: u32 = 0xDC;
+const G_LOAD_UCODE: u32 = 0xDD;
+const G_DL: u32 = 0xDE;
+const G_ENDDL: u32 = 0xDF;
+const G_NOOP: u32 = 0xE0;
+const G_RDPHALF_1: u32 = 0xE1;
+const G_SETOTHERMODE_L: u32 = 0xE2;
+const G_SETOTHERMODE_H: u32 = 0xE3;
+const G_TEXRECT: u32 = 0xE4;
+const G_TEXRECTFLIP: u32 = 0xE5;
+/// The first and last of the four sync commands (load, pipe, tile, full).
+const G_RDPLOADSYNC: u32 = 0xE6;
+const G_RDPFULLSYNC: u32 = 0xE9;
+const G_SETCONVERT: u32 = 0xEC;
+const G_SETSCISSOR: u32 = 0xED;
+const G_SETPRIMDEPTH: u32 = 0xEE;
+const G_RDPSETOTHERMODE: u32 = 0xEF;
+const G_LOADTLUT: u32 = 0xF0;
+const G_RDPHALF_2: u32 = 0xF1;
+const G_SETTILESIZE: u32 = 0xF2;
+const G_LOADBLOCK: u32 = 0xF3;
+const G_LOADTILE: u32 = 0xF4;
+const G_SETTILE: u32 = 0xF5;
+const G_FILLRECT: u32 = 0xF6;
+const G_SETFILLCOLOR: u32 = 0xF7;
+const G_SETFOGCOLOR: u32 = 0xF8;
+const G_SETBLENDCOLOR: u32 = 0xF9;
+const G_SETPRIMCOLOR: u32 = 0xFA;
+const G_SETENVCOLOR: u32 = 0xFB;
+const G_SETCOMBINE: u32 = 0xFC;
+const G_SETTIMG: u32 = 0xFD;
+const G_SETZIMG: u32 = 0xFE;
+const G_SETCIMG: u32 = 0xFF;
+/// The 2D microcode's own commands: every number up to this one, and the
+/// numbers the 3D one uses for `G_MTX` and `G_MOVEMEM`.
+const S2D_LAST_LOW: u32 = 0x0B;
+/// The 2D microcode's background copy.
+const G_BG_COPY: u32 = 0x0A;
+
+// Move-word indices (`G_MOVEWORD`).
+const G_MW_MATRIX: u32 = 0x00;
+const G_MW_NUMLIGHT: u32 = 0x02;
+const G_MW_CLIP: u32 = 0x04;
+const G_MW_SEGMENT: u32 = 0x06;
+const G_MW_FOG: u32 = 0x08;
+const G_MW_LIGHTCOL: u32 = 0x0A;
+const G_MW_FORCEMTX: u32 = 0x0C;
+const G_MW_PERSPNORM: u32 = 0x0E;
+/// The light space of the variant that keeps normals apart.
+const G_MW_LIGHT_SPACE: u32 = 0x10;
+
+// Move-memory indices (`G_MOVEMEM`).
+const G_MV_VIEWPORT: u32 = 8;
+const G_MV_LIGHT: u32 = 10;
+/// The normal table of the variant that keeps normals apart.
+const G_MV_NORMALS: u32 = 14;
 
 /// A loaded vertex, after the vertex stage.
 #[derive(Clone, Copy, Default)]
@@ -210,6 +312,8 @@ impl Default for Interpreter {
 }
 
 impl Interpreter {
+    /// An interpreter in the state a game starts in: no segments, an
+    /// identity matrix stack and the usual 3D microcode.
     pub fn new() -> Self {
         Self {
             segments: [0; 16],
@@ -314,8 +418,6 @@ impl Interpreter {
         &self.frame
     }
 
-    /// Follow the display list at `addr` (a segmented or physical address)
-    /// in `rdram`, the big-endian guest RAM.
     /// Names the data of the microcode the coming tasks start on (the
     /// task's own pointer to it), so the command set follows the name in
     /// it. Without this every task starts on the usual 3D set.
@@ -323,6 +425,8 @@ impl Interpreter {
         self.start_data = data;
     }
 
+    /// Follow the display list at `addr` (a segmented or physical address)
+    /// in `rdram`, the big-endian guest RAM.
     pub fn run(&mut self, rdram: &[u8], addr: u32) -> Result<(), GfxError> {
         self.exec(Ram::Shared(rdram), addr, None)
     }
@@ -360,34 +464,23 @@ impl Interpreter {
             let w1 = rd32(ram.r(), pc + 4, pc)?;
             let at = pc;
             pc += 8;
-            if self.ucode_2d && (w0 >> 24 <= 0x0B || matches!(w0 >> 24, 0xDA | 0xDC)) {
+            if self.ucode_2d && (w0 >> 24 <= S2D_LAST_LOW || matches!(w0 >> 24, G_MTX | G_MOVEMEM))
+            {
                 match w0 >> 24 {
-                    0x0A => self.bg_copy(ram.r(), w1, at)?,
+                    G_BG_COPY => self.bg_copy(ram.r(), w1, at)?,
                     op => self.warn(format!("unknown 2D command {op:#04x} at {at:#010x}")),
                 }
                 continue;
             }
             match w0 >> 24 {
-                // A load names the new microcode's data in the half word
-                // before it. shortcut: data with no name in it toggles
-                // between 3D and 2D, as games with those two do.
-                0xDD => {
-                    let data = self.phys(self.rdphalf1);
-                    if !self.microcode(ram.r(), data) {
-                        self.ucode_2d = !self.ucode_2d;
-                    }
-                }
-                0x01 => self.vertices(ram.r(), w0, w1, at)?,
-                0x02 => self.modify_vertex(w0, w1, at),
-                0xED => {
-                    let fixed = |v: u32, sh: u32| ((v >> sh) & 0xFFF) as f32 / 4.0;
-                    self.state.scissor =
-                        Some([fixed(w0, 12), fixed(w0, 0), fixed(w1, 12), fixed(w1, 0)]);
-                }
-                0x05 => self.tri([(w0 >> 16) & 0xFF, (w0 >> 8) & 0xFF, w0 & 0xFF], at),
-                0x06 | 0x07 => {
-                    self.tri([(w0 >> 16) & 0xFF, (w0 >> 8) & 0xFF, w0 & 0xFF], at);
-                    self.tri([(w1 >> 16) & 0xFF, (w1 >> 8) & 0xFF, w1 & 0xFF], at);
+                G_LOAD_UCODE => self.load_ucode(ram.r()),
+                G_VTX => self.vertices(ram.r(), w0, w1, at)?,
+                G_MODIFYVTX => self.modify_vertex(w0, w1, at),
+                G_SETSCISSOR => self.state.scissor = Some(rect_coords(w0, w1)),
+                G_TRI1 => self.tri(tri_indices(w0), at),
+                G_TRI2 | G_QUAD => {
+                    self.tri(tri_indices(w0), at);
+                    self.tri(tri_indices(w1), at);
                 }
                 // Four triangles in one command (a microcode some games
                 // use), each corner a 5-bit vertex number: the opcode's low
@@ -395,7 +488,7 @@ impl Interpreter {
                 // triangles, with the third corner of the first split
                 // across both words. A triangle with one vertex three times
                 // fills an unused place.
-                0x10..=0x1F => {
+                G_TRI4_FIRST..=G_TRI4_LAST => {
                     let f = |v: u32, s: u32| (v >> s) & 31;
                     let tris = [
                         [f(w0, 23), f(w0, 18), ((w0 >> 15) & 7) << 2 | w1 >> 30],
@@ -411,38 +504,23 @@ impl Interpreter {
                 }
                 // G_SPNOOP, G_CULLDL (drawing everything is always safe),
                 // syncs, scissor and the coprocessor-only commands.
-                0x00 | 0x03 | 0xE0 | 0xE6..=0xE9 | 0xF1 => {}
+                G_SPNOOP | G_CULLDL | G_NOOP | G_RDPLOADSYNC..=G_RDPFULLSYNC | G_RDPHALF_2 => {}
                 // SETCONVERT: only K5 (a signed 9-bit value) is a colour
                 // combiner input; the rest convert YUV textures.
-                0xEC => self.state.k5 = ((w1 << 23) as i32 >> 23) as f32 / 255.0,
-                0x04 => {
+                G_SETCONVERT => self.state.k5 = ((w1 << 23) as i32 >> 23) as f32 / 255.0,
+                G_BRANCH_Z => {
                     // shortcut: G_BRANCH_Z always takes the branch (the
                     // nearer, more detailed level); compare depth when a
                     // game shows the wrong level of detail.
                     pc = self.phys(self.rdphalf1);
                 }
-                0xD7 => {
-                    // 0xFFFF is the conventional "1.0".
-                    let scale = |v: u32| if v == 0xFFFF { 1.0 } else { v as f32 / 65536.0 };
-                    self.tex_scale = [scale(w1 >> 16), scale(w1 & 0xFFFF)];
-                    self.tex_tile = ((w0 >> 8) & 7) as usize;
-                    self.tex_on = w0 & 0xFE != 0;
-                }
-                0xD8 => {
-                    let n = (w1 / MTX_BYTES) as usize;
-                    // F3DEX2 skips a pop below the stack base (bltz); a zero-byte pop
-                    // removes nothing but still reloads the modelview like any pop.
-                    if n < self.modelview.len() {
-                        self.modelview.truncate(self.modelview.len() - n);
-                        // F3DEX2 reloads the modelview and marks the combined matrix stale (GLideN64: CHANGED_MATRIX).
-                        self.mvp = None;
-                    }
-                }
-                0xD9 => self.geometry = (self.geometry & (w0 & 0x00FF_FFFF)) | w1,
-                0xDA => self.matrix(ram.r(), w0, w1, at)?,
-                0xDB => self.moveword(w0, w1, at),
-                0xDC => self.movemem(ram.r(), w0, w1, at)?,
-                0xDE => {
+                G_TEXTURE => self.texture(w0, w1),
+                G_POPMTX => self.pop_matrix(w1),
+                G_GEOMETRYMODE => self.geometry = (self.geometry & (w0 & 0x00FF_FFFF)) | w1,
+                G_MTX => self.matrix(ram.r(), w0, w1, at)?,
+                G_MOVEWORD => self.moveword(w0, w1, at),
+                G_MOVEMEM => self.movemem(ram.r(), w0, w1, at)?,
+                G_DL => {
                     if (w0 >> 16) & 0xFF == 0 {
                         if stack.len() >= DL_STACK {
                             return Err(GfxError::StackOverflow { at });
@@ -451,80 +529,119 @@ impl Interpreter {
                     }
                     pc = self.phys(w1);
                 }
-                0xDF => match stack.pop() {
+                G_ENDDL => match stack.pop() {
                     Some(ret) => pc = ret,
                     None => return Ok(()),
                 },
-                0xE1 => self.rdphalf1 = w1,
-                0xE2 | 0xE3 => {
-                    // A malformed length past 32 bits would overflow the shift.
-                    let len = ((w0 & 0xFF) + 1).min(32);
-                    let shift = 32u32.saturating_sub(((w0 >> 8) & 0xFF) + len);
-                    let mask = (((1u64 << len) - 1) << shift) as u32;
-                    let m = if w0 >> 24 == 0xE2 {
-                        &mut self.state.other_l
-                    } else {
-                        &mut self.state.other_h
-                    };
-                    *m = (*m & !mask) | (w1 & mask);
-                }
-                0xE4 | 0xE5 => {
+                G_RDPHALF_1 => self.rdphalf1 = w1,
+                G_SETOTHERMODE_L | G_SETOTHERMODE_H => self.set_other_mode(w0, w1),
+                G_TEXRECT | G_TEXRECTFLIP => {
                     let h1 = rd32(ram.r(), pc + 4, at)?;
                     let h2 = rd32(ram.r(), pc + 12, at)?;
                     pc += 16;
-                    self.texture_rect(w0, w1, h1, h2, w0 >> 24 == 0xE5, ram.w());
+                    self.texture_rect(w0, w1, h1, h2, w0 >> 24 == G_TEXRECTFLIP, ram.w());
                 }
-                0xEE => self.prim_depth = ((w1 >> 16) & 0x7FFF) as f32 / 32767.0, // 15-bit depth
-                0xEF => {
+                G_SETPRIMDEPTH => self.prim_depth = ((w1 >> 16) & 0x7FFF) as f32 / 32767.0, // 15-bit depth
+                G_RDPSETOTHERMODE => {
                     self.state.other_h = w0 & 0x00FF_FFFF;
                     self.state.other_l = w1;
                 }
-                0xF0 | 0xF3 | 0xF4 if rb.is_some() => {
+                G_LOADTLUT | G_LOADBLOCK | G_LOADTILE if rb.is_some() => {
                     if let (Some(rb), Some(m)) = (rb.as_deref_mut(), ram.w()) {
                         self.read_back(m, rb);
                     }
                     match w0 >> 24 {
-                        0xF0 => self.tmem.load_tlut(ram.r(), w1),
-                        0xF3 => self.tmem.load_block(ram.r(), w0, w1),
+                        G_LOADTLUT => self.tmem.load_tlut(ram.r(), w1),
+                        G_LOADBLOCK => self.tmem.load_block(ram.r(), w0, w1),
                         _ => self.tmem.load_tile(ram.r(), w0, w1),
                     }
                 }
-                0xF0 => self.tmem.load_tlut(ram.r(), w1),
-                0xF2 => self.tmem.set_tile_size(w0, w1),
-                0xF3 => self.tmem.load_block(ram.r(), w0, w1),
-                0xF4 => self.tmem.load_tile(ram.r(), w0, w1),
-                0xF5 => self.tmem.set_tile(w0, w1),
-                0xF6 => self.fill_rect(w0, w1, ram.w()),
-                0xF7 => self.fill_color = w1,
-                0xF8 => self.state.fog = rgba(w1),
-                0xF9 => self.state.blend = rgba(w1),
-                0xFA => {
+                G_LOADTLUT => self.tmem.load_tlut(ram.r(), w1),
+                G_SETTILESIZE => self.tmem.set_tile_size(w0, w1),
+                G_LOADBLOCK => self.tmem.load_block(ram.r(), w0, w1),
+                G_LOADTILE => self.tmem.load_tile(ram.r(), w0, w1),
+                G_SETTILE => self.tmem.set_tile(w0, w1),
+                G_FILLRECT => self.fill_rect(w0, w1, ram.w()),
+                G_SETFILLCOLOR => self.fill_color = w1,
+                G_SETFOGCOLOR => self.state.fog = rgba(w1),
+                G_SETBLENDCOLOR => self.state.blend = rgba(w1),
+                G_SETPRIMCOLOR => {
                     self.state.prim = rgba(w1);
                     self.state.prim_lod = (w0 & 0xFF) as f32 / 255.0;
                 }
-                0xFB => self.state.env = rgba(w1),
-                0xFC => self.state.combine = ((w0 as u64 & 0x00FF_FFFF) << 32) | w1 as u64,
-                0xFD => self.tmem.set_image(w0, self.phys(w1)),
-                0xFE => self.zimg = self.phys(w1),
-                0xFF => {
-                    self.cimg = (self.phys(w1), (w0 & 0xFFF) + 1, (w0 >> 19) & 3);
-                    self.state.color_image = self.cimg.0;
-                    self.state.color_width = self.cimg.1;
-                    self.frame.color_image = self.cimg.0;
-                    if self.frame.width != self.cimg.1 {
-                        self.frame.width = self.cimg.1;
-                        self.rect_transform = None;
-                    }
-                }
+                G_SETENVCOLOR => self.state.env = rgba(w1),
+                G_SETCOMBINE => self.state.combine = ((w0 as u64 & 0x00FF_FFFF) << 32) | w1 as u64,
+                G_SETTIMG => self.tmem.set_image(w0, self.phys(w1)),
+                G_SETZIMG => self.zimg = self.phys(w1),
+                G_SETCIMG => self.color_image(w0, w1),
                 op => self.warn(format!("unknown command {op:#04x} at {at:#010x}")),
             }
         }
         Err(GfxError::TooLong { at: pc })
     }
 
+    /// `G_LOAD_UCODE`: a load names the new microcode's data in the half
+    /// word before it. shortcut: data with no name in it toggles between 3D
+    /// and 2D, as games with those two do.
+    fn load_ucode(&mut self, rdram: &[u8]) {
+        let data = self.phys(self.rdphalf1);
+        if !self.microcode(rdram, data) {
+            self.ucode_2d = !self.ucode_2d;
+        }
+    }
+
+    /// `G_TEXTURE`: the texture coordinate scale, the tile and on or off.
+    fn texture(&mut self, w0: u32, w1: u32) {
+        // 0xFFFF is the conventional "1.0".
+        let scale = |v: u32| if v == 0xFFFF { 1.0 } else { v as f32 / 65536.0 };
+        self.tex_scale = [scale(w1 >> 16), scale(w1 & 0xFFFF)];
+        self.tex_tile = ((w0 >> 8) & 7) as usize;
+        self.tex_on = w0 & 0xFE != 0;
+    }
+
+    /// `G_POPMTX`: pop `w1` bytes' worth of model-view matrices.
+    fn pop_matrix(&mut self, w1: u32) {
+        let n = (w1 / MTX_BYTES) as usize;
+        // F3DEX2 skips a pop below the stack base (bltz); a zero-byte pop
+        // removes nothing but still reloads the modelview like any pop.
+        if n < self.modelview.len() {
+            self.modelview.truncate(self.modelview.len() - n);
+            // F3DEX2 reloads the modelview and marks the combined matrix stale (GLideN64: CHANGED_MATRIX).
+            self.mvp = None;
+        }
+    }
+
+    /// `G_SETOTHERMODE_L` and `_H`: replace a run of bits of one word.
+    fn set_other_mode(&mut self, w0: u32, w1: u32) {
+        // A malformed length past 32 bits would overflow the shift.
+        let len = ((w0 & 0xFF) + 1).min(32);
+        let shift = 32u32.saturating_sub(((w0 >> 8) & 0xFF) + len);
+        let mask = (((1u64 << len) - 1) << shift) as u32;
+        let m = if w0 >> 24 == G_SETOTHERMODE_L {
+            &mut self.state.other_l
+        } else {
+            &mut self.state.other_h
+        };
+        *m = (*m & !mask) | (w1 & mask);
+    }
+
+    /// `G_SETCIMG`: the colour image drawn into from now on.
+    fn color_image(&mut self, w0: u32, w1: u32) {
+        self.cimg = (self.phys(w1), (w0 & 0xFFF) + 1, (w0 >> 19) & 3);
+        self.state.color_image = self.cimg.0;
+        self.state.color_width = self.cimg.1;
+        self.frame.color_image = self.cimg.0;
+        if self.frame.width != self.cimg.1 {
+            self.frame.width = self.cimg.1;
+            self.rect_transform = None;
+        }
+    }
+
     fn warn(&mut self, msg: String) {
         if self.frame.warnings.len() < MAX_WARNINGS {
             self.frame.warnings.push(msg);
+        } else {
+            self.frame.warnings_dropped += 1;
         }
     }
 
@@ -593,17 +710,19 @@ impl Interpreter {
     fn moveword(&mut self, w0: u32, w1: u32, at: u32) {
         let (index, offset) = ((w0 >> 16) & 0xFF, w0 & 0xFFFF);
         match index {
-            0x02 => self.num_lights = (w1 / self.light_size()).min(7) as usize,
-            0x06 => self.segments[(offset / 4) as usize & 0xF] = w1 & 0x00FF_FFFF,
-            0x10 if self.normals_apart => self.light_space[(offset / 4) as usize % 12] = w1,
+            G_MW_NUMLIGHT => self.num_lights = (w1 / self.light_size()).min(7) as usize,
+            G_MW_SEGMENT => self.segments[(offset / 4) as usize & 0xF] = w1 & 0x00FF_FFFF,
+            G_MW_LIGHT_SPACE if self.normals_apart => {
+                self.light_space[(offset / 4) as usize % 12] = w1
+            }
             // Fog: multiplier and offset of the fog factor.
-            0x08 => {
+            G_MW_FOG => {
                 self.state.fog_factor = [(w1 >> 16) as i16 as f32, w1 as i16 as f32];
             }
             // Clip ratio, perspective norm: not needed by this renderer.
             // Light colour (`gSPLightColor`): light n's two colour words
             // are at n * 24 and n * 24 + 4; the second is a copy.
-            0x0A => {
+            G_MW_LIGHTCOL => {
                 if offset % 24 == 0 {
                     if let Some(l) = self.lights.get_mut((offset / 24) as usize) {
                         l.color = [24, 16, 8].map(|s| ((w1 >> s) & 0xFF) as f32 / 255.0);
@@ -613,7 +732,7 @@ impl Interpreter {
             // gSPInsertMatrix: overwrite two 16-bit halves (integer parts in
             // the first 32 bytes, fractions in the next 32) of the combined
             // modelview-projection matrix. Games build billboards this way.
-            0x00 if offset < 64 => {
+            G_MW_MATRIX if offset < 64 => {
                 let mut m = self
                     .mvp
                     .unwrap_or_else(|| mat_mul(self.modelview.last().unwrap(), &self.projection));
@@ -633,7 +752,7 @@ impl Interpreter {
                 }
                 self.mvp = Some(m);
             }
-            0x04 | 0x0C | 0x0E => {}
+            G_MW_CLIP | G_MW_FORCEMTX | G_MW_PERSPNORM => {}
             _ => self.warn(format!("moveword {index:#x} at {at:#010x}")),
         }
     }
@@ -642,7 +761,7 @@ impl Interpreter {
         let a = self.phys(w1);
         let offset = ((w0 >> 8) & 0xFF) * 8;
         match w0 & 0xFF {
-            8 => {
+            G_MV_VIEWPORT => {
                 let v = |k: u32| -> Result<f32, GfxError> {
                     Ok(rd16(rdram, a + k * 2, at)? as i16 as f32 / 4.0)
                 };
@@ -651,7 +770,7 @@ impl Interpreter {
                     trans: [v(4)?, v(5)?],
                 };
             }
-            10 => {
+            G_MV_LIGHT => {
                 // Lights start after the two look-at entries.
                 let b = |k: u32| rd8(rdram, a + k, at);
                 let place = offset / self.light_size();
@@ -686,7 +805,7 @@ impl Interpreter {
                     *l = light;
                 }
             }
-            14 if self.normals_apart => self.normals = a,
+            G_MV_NORMALS if self.normals_apart => self.normals = a,
             idx => self.warn(format!("movemem {idx:#x} at {at:#010x}")),
         }
         Ok(())
@@ -880,7 +999,7 @@ impl Interpreter {
             return;
         }
         let tiles = self.tiles();
-        let bilerp = (self.state.other_h >> 12) & 3 != 0;
+        let bilerp = (self.state.other_h >> G_MDSFT_TEXTFILT) & 3 != 0;
         // Perspective correction off: the console takes the coordinates at
         // half scale (games' billboards such as the sun are made for it).
         let half = if self.state.other_h & G_TP_PERSP == 0 { 0.5 } else { 1.0 };
@@ -1076,7 +1195,7 @@ impl Interpreter {
     }
 
     fn cycle_type(&self) -> u32 {
-        (self.state.other_h >> 20) & 3
+        cycle_type(self.state.other_h)
     }
 
     /// Two triangles covering `xy` (x0, y0, x1, y1 in pixels); `uv(x, y)`
@@ -1102,9 +1221,8 @@ impl Interpreter {
     }
 
     fn fill_rect(&mut self, w0: u32, w1: u32, ram: Option<&mut [u8]>) {
-        let fixed = |v: u32, sh: u32| ((v >> sh) & 0xFFF) as f32 / 4.0;
-        let (x1, y1, x0, y0) = (fixed(w0, 12), fixed(w0, 0), fixed(w1, 12), fixed(w1, 0));
-        let fill = self.cycle_type() == 3;
+        let [x1, y1, x0, y0] = rect_coords(w0, w1);
+        let fill = self.cycle_type() == G_CYC_FILL;
         if let (true, Some(ram)) = (fill, ram) {
             // The fill colour, as the RDP writes it: two 16-bit pixels or
             // one 32-bit pixel per word.
@@ -1138,7 +1256,7 @@ impl Interpreter {
         state.geometry = 0;
         state.textures = [None; 2];
         // Fill and copy modes include the bottom-right edge.
-        let extra = if self.cycle_type() >= 2 { 1.0 } else { 0.0 };
+        let extra = if self.cycle_type() >= G_CYC_COPY { 1.0 } else { 0.0 };
         if fill {
             // The fill colour bypasses the combiner: draw it as the primitive
             // colour through a combiner that passes the primitive through.
@@ -1223,14 +1341,13 @@ impl Interpreter {
         flip: bool,
         ram: Option<&mut [u8]>,
     ) {
-        let fixed = |v: u32, sh: u32| ((v >> sh) & 0xFFF) as f32 / 4.0;
-        let (x1, y1, x0, y0) = (fixed(w0, 12), fixed(w0, 0), fixed(w1, 12), fixed(w1, 0));
+        let [x1, y1, x0, y0] = rect_coords(w0, w1);
         let tile = ((w1 >> 24) & 7) as usize;
         let s = (h1 >> 16) as i16 as f32 / 32.0;
         let t = (h1 & 0xFFFF) as i16 as f32 / 32.0;
         let mut dsdx = (h2 >> 16) as i16 as f32 / 1024.0;
         let dtdy = (h2 & 0xFFFF) as i16 as f32 / 1024.0;
-        let copy = self.cycle_type() == 2;
+        let copy = self.cycle_type() == G_CYC_COPY;
         let extra = if copy { 1.0 } else { 0.0 };
         if copy {
             dsdx /= 4.0; // copy mode steps four pixels per clock
@@ -1303,10 +1420,16 @@ fn rgba(w: u32) -> [f32; 4] {
     w.to_be_bytes().map(|c| c as f32 / 255.0)
 }
 
-/// Height of a colour image of `width`, which the RDP does not know: the
-/// usual 4:3 shape.
-fn image_height(width: u32) -> u32 {
-    (width * 3 / 4).max(1)
+/// The four 10.2 fixed-point coordinates of a scissor or rectangle
+/// command, in the order the words hold them: `[w0 >> 12, w0, w1 >> 12, w1]`.
+fn rect_coords(w0: u32, w1: u32) -> [f32; 4] {
+    let fixed = |v: u32, sh: u32| ((v >> sh) & 0xFFF) as f32 / 4.0;
+    [fixed(w0, 12), fixed(w0, 0), fixed(w1, 12), fixed(w1, 0)]
+}
+
+/// The three vertex-buffer indices of a triangle in the low 24 bits of `w`.
+fn tri_indices(w: u32) -> [u32; 3] {
+    [(w >> 16) & 0xFF, (w >> 8) & 0xFF, w & 0xFF]
 }
 
 /// Writes `bytes` at physical `at`, if it is in RAM.
@@ -1391,6 +1514,25 @@ mod tests {
         let mut ram: Vec<u8> = words.iter().flat_map(|w| w.to_be_bytes()).collect();
         ram.resize(0x2_0000, 0);
         ram
+    }
+
+    #[test]
+    fn warnings_past_the_limit_are_counted_not_kept() {
+        // Unknown commands, each a warning, then the end of the list.
+        let extra = 5;
+        let mut words = Vec::new();
+        for _ in 0..MAX_WARNINGS + extra {
+            words.extend([0x08 << 24, 0]);
+        }
+        words.extend([G_ENDDL << 24, 0]);
+        let ram: Vec<u8> = words.iter().flat_map(|w| w.to_be_bytes()).collect();
+        let mut it = Interpreter::new();
+        it.run(&ram, 0).unwrap();
+        let f = it.take_frame();
+        assert_eq!(f.warnings.len(), MAX_WARNINGS);
+        assert_eq!(f.warnings_dropped, extra as u32);
+        // The count starts again with the next frame.
+        assert_eq!(it.take_frame().warnings_dropped, 0);
     }
 
     #[test]

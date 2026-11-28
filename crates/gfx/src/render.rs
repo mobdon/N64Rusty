@@ -10,18 +10,25 @@ use std::fmt;
 use std::sync::OnceLock;
 
 use crate::combiner::{shader, ShaderKey};
+use crate::dl::{
+    cycle_type, G_CULL_BACK, G_CULL_FRONT, G_CYC_2CYCLE, G_CYC_COPY, G_CYC_FILL, G_MDSFT_TEXTFILT,
+    G_SHADING_SMOOTH, G_ZBUFFER,
+};
 use crate::{mat_mul, Command, Frame, RenderState, Wrap};
 
 /// Pixels read back from the GPU.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Image {
+    /// Width in pixels.
     pub width: u32,
+    /// Height in pixels.
     pub height: u32,
     /// RGBA8, row-major, top row first.
     pub rgba: Vec<u8>,
 }
 
 impl Image {
+    /// The RGBA of the pixel at (`x`, `y`); panics outside the image.
     pub fn pixel(&self, x: u32, y: u32) -> [u8; 4] {
         let i = ((y * self.width + x) * 4) as usize;
         [
@@ -33,11 +40,14 @@ impl Image {
     }
 }
 
+/// The GPU could not be set up or used.
 #[derive(Debug)]
 pub enum RenderError {
     /// No GPU or software adapter was found.
     NoAdapter(String),
+    /// The device could not be created, or reported an error.
     Device(String),
+    /// The picture could not be read back.
     Readback(String),
     /// A size or pixel buffer the device cannot take; nothing was drawn.
     Size(String),
@@ -73,30 +83,77 @@ const BL_IN: u32 = 0;
 const BL_MEM: u32 = 1;
 const BL_FOG: u32 = 3;
 const BL_A_SHADE: u32 = 2;
+/// Blender A input: zero.
+const BL_A_ZERO: u32 = 3;
+/// Blender B input: one minus A.
+const BL_B_ONE_MINUS_A: u32 = 0;
 /// Geometry mode: the vertex shade alpha is the fog factor.
 const G_FOG: u32 = 0x0001_0000;
+
+// Other modes, low word (render mode).
+/// Alpha compare against the blend colour's alpha.
+const G_AC_THRESHOLD: u32 = 1;
+/// The two alpha compare bits.
+const G_AC_MASK: u32 = 3;
+/// Rectangles take their depth from the primitive depth.
+const G_ZS_PRIM: u32 = 0x0004;
+const Z_CMP: u32 = 0x0010;
+const Z_UPD: u32 = 0x0020;
+/// The depth mode field; [`ZMODE_DEC`] is decal.
+const ZMODE_SHIFT: u32 = 10;
+const ZMODE_DEC: u32 = 3;
+/// Coverage times alpha with alpha as coverage: the "texture edge" modes.
+const CVG_X_ALPHA_SEL: u32 = 0x3000;
+const FORCE_BL: u32 = 0x4000;
+
+// Widescreen tuning, as fractions of the frame's width unless named.
+/// A row of background rectangles starts by this much from the left edge
+/// and ends past [`BG_ROW_END`] to stretch edge to edge.
+const BG_ROW_START: f32 = 0.05;
+const BG_ROW_END: f32 = 0.95;
+/// A box spans the frame's width when it starts by this much and ends
+/// past [`SPAN_END`]: the border games often leave.
+const SPAN_START: f32 = 0.1;
+const SPAN_END: f32 = 0.9;
+/// A backdrop covers at least this much of the clip-space width (2), nine
+/// tenths of the view.
+const BACKDROP_MIN_SPAN: f32 = 1.8;
+/// A flat overlay reaches past this in clip space on every side.
+const OVERLAY_EDGE: f32 = 0.98;
+/// Vertices of one flat overlay have the same w to within this fraction.
+const OVERLAY_FLAT_W: f32 = 1e-3;
+/// A HUD panel is at least this many pixels wide, and narrower than
+/// [`PANEL_MAX_WIDTH`] of the frame.
+const PANEL_MIN_PX: f32 = 100.0;
+const PANEL_MAX_WIDTH: f32 = 0.9;
+/// A 3D viewport at least this wide is the scene, not a HUD piece.
+const HUD_3D_VIEWPORT: f32 = 0.5;
 
 /// Everything that needs its own pipeline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct PipeKey {
     shader: ShaderKey,
     /// Source and destination factors, or opaque.
-    blend: Option<(u8, u8)>,
+    blend: Option<(wgpu::BlendFactor, wgpu::BlendFactor)>,
     depth_test: bool,
     depth_write: bool,
     decal: bool,
-    /// 0 none, 1 front, 2 back.
-    cull: u8,
+    /// The faces culled, if any.
+    cull: Option<wgpu::Face>,
 }
 
 fn pipe_key(s: &RenderState) -> PipeKey {
-    let cycle = (s.other_h >> 20) & 3;
-    let two_cycle = cycle == 1;
-    let copy_or_fill = cycle >= 2;
+    let cycle = cycle_type(s.other_h);
+    let two_cycle = cycle == G_CYC_2CYCLE;
+    let copy_or_fill = cycle >= G_CYC_COPY;
     // Coverage times alpha ("texture edge" modes) behaves like a test at
     // one half. With alpha compare also on, both apply: a compare against a
     // zero blend alpha alone would draw the texture's clear parts solid.
-    let alpha_test = match (cycle == 3, s.other_l & 3 == 1, s.other_l & 0x3000 == 0x3000) {
+    let alpha_test = match (
+        cycle == G_CYC_FILL,
+        s.other_l & G_AC_MASK == G_AC_THRESHOLD,
+        s.other_l & CVG_X_ALPHA_SEL == CVG_X_ALPHA_SEL,
+    ) {
         (true, _, _) => 0,
         (_, true, true) => 3,
         (_, true, false) => 1,
@@ -107,16 +164,20 @@ fn pipe_key(s: &RenderState) -> PipeKey {
     let sh = if two_cycle { 16 } else { 18 };
     let field = |k: u32| (s.other_l >> (sh + k * 4)) & 3;
     let (b, m, a, p) = (field(0), field(1), field(2), field(3));
-    let force_blend = s.other_l & 0x4000 != 0;
+    let force_blend = s.other_l & FORCE_BL != 0;
     // shortcut: only "IN * A + MEM * B" blends; fog and blend-colour mixes
     // are drawn opaque. Add them when a game needs them.
     let blend = (!copy_or_fill && force_blend && p == BL_IN && m == BL_MEM).then(|| {
-        let src = if a == 3 { 0 } else { 1 }; // zero, or source alpha
+        let src = if a == BL_A_ZERO {
+            wgpu::BlendFactor::Zero
+        } else {
+            wgpu::BlendFactor::SrcAlpha
+        };
         let dst = match b {
-            0 if a == 3 => 2, // one
-            0 => 3,           // one minus source alpha
-            1 | 2 => 2,       // memory alpha, one
-            _ => 0,           // zero
+            BL_B_ONE_MINUS_A if a == BL_A_ZERO => wgpu::BlendFactor::One,
+            BL_B_ONE_MINUS_A => wgpu::BlendFactor::OneMinusSrcAlpha,
+            1 | 2 => wgpu::BlendFactor::One, // memory alpha, one
+            _ => wgpu::BlendFactor::Zero,
         };
         (src, dst)
     });
@@ -125,43 +186,34 @@ fn pipe_key(s: &RenderState) -> PipeKey {
     let first = |k: u32| (s.other_l >> (18 + k * 4)) & 3;
     let fog = two_cycle && !s.rect && first(3) == BL_FOG && first(2) == BL_A_SHADE;
     let zbuf = if s.rect {
-        s.other_l & 4 != 0 // rectangles compare only with the primitive depth
+        s.other_l & G_ZS_PRIM != 0 // rectangles compare only with the primitive depth
     } else {
-        s.geometry & 1 != 0
+        s.geometry & G_ZBUFFER != 0
     };
     let depth = zbuf && !copy_or_fill;
     let cull = if s.rect || copy_or_fill {
-        0
-    } else if s.geometry & 0x0400 != 0 {
-        2
-    } else if s.geometry & 0x0200 != 0 {
-        1
+        None
+    } else if s.geometry & G_CULL_BACK != 0 {
+        Some(wgpu::Face::Back)
+    } else if s.geometry & G_CULL_FRONT != 0 {
+        Some(wgpu::Face::Front)
     } else {
-        0
+        None
     };
     PipeKey {
         shader: ShaderKey {
             combine: s.combine,
             two_cycle,
             alpha_test,
-            flat: !s.rect && s.geometry & 0x0020_0000 == 0,
+            flat: !s.rect && s.geometry & G_SHADING_SMOOTH == 0,
             sharp: false,
             fog,
         },
         blend,
-        depth_test: depth && s.other_l & 0x10 != 0,
-        depth_write: depth && s.other_l & 0x20 != 0,
-        decal: (s.other_l >> 10) & 3 == 3,
+        depth_test: depth && s.other_l & Z_CMP != 0,
+        depth_write: depth && s.other_l & Z_UPD != 0,
+        decal: (s.other_l >> ZMODE_SHIFT) & 3 == ZMODE_DEC,
         cull,
-    }
-}
-
-fn factor(f: u8) -> wgpu::BlendFactor {
-    match f {
-        0 => wgpu::BlendFactor::Zero,
-        1 => wgpu::BlendFactor::SrcAlpha,
-        2 => wgpu::BlendFactor::One,
-        _ => wgpu::BlendFactor::OneMinusSrcAlpha,
     }
 }
 
@@ -211,8 +263,9 @@ pub struct Stats {
     pub upload_us: u64,
     /// Submitting, and waiting for a read-back or a present.
     pub submit_us: u64,
-    /// Textures uploaded, and their bytes (top level only).
+    /// Textures uploaded.
     pub textures_new: u64,
+    /// Bytes of the textures uploaded (top level only).
     pub texture_bytes: u64,
 }
 
@@ -246,6 +299,9 @@ pub struct Renderer {
     readback_buf: Option<wgpu::Buffer>,
     /// Texture bindings by what they bind, kept with the uploaded textures.
     bindings: HashMap<BindKey, wgpu::BindGroup>,
+    /// Keep the vertex and uniform buffers across pictures. Off with
+    /// `N64RUSTY_BUFFER_REUSE=off`, read when the renderer is made.
+    buffer_reuse: bool,
 }
 
 /// Content key and wrap of each texture slot, and linear filtering.
@@ -261,6 +317,8 @@ struct Uploaded {
 /// textures cost a view each even under the byte limit.
 const UPLOADED_MAX: usize = 2048;
 const UPLOADED_MAX_BYTES: u64 = 256 << 20;
+/// Texture bindings kept; all are dropped past this.
+const BINDINGS_MAX: usize = 2048;
 
 impl Renderer {
     /// Open the first GPU or software adapter, with no window.
@@ -296,25 +354,14 @@ impl Renderer {
                 count: None,
             }],
         });
-        let tex_entry = |binding| wgpu::BindGroupLayoutEntry {
-            binding,
-            visibility: wgpu::ShaderStages::FRAGMENT,
-            ty: wgpu::BindingType::Texture {
-                sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                view_dimension: wgpu::TextureViewDimension::D2,
-                multisampled: false,
-            },
-            count: None,
-        };
-        let smp_entry = |binding| wgpu::BindGroupLayoutEntry {
-            binding,
-            visibility: wgpu::ShaderStages::FRAGMENT,
-            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-            count: None,
-        };
         let texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("textures"),
-            entries: &[tex_entry(0), smp_entry(1), tex_entry(2), smp_entry(3)],
+            entries: &[
+                texture_layout_entry(0),
+                sampler_layout_entry(1),
+                texture_layout_entry(2),
+                sampler_layout_entry(3),
+            ],
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("n64"),
@@ -344,6 +391,7 @@ impl Renderer {
             uniform_buf: None,
             readback_buf: None,
             bindings: HashMap::new(),
+            buffer_reuse: std::env::var_os("N64RUSTY_BUFFER_REUSE").is_none_or(|v| v != "off"),
         })
     }
 
@@ -396,7 +444,6 @@ impl Renderer {
         }
     }
 
-    /// Name and backend of the adapter in use.
     /// Time spent since the last [`Renderer::take_stats`].
     pub fn stats(&self) -> Stats {
         self.stats
@@ -407,6 +454,7 @@ impl Renderer {
         std::mem::take(&mut self.stats)
     }
 
+    /// Name and backend of the adapter in use.
     pub fn adapter_name(&self) -> &str {
         &self.adapter_name
     }
@@ -445,8 +493,8 @@ impl Renderer {
             ];
             let blend = key.blend.map(|(src, dst)| {
                 let c = wgpu::BlendComponent {
-                    src_factor: factor(src),
-                    dst_factor: factor(dst),
+                    src_factor: src,
+                    dst_factor: dst,
                     operation: wgpu::BlendOperation::Add,
                 };
                 wgpu::BlendState { color: c, alpha: c }
@@ -466,11 +514,7 @@ impl Renderer {
                 },
                 primitive: wgpu::PrimitiveState {
                     front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: match key.cull {
-                        1 => Some(wgpu::Face::Front),
-                        2 => Some(wgpu::Face::Back),
-                        _ => None,
-                    },
+                    cull_mode: key.cull,
                     ..Default::default()
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
@@ -633,22 +677,14 @@ impl Renderer {
         })
     }
 
-    /// Records the passes that draw `frame` into a new `width` x `height`
-    /// colour texture; nothing is submitted yet.
-    fn draw(
-        &mut self,
-        frame: &Frame,
-        transforms: &[crate::Transform],
-        width: u32,
-        height: u32,
-    ) -> (wgpu::Texture, wgpu::CommandEncoder) {
-        let t0 = std::time::Instant::now();
+    /// The colour and depth targets for a `width` x `height` picture. The
+    /// window draws at one size frame after frame: the last ones are kept.
+    fn targets(&mut self, width: u32, height: u32) -> (wgpu::Texture, wgpu::Texture) {
         let size = wgpu::Extent3d {
             width,
             height,
             depth_or_array_layers: 1,
         };
-        // The window draws at one size frame after frame: keep the targets.
         let reuse = matches!(&self.targets, Some((w, h, ..)) if (*w, *h) == (width, height));
         if !reuse {
             let target = self.device.create_texture(&wgpu::TextureDescriptor {
@@ -672,6 +708,20 @@ impl Renderer {
             self.targets = Some((width, height, target, depth));
         }
         let (_, _, target, depth) = self.targets.clone().expect("targets were just made");
+        (target, depth)
+    }
+
+    /// Records the passes that draw `frame` into a new `width` x `height`
+    /// colour texture; nothing is submitted yet.
+    fn draw(
+        &mut self,
+        frame: &Frame,
+        transforms: &[crate::Transform],
+        width: u32,
+        height: u32,
+    ) -> (wgpu::Texture, wgpu::CommandEncoder) {
+        let t0 = std::time::Instant::now();
+        let (target, depth) = self.targets(width, height);
         let color_view = target.create_view(&Default::default());
         let depth_view = depth.create_view(&Default::default());
 
@@ -682,47 +732,7 @@ impl Renderer {
         // A background may also be a row of tiles: rectangles on the same
         // lines, edge to edge, that together span the frame.
         let wide = self.wide(frame, width, height);
-        let mut stretch = vec![None; frame.vertices.len()];
-        let mut rows = HashMap::<(i32, i32), Vec<_>>::new();
-        // Neighbouring rectangles with one state share a draw: look at each
-        // one (two triangles, six vertices) on its own.
-        let quads = frame
-            .draws()
-            // A pre-rendered picture has 3D drawn into it (a room around a
-            // character): stretched, the two would part. It keeps its shape.
-            .filter(|d| d.state.rect && !d.state.picture && wide > 1.0)
-            .flat_map(|d| {
-                let end = (d.first + d.count) as usize;
-                (d.first as usize..end)
-                    .step_by(6)
-                    .map(move |q| q..(q + 6).min(end))
-            });
-        for range in quads {
-            let bound = |k: usize, f: fn(f32, f32) -> f32, start: f32| {
-                frame.vertices[range.clone()]
-                    .iter()
-                    .map(|v| v.pos[k])
-                    .fold(start, f)
-            };
-            let (x0, x1) = (bound(0, f32::min, f32::MAX), bound(0, f32::max, f32::MIN));
-            let (y0, y1) = (bound(1, f32::min, f32::MAX), bound(1, f32::max, f32::MIN));
-            let row = (y0.round() as i32, y1.round() as i32);
-            rows.entry(row).or_default().push((x0, x1, range));
-        }
-        for mut row in rows.into_values() {
-            row.sort_by(|a, b| a.0.total_cmp(&b.0));
-            let edge_to_edge = row.windows(2).all(|w| w[1].0 <= w[0].1 + 1.0);
-            let x0 = row[0].0;
-            let x1 = row.iter().map(|r| r.1).fold(f32::MIN, f32::max);
-            // Stricter than one rectangle: a menu grid (portraits from 25 to
-            // 295 of 320) must keep its place under its cursor.
-            let fw = frame.width as f32;
-            if edge_to_edge && x0 <= fw * 0.05 && x1 >= fw * 0.95 {
-                for (_, _, range) in row {
-                    stretch[range].fill(Some((x0, x1)));
-                }
-            }
-        }
+        let stretch = stretched_backgrounds(frame, wide);
         let clip = clip_matrices(frame, transforms);
         // Flat (orthographic) pieces get their depth clamped, not clipped:
         // a HUD piece in front of the near plane still shows. Perspective
@@ -742,75 +752,9 @@ impl Renderer {
             }
             p
         };
-        // A backdrop drawn first (a sky made for the original view's width)
-        // ends at the 4:3 edges: stretch it like a background. It is the
-        // leading run of 3D draws, after nothing but fills, that each cover
-        // nine tenths of the width.
-        let mut backdrop = vec![false; frame.vertices.len()];
-        let mut started = false;
-        if wide > 1.0 {
-            for d in frame
-                .draws()
-                .filter(|d| d.state.color_image == frame.color_image)
-            {
-                // Fills (a clear) come before a backdrop; any other
-                // rectangle (a background picture) is the backdrop itself,
-                // and 3D after it is the scene.
-                if d.state.rect {
-                    let fill = (d.state.other_h >> 20) & 3 == 3 && d.state.textures[0].is_none();
-                    // Only before the backdrop starts: a fill after it is
-                    // part of the scene.
-                    if fill && !started {
-                        continue;
-                    }
-                    break;
-                }
-                started = true;
-                let range = d.first as usize..(d.first + d.count) as usize;
-                let (mut x0, mut x1) = (1.0f32, -1.0f32);
-                for v in &frame.vertices[range.clone()] {
-                    let p = at(v);
-                    if p[3] > 0.0 {
-                        x0 = x0.min(p[0] / p[3]);
-                        x1 = x1.max(p[0] / p[3]);
-                    }
-                }
-                if x1.min(1.0) - x0.max(-1.0) < 1.8 {
-                    break;
-                }
-                backdrop[range].fill(true);
-            }
-        }
-        // A flat overlay facing the camera and covering the whole view (a
-        // fade or a flash drawn as triangles) covers the wide view too.
-        if wide > 1.0 {
-            for d in frame
-                .draws()
-                .filter(|d| !d.state.rect && d.state.color_image == frame.color_image)
-            {
-                let range = d.first as usize..(d.first + d.count) as usize;
-                let ps: Vec<_> = frame.vertices[range.clone()].iter().map(at).collect();
-                let Some(w) = ps.first().map(|p| p[3]) else {
-                    continue;
-                };
-                let flat = w > 0.0 && ps.iter().all(|p| (p[3] - w).abs() <= w * 1e-3);
-                let ext = |k: usize, f: fn(f32, f32) -> f32, s: f32| {
-                    ps.iter().map(|p| p[k] / p[3]).fold(s, f)
-                };
-                let covers =
-                    |k| ext(k, f32::min, f32::MAX) <= -0.98 && ext(k, f32::max, f32::MIN) >= 0.98;
-                if flat && covers(0) && covers(1) {
-                    backdrop[range].fill(true);
-                }
-            }
-        }
+        let backdrop = backdrops(frame, wide, at);
         let shift = hud_shift(frame, transforms, &clip, wide);
-        // Fog on: the vertex's shade alpha becomes its fog factor, from its
-        // depth, as the microcode computes it.
-        let mut fog = vec![None; frame.vertices.len()];
-        for d in frame.draws().filter(|d| !d.state.rect && d.state.geometry & G_FOG != 0) {
-            fog[d.first as usize..(d.first + d.count) as usize].fill(Some(d.state.fog_factor));
-        }
+        let fog = fog_factors(frame);
         let mut verts = Vec::with_capacity(frame.vertices.len() * VERTEX_FLOATS);
         for ((((v, stretch), backdrop), shift), fog) in frame
             .vertices
@@ -846,6 +790,7 @@ impl Renderer {
             &mut self.vertex_buf,
             &floats(&verts),
             wgpu::BufferUsages::VERTEX,
+            self.buffer_reuse,
         );
 
         // Per-draw uniforms.
@@ -855,20 +800,14 @@ impl Renderer {
             // are skipped; give them their own targets when a game needs it.
             .filter(|d| d.state.color_image == frame.color_image)
             .collect();
-        let mut uniforms = vec![0u8; (draws.len().max(1) as u64 * UNIFORM_STRIDE) as usize];
-        for (i, d) in draws.iter().enumerate() {
-            let s = &d.state;
-            let misc = [s.prim_lod, s.k5, 0.0, 0.0];
-            let vals: Vec<f32> = [s.prim, s.env, s.blend, misc, s.fog].concat();
-            let at = i * UNIFORM_STRIDE as usize;
-            uniforms[at..at + UNIFORM_SIZE as usize].copy_from_slice(&floats(&vals));
-        }
+        let uniforms = draw_uniforms(&draws);
         let ubuf = kept_buffer(
             &self.device,
             &self.queue,
             &mut self.uniform_buf,
             &uniforms,
             wgpu::BufferUsages::UNIFORM,
+            self.buffer_reuse,
         );
         let ubind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("uniforms"),
@@ -888,65 +827,7 @@ impl Renderer {
         self.stats.upload_us += t1.elapsed().as_micros() as u64;
 
         // Prepare pipelines and texture bindings before recording passes.
-        let mut prepared = Vec::with_capacity(draws.len());
-        for d in &draws {
-            let mut key = pipe_key(&d.state);
-            // Two textures blended (a stretched base under a fine detail
-            // layer, as the games' floors are) only look right filtered as
-            // the console does: kept crisp, the base shows as hard blocks.
-            key.shader.sharp = self.sharp
-                && !crate::combiner::Combiner::from_raw(d.state.combine)
-                    .reads_texel1(key.shader.two_cycle);
-            self.pipeline(key);
-            let linear = (d.state.other_h >> 20) & 3 != 2
-                && (d.state.other_h >> 12) & 3 != 0
-                && (self.sharp || !d.state.texel_exact);
-            let mut entries = Vec::new();
-            let mut bkey: BindKey = ([None; 2], linear);
-            let mut keyed = true;
-            for (k, slot) in d.state.textures.iter().enumerate() {
-                let (view, wrap) = match slot.and_then(|i| Some((views.get(i as usize)?, i))) {
-                    Some(((content, v), i)) => {
-                        let wrap = frame.textures[i as usize].wrap;
-                        bkey.0[k] = content.map(|c| (c, wrap));
-                        keyed &= content.is_some();
-                        (v.clone(), wrap)
-                    }
-                    None => (self.white.clone(), [Wrap::Repeat; 2]),
-                };
-                entries.push((view, self.sampler(wrap, linear), k as u32 * 2));
-            }
-            if let Some(bind) = self.bindings.get(&bkey).filter(|_| keyed) {
-                prepared.push((key, bind.clone()));
-                continue;
-            }
-            let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("textures"),
-                layout: &self.texture_layout,
-                entries: &entries
-                    .iter()
-                    .flat_map(|(v, s, b)| {
-                        [
-                            wgpu::BindGroupEntry {
-                                binding: *b,
-                                resource: wgpu::BindingResource::TextureView(v),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: b + 1,
-                                resource: wgpu::BindingResource::Sampler(s),
-                            },
-                        ]
-                    })
-                    .collect::<Vec<_>>(),
-            });
-            if keyed {
-                if self.bindings.len() >= UPLOADED_MAX {
-                    self.bindings.clear();
-                }
-                self.bindings.insert(bkey, bind.clone());
-            }
-            prepared.push((key, bind));
-        }
+        let prepared = self.prepare(frame, &draws, &views);
 
         let mut encoder = self.device.create_command_encoder(&Default::default());
         let mut first_pass = true;
@@ -1024,6 +905,76 @@ impl Renderer {
         (target, encoder)
     }
 
+    /// The pipeline (made if new) and texture binding of each of `draws`,
+    /// with `views` the frame's uploaded textures.
+    fn prepare(
+        &mut self,
+        frame: &Frame,
+        draws: &[&crate::Draw],
+        views: &[(Option<u64>, wgpu::TextureView)],
+    ) -> Vec<(PipeKey, wgpu::BindGroup)> {
+        let mut prepared = Vec::with_capacity(draws.len());
+        for d in draws {
+            let mut key = pipe_key(&d.state);
+            // Two textures blended (a stretched base under a fine detail
+            // layer, as the games' floors are) only look right filtered as
+            // the console does: kept crisp, the base shows as hard blocks.
+            key.shader.sharp = self.sharp
+                && !crate::combiner::Combiner::from_raw(d.state.combine)
+                    .reads_texel1(key.shader.two_cycle);
+            self.pipeline(key);
+            let linear = cycle_type(d.state.other_h) != G_CYC_COPY
+                && (d.state.other_h >> G_MDSFT_TEXTFILT) & 3 != 0
+                && (self.sharp || !d.state.texel_exact);
+            let mut entries = Vec::new();
+            let mut bkey: BindKey = ([None; 2], linear);
+            let mut keyed = true;
+            for (k, slot) in d.state.textures.iter().enumerate() {
+                let (view, wrap) = match slot.and_then(|i| Some((views.get(i as usize)?, i))) {
+                    Some(((content, v), i)) => {
+                        let wrap = frame.textures[i as usize].wrap;
+                        bkey.0[k] = content.map(|c| (c, wrap));
+                        keyed &= content.is_some();
+                        (v.clone(), wrap)
+                    }
+                    None => (self.white.clone(), [Wrap::Repeat; 2]),
+                };
+                entries.push((view, self.sampler(wrap, linear), k as u32 * 2));
+            }
+            if let Some(bind) = self.bindings.get(&bkey).filter(|_| keyed) {
+                prepared.push((key, bind.clone()));
+                continue;
+            }
+            let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("textures"),
+                layout: &self.texture_layout,
+                entries: &entries
+                    .iter()
+                    .flat_map(|(v, s, b)| {
+                        [
+                            wgpu::BindGroupEntry {
+                                binding: *b,
+                                resource: wgpu::BindingResource::TextureView(v),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: b + 1,
+                                resource: wgpu::BindingResource::Sampler(s),
+                            },
+                        ]
+                    })
+                    .collect::<Vec<_>>(),
+            });
+            if keyed {
+                if self.bindings.len() >= BINDINGS_MAX {
+                    self.bindings.clear();
+                }
+                self.bindings.insert(bkey, bind.clone());
+            }
+            prepared.push((key, bind));
+        }
+        prepared
+    }
+
     /// A view of each of `textures`, uploading only those not kept from
     /// an earlier picture.
     /// With the cache on, each view comes with its content key.
@@ -1072,23 +1023,20 @@ impl Renderer {
 }
 
 /// `data` written into the buffer kept in `slot`, made anew (at the next
-/// power of two) only when it has grown too small. Safe because every
-/// picture is submitted before the next one writes the buffer again.
+/// power of two) only when it has grown too small or `reuse` is off. Safe
+/// because every picture is submitted before the next one writes the
+/// buffer again.
 fn kept_buffer(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     slot: &mut Option<wgpu::Buffer>,
     data: &[u8],
     usage: wgpu::BufferUsages,
+    reuse: bool,
 ) -> wgpu::Buffer {
     let size = (data.len() as u64).max(64).next_multiple_of(4);
     let buf = match slot.take() {
-        Some(b)
-            if b.size() >= size
-                && std::env::var_os("N64RUSTY_BUFFER_REUSE").is_none_or(|v| v != "off") =>
-        {
-            b
-        }
+        Some(b) if b.size() >= size && reuse => b,
         _ => device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
             size: size.next_power_of_two(),
@@ -1104,7 +1052,7 @@ fn kept_buffer(
 /// Whether pixels `x0..x1` span a frame `fw` wide, give or take the border
 /// games often leave (a scissor of 10 to 310 in a 320-wide frame).
 fn spans_width(x0: f32, x1: f32, fw: f32) -> bool {
-    x0 <= fw * 0.1 && x1 >= fw * 0.9
+    x0 <= fw * SPAN_START && x1 >= fw * SPAN_END
 }
 
 /// The scissor box scaled from framebuffer pixels to the target, clamped to
@@ -1163,7 +1111,8 @@ fn upload(
             depth_or_array_layers: 1,
         })
     });
-    let (mut w, mut h, mut level) = (width, height, rgba.to_vec());
+    let (mut w, mut h) = (width, height);
+    let mut level = std::borrow::Cow::Borrowed(rgba);
     for mip in 0..levels {
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
@@ -1182,7 +1131,8 @@ fn upload(
                 depth_or_array_layers: 1,
             },
         );
-        (level, w, h) = half(&level, w, h);
+        let (next, nw, nh) = half(&level, w, h);
+        (level, w, h) = (next.into(), nw, nh);
     }
     tex.create_view(&Default::default())
 }
@@ -1231,6 +1181,180 @@ fn clip_matrices(frame: &Frame, transforms: &[crate::Transform]) -> Vec<crate::M
         .collect()
 }
 
+/// Per vertex, the pixel span (x0, x1) a background rectangle stretches
+/// across in widescreen: rectangles spanning the whole frame (backgrounds)
+/// stretch from edge to edge of the target, over the border the game left.
+/// A background may also be a row of tiles: rectangles on the same lines,
+/// edge to edge, that together span the frame.
+fn stretched_backgrounds(frame: &Frame, wide: f32) -> Vec<Option<(f32, f32)>> {
+    let mut stretch = vec![None; frame.vertices.len()];
+    let mut rows = HashMap::<(i32, i32), Vec<_>>::new();
+    // Neighbouring rectangles with one state share a draw: look at each
+    // one (two triangles, six vertices) on its own.
+    let quads = frame
+        .draws()
+        // A pre-rendered picture has 3D drawn into it (a room around a
+        // character): stretched, the two would part. It keeps its shape.
+        .filter(|d| d.state.rect && !d.state.picture && wide > 1.0)
+        .flat_map(|d| {
+            let end = (d.first + d.count) as usize;
+            (d.first as usize..end)
+                .step_by(6)
+                .map(move |q| q..(q + 6).min(end))
+        });
+    for range in quads {
+        let bound = |k: usize, f: fn(f32, f32) -> f32, start: f32| {
+            frame.vertices[range.clone()]
+                .iter()
+                .map(|v| v.pos[k])
+                .fold(start, f)
+        };
+        let (x0, x1) = (bound(0, f32::min, f32::MAX), bound(0, f32::max, f32::MIN));
+        let (y0, y1) = (bound(1, f32::min, f32::MAX), bound(1, f32::max, f32::MIN));
+        let row = (y0.round() as i32, y1.round() as i32);
+        rows.entry(row).or_default().push((x0, x1, range));
+    }
+    for mut row in rows.into_values() {
+        row.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let edge_to_edge = row.windows(2).all(|w| w[1].0 <= w[0].1 + 1.0);
+        let x0 = row[0].0;
+        let x1 = row.iter().map(|r| r.1).fold(f32::MIN, f32::max);
+        // Stricter than one rectangle: a menu grid (portraits from 25 to
+        // 295 of 320) must keep its place under its cursor.
+        let fw = frame.width as f32;
+        if edge_to_edge && x0 <= fw * BG_ROW_START && x1 >= fw * BG_ROW_END {
+            for (_, _, range) in row {
+                stretch[range].fill(Some((x0, x1)));
+            }
+        }
+    }
+    stretch
+}
+
+/// Per vertex, whether it is part of a backdrop or overlay that widescreen
+/// stretches like a background; `at` gives a vertex's clip position.
+fn backdrops(frame: &Frame, wide: f32, at: impl Fn(&crate::Vertex) -> [f32; 4]) -> Vec<bool> {
+    // A backdrop drawn first (a sky made for the original view's width)
+    // ends at the 4:3 edges: stretch it like a background. It is the
+    // leading run of 3D draws, after nothing but fills, that each cover
+    // nine tenths of the width.
+    let mut backdrop = vec![false; frame.vertices.len()];
+    let mut started = false;
+    if wide > 1.0 {
+        for d in frame
+            .draws()
+            .filter(|d| d.state.color_image == frame.color_image)
+        {
+            // Fills (a clear) come before a backdrop; any other
+            // rectangle (a background picture) is the backdrop itself,
+            // and 3D after it is the scene.
+            if d.state.rect {
+                let fill =
+                    cycle_type(d.state.other_h) == G_CYC_FILL && d.state.textures[0].is_none();
+                // Only before the backdrop starts: a fill after it is
+                // part of the scene.
+                if fill && !started {
+                    continue;
+                }
+                break;
+            }
+            started = true;
+            let range = vertex_range(d);
+            let (mut x0, mut x1) = (1.0f32, -1.0f32);
+            for v in &frame.vertices[range.clone()] {
+                let p = at(v);
+                if p[3] > 0.0 {
+                    x0 = x0.min(p[0] / p[3]);
+                    x1 = x1.max(p[0] / p[3]);
+                }
+            }
+            if x1.min(1.0) - x0.max(-1.0) < BACKDROP_MIN_SPAN {
+                break;
+            }
+            backdrop[range].fill(true);
+        }
+    }
+    // A flat overlay facing the camera and covering the whole view (a
+    // fade or a flash drawn as triangles) covers the wide view too.
+    if wide > 1.0 {
+        for d in frame
+            .draws()
+            .filter(|d| !d.state.rect && d.state.color_image == frame.color_image)
+        {
+            let range = vertex_range(d);
+            let ps: Vec<_> = frame.vertices[range.clone()].iter().map(&at).collect();
+            let Some(w) = ps.first().map(|p| p[3]) else {
+                continue;
+            };
+            let flat = w > 0.0 && ps.iter().all(|p| (p[3] - w).abs() <= w * OVERLAY_FLAT_W);
+            let ext = |k: usize, f: fn(f32, f32) -> f32, s: f32| {
+                ps.iter().map(|p| p[k] / p[3]).fold(s, f)
+            };
+            let covers = |k| {
+                ext(k, f32::min, f32::MAX) <= -OVERLAY_EDGE
+                    && ext(k, f32::max, f32::MIN) >= OVERLAY_EDGE
+            };
+            if flat && covers(0) && covers(1) {
+                backdrop[range].fill(true);
+            }
+        }
+    }
+    backdrop
+}
+
+/// Per vertex, the fog multiplier and offset when fog is on: the vertex's
+/// shade alpha becomes its fog factor, from its depth, as the microcode
+/// computes it.
+fn fog_factors(frame: &Frame) -> Vec<Option<[f32; 2]>> {
+    let mut fog = vec![None; frame.vertices.len()];
+    for d in frame.draws().filter(|d| !d.state.rect && d.state.geometry & G_FOG != 0) {
+        fog[vertex_range(d)].fill(Some(d.state.fog_factor));
+    }
+    fog
+}
+
+/// The uniforms of each of `draws`, one [`UNIFORM_STRIDE`] apart.
+fn draw_uniforms(draws: &[&crate::Draw]) -> Vec<u8> {
+    let mut uniforms = vec![0u8; (draws.len().max(1) as u64 * UNIFORM_STRIDE) as usize];
+    for (i, d) in draws.iter().enumerate() {
+        let s = &d.state;
+        let misc = [s.prim_lod, s.k5, 0.0, 0.0];
+        let vals: Vec<f32> = [s.prim, s.env, s.blend, misc, s.fog].concat();
+        let at = i * UNIFORM_STRIDE as usize;
+        uniforms[at..at + UNIFORM_SIZE as usize].copy_from_slice(&floats(&vals));
+    }
+    uniforms
+}
+
+/// The vertices of `d` in [`Frame::vertices`].
+fn vertex_range(d: &crate::Draw) -> std::ops::Range<usize> {
+    d.first as usize..(d.first + d.count) as usize
+}
+
+/// A texture binding's layout entry, at `binding`.
+fn texture_layout_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+/// A filtering sampler's layout entry, at `binding`.
+fn sampler_layout_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+        count: None,
+    }
+}
+
 /// Clip-space x shift of each vertex for the frame's HUD areas (see
 /// [`Frame::hud`]): `side * (1 - 1 / wide)` for the triangles moved.
 ///
@@ -1268,7 +1392,7 @@ fn hud_shift(
                 };
                 if m[0][3] != 0.0 || m[1][3] != 0.0 || m[2][3] != 0.0 {
                     let ([sx, sy], [tx, ty]) = (t.viewport.scale, t.viewport.trans);
-                    if sx.abs() * 2.0 >= fw * 0.5 {
+                    if sx.abs() * 2.0 >= fw * HUD_3D_VIEWPORT {
                         continue 'tri; // the 3D scene
                     }
                     let vb = [tx - sx.abs(), ty - sy.abs(), tx + sx.abs(), ty + sy.abs()];
@@ -1297,7 +1421,7 @@ fn hud_shift(
     let panels: Vec<[f32; 4]> = tris
         .iter()
         .map(|t| t.1)
-        .filter(|b| b[2] - b[0] >= 100.0 && b[2] - b[0] < fw * 0.9)
+        .filter(|b| b[2] - b[0] >= PANEL_MIN_PX && b[2] - b[0] < fw * PANEL_MAX_WIDTH)
         .filter(|b| !frame.hud.iter().any(|r| within(b, &area(r))))
         .collect();
     for (range, b) in tris {
@@ -1358,24 +1482,7 @@ impl Blit {
     fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Blit {
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("blit"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
+            entries: &[texture_layout_entry(0), sampler_layout_entry(1)],
         });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("blit"),
