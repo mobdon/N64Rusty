@@ -901,3 +901,325 @@ mod interpret_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod tlb_tests {
+    use super::{Ctx, Memory};
+
+    // COP0 register numbers (VR4300 manual, chapter 5).
+    const INDEX: usize = 0;
+    const ENTRY_LO0: usize = 2;
+    const ENTRY_LO1: usize = 3;
+    const CONTEXT: usize = 4;
+    const PAGE_MASK: usize = 5;
+    const WIRED: usize = 6;
+    const BAD_VADDR: usize = 8;
+    const ENTRY_HI: usize = 10;
+
+    // COP0 function codes of the TLB instructions.
+    const TLBR: u32 = 1;
+    const TLBWI: u32 = 2;
+    const TLBWR: u32 = 6;
+    const TLBP: u32 = 8;
+
+    /// Index bit 31: set by TLBP when no entry matches.
+    const PROBE_FAILED: u32 = 0x8000_0000;
+    // EntryLo bits: Global (0), Valid (1), Dirty (2); the frame starts at bit 6.
+    const GLOBAL: u32 = 1;
+    const VALID: u32 = 2;
+    const DIRTY: u32 = 4;
+    // PageMask for 4 KiB, 16 KiB and 1 MiB pages.
+    const MASK_4K: u32 = 0;
+    const MASK_16K: u32 = 0x0000_6000;
+    const MASK_1M: u32 = 0x001F_E000;
+
+    const RAM: usize = 0x1_0000;
+    const REFILL: u32 = 0x8000_0100;
+
+    /// EntryLo for the 4 KiB physical frame `frame`.
+    fn lo(frame: u32, flags: u32) -> u32 {
+        frame << 6 | flags
+    }
+
+    fn ctx() -> Ctx {
+        Ctx::new(Memory::new(RAM))
+    }
+
+    /// Loads the TLB registers with one entry, as a game does before a write.
+    fn load(c: &mut Ctx, mask: u32, hi: u32, lo0: u32, lo1: u32) {
+        (c.cop0[PAGE_MASK], c.cop0[ENTRY_HI]) = (mask, hi);
+        (c.cop0[ENTRY_LO0], c.cop0[ENTRY_LO1]) = (lo0, lo1);
+    }
+
+    /// TLBWI of one entry at `index`.
+    fn write(c: &mut Ctx, index: u32, mask: u32, hi: u32, lo0: u32, lo1: u32) {
+        load(c, mask, hi, lo0, lo1);
+        c.cop0[INDEX] = index;
+        c.tlb(TLBWI);
+    }
+
+    /// TLBP for `hi`, giving Index.
+    fn probe(c: &mut Ctx, hi: u32) -> u32 {
+        c.cop0[ENTRY_HI] = hi;
+        c.tlb(TLBP);
+        c.cop0[INDEX]
+    }
+
+    fn missed(index: u32) -> bool {
+        index & PROBE_FAILED != 0
+    }
+
+    /// TLBWR of an entry told apart by its EntryHi, giving the slot written.
+    fn write_random(c: &mut Ctx, hi: u32) -> usize {
+        load(c, MASK_4K, hi, 0, 0);
+        c.tlb(TLBWR);
+        c.tlb.iter().position(|e| e[1] == hi).unwrap()
+    }
+
+    /// EntryHi values for `n` distinct page pairs.
+    fn distinct_his(n: u32) -> impl Iterator<Item = u32> {
+        (0..n).map(|k| 0x0100_0000 + k * 0x2000)
+    }
+
+    #[test]
+    fn tlbr_reads_back_the_entry_tlbwi_wrote() {
+        let mut c = ctx();
+        let lo0 = lo(0x12, VALID | DIRTY | GLOBAL);
+        let lo1 = lo(0x34, VALID | GLOBAL);
+        write(&mut c, 5, MASK_16K, 0x0040_0000 | 0x2A, lo0, lo1);
+        load(&mut c, 0, 0, 0, 0);
+        c.cop0[INDEX] = 5;
+        c.tlb(TLBR);
+        assert_eq!(c.cop0[PAGE_MASK], MASK_16K);
+        assert_eq!(c.cop0[ENTRY_HI], 0x0040_002A);
+        assert_eq!(c.cop0[ENTRY_LO0], lo0);
+        assert_eq!(c.cop0[ENTRY_LO1], lo1);
+    }
+
+    #[test]
+    #[ignore = "bug: TLBR returns each EntryLo's own G bit, not the entry's single G (Lo0.G AND Lo1.G)"]
+    fn tlbr_gives_both_entrylo_the_entrys_one_global_bit() {
+        // VR4300 manual, TLBR: the entry's G bit is written into both
+        // EntryLo0 and EntryLo1; TLBWI stores G as Lo0.G AND Lo1.G.
+        let mut c = ctx();
+        write(
+            &mut c,
+            0,
+            MASK_4K,
+            0x0040_0000,
+            lo(1, VALID | GLOBAL),
+            lo(2, VALID),
+        );
+        c.tlb(TLBR);
+        assert_eq!(c.cop0[ENTRY_LO0] & GLOBAL, 0);
+        assert_eq!(c.cop0[ENTRY_LO1] & GLOBAL, 0);
+    }
+
+    #[test]
+    fn tlbwi_writes_only_the_slot_index_names() {
+        let mut c = ctx();
+        write(&mut c, 7, MASK_4K, 0x0040_0000, lo(1, VALID), lo(2, VALID));
+        for (k, e) in c.tlb.iter().enumerate() {
+            let want = if k == 7 {
+                [MASK_4K, 0x0040_0000, lo(1, VALID), lo(2, VALID)]
+            } else {
+                [0; 4]
+            };
+            assert_eq!(*e, want, "slot {k}");
+        }
+    }
+
+    // The two TLBWR tests pin this emulator's model, where Random drops by 1
+    // per TLBWR. On hardware it drops every instruction, and only the range
+    // [Wired, 31] is guaranteed.
+    #[test]
+    fn tlbwr_counts_random_down_from_31_to_wired_then_wraps() {
+        let mut c = ctx();
+        c.cop0[WIRED] = 28;
+        let slots: Vec<usize> = distinct_his(6).map(|hi| write_random(&mut c, hi)).collect();
+        assert_eq!(slots, [31, 30, 29, 28, 31, 30]);
+    }
+
+    #[test]
+    fn tlbwr_with_no_wired_entries_reaches_slot_0_before_wrapping() {
+        let mut c = ctx();
+        let slots: Vec<usize> = distinct_his(33)
+            .map(|hi| write_random(&mut c, hi))
+            .collect();
+        let want: Vec<usize> = (0..32).rev().chain([31]).collect();
+        assert_eq!(slots, want);
+    }
+
+    #[test]
+    #[ignore = "bug: writing Wired (MTC0 6) does not reset Random to 31"]
+    fn writing_wired_resets_random_to_31() {
+        // VR4300 manual, Wired register: a write also sets Random to its
+        // upper bound, 31.
+        let mut c = ctx();
+        let mut his = distinct_his(2);
+        assert_eq!(write_random(&mut c, his.next().unwrap()), 31);
+        c.mtc0(WIRED, 0);
+        assert_eq!(write_random(&mut c, his.next().unwrap()), 31);
+    }
+
+    #[test]
+    fn tlbp_finds_an_entry_by_vpn2_and_asid() {
+        let mut c = ctx();
+        write(
+            &mut c,
+            9,
+            MASK_4K,
+            0x0040_0000 | 5,
+            lo(1, VALID),
+            lo(2, VALID),
+        );
+        assert_eq!(probe(&mut c, 0x0040_0000 | 5), 9);
+        // VPN2 names a pair of pages: the odd page matches the same entry.
+        assert_eq!(probe(&mut c, 0x0040_1000 | 5), 9);
+        assert!(missed(probe(&mut c, 0x0040_0000 | 6)), "other ASID");
+        assert!(missed(probe(&mut c, 0x0040_2000 | 5)), "next VPN2");
+    }
+
+    #[test]
+    fn tlbp_matches_a_global_entry_under_any_asid() {
+        let mut c = ctx();
+        let (lo0, lo1) = (lo(1, VALID | GLOBAL), lo(2, GLOBAL));
+        write(&mut c, 3, MASK_4K, 0x0040_0000 | 5, lo0, lo1);
+        assert_eq!(probe(&mut c, 0x0040_0000 | 0x77), 3);
+    }
+
+    #[test]
+    fn tlbp_needs_both_global_bits_for_a_global_match() {
+        // The entry's G is Lo0.G AND Lo1.G (VR4300 manual, TLBWI).
+        let mut c = ctx();
+        write(
+            &mut c,
+            3,
+            MASK_4K,
+            0x0040_0000 | 5,
+            lo(1, VALID | GLOBAL),
+            lo(2, VALID),
+        );
+        assert!(missed(probe(&mut c, 0x0040_0000 | 0x77)));
+    }
+
+    #[test]
+    fn tlbp_compares_vpn2_only_above_the_page_mask() {
+        let mut c = ctx();
+        // 1 MiB pages: one entry spans 2 MiB from 0x0020_0000.
+        let g = lo(0, VALID | GLOBAL);
+        write(&mut c, 4, MASK_1M, 0x0020_0000, g, g);
+        assert_eq!(probe(&mut c, 0x0020_0000), 4);
+        assert_eq!(probe(&mut c, 0x003F_E000), 4);
+        assert!(missed(probe(&mut c, 0x0040_0000)));
+        assert!(missed(probe(&mut c, 0x001F_E000)));
+    }
+
+    #[test]
+    fn tlbp_clears_the_probe_bit_on_a_hit_after_a_miss() {
+        let mut c = ctx();
+        let g = lo(1, VALID | GLOBAL);
+        write(&mut c, 2, MASK_4K, 0x0040_0000, g, g);
+        assert!(missed(probe(&mut c, 0x0080_0000)));
+        assert_eq!(probe(&mut c, 0x0040_0000), 2);
+    }
+
+    #[test]
+    fn mapped_addresses_go_through_the_even_or_odd_page() {
+        let mut c = ctx();
+        write(&mut c, 0, MASK_4K, 0x0040_0000, lo(1, VALID), lo(3, VALID));
+        assert_eq!(c.mem.kseg0(0x0040_0010), 0x8000_1010);
+        assert_eq!(c.mem.kseg0(0x0040_1020), 0x8000_3020);
+        c.mem.write_u32(0x0040_1020, 0x1234_5678);
+        assert_eq!(c.mem.read_u32(0x8000_3020), 0x1234_5678);
+    }
+
+    #[test]
+    fn mapped_16k_pages_split_at_the_page_size() {
+        let mut c = ctx();
+        write(&mut c, 0, MASK_16K, 0x0080_0000, lo(4, VALID), lo(8, VALID));
+        assert_eq!(c.mem.kseg0(0x0080_3FFC), 0x8000_7FFC);
+        assert_eq!(c.mem.kseg0(0x0080_4000), 0x8000_8000);
+    }
+
+    #[test]
+    fn a_page_without_the_valid_bit_is_not_mapped() {
+        let mut c = ctx();
+        c.tlb_refill = REFILL;
+        write(&mut c, 0, MASK_4K, 0x0040_0000, lo(1, DIRTY), lo(3, VALID));
+        assert!(c.unmapped(0x0040_0000), "even page is not valid");
+        assert!(!c.unmapped(0x0040_1000), "odd page is valid");
+    }
+
+    /// A refill routine: maps EntryHi's page pair to frames 5 and 6, and
+    /// clobbers a register its exception handler saves.
+    fn refill(c: &mut Ctx) {
+        c.r[2] = 0xBAD;
+        let hi = c.cop0[ENTRY_HI];
+        load(c, MASK_4K, hi, lo(5, VALID | GLOBAL), lo(6, VALID | GLOBAL));
+        c.tlb(TLBWR);
+    }
+
+    fn refill_nothing(_: &mut Ctx) {}
+
+    fn ctx_with_refill(f: super::GuestFn) -> Ctx {
+        let mut c = ctx();
+        c.register(REFILL, f);
+        c.tlb_refill = REFILL;
+        c
+    }
+
+    #[test]
+    fn tlb_miss_sets_badvaddr_context_and_entryhi_then_runs_the_refill() {
+        const VADDR: u32 = 0x1234_5678;
+        const PTE_BASE: u32 = 0xFF80_0000;
+        const ASID: u32 = 0x2A;
+        let mut c = ctx_with_refill(refill);
+        c.cop0[CONTEXT] = PTE_BASE | 0x7F_FFF0;
+        c.cop0[ENTRY_HI] = 0x0000_2000 | ASID;
+        c.r[2] = 1;
+        assert!(c.tlb_miss(VADDR));
+        assert_eq!(c.cop0[BAD_VADDR], VADDR);
+        // Context: PTEBase kept, BadVPN2 (vaddr bits 31..13) at bits 22..4.
+        assert_eq!(c.cop0[CONTEXT], PTE_BASE | (VADDR >> 13) << 4);
+        // EntryHi: VPN2 of the address, the ASID kept.
+        assert_eq!(c.cop0[ENTRY_HI], 0x1234_4000 | ASID);
+        assert_eq!(c.mem.kseg0(VADDR), 0x8000_6678, "odd page of the pair");
+        assert_eq!(c.r[2], 1, "registers are as before the exception");
+    }
+
+    #[test]
+    fn tlb_miss_reports_a_refill_that_maps_nothing() {
+        let mut c = ctx_with_refill(refill_nothing);
+        assert!(!c.tlb_miss(0x0040_0000));
+        assert_eq!(c.calls, 1, "the refill ran");
+    }
+
+    #[test]
+    fn tlb_miss_runs_no_refill_for_kseg_or_mapped_addresses() {
+        let mut c = ctx_with_refill(refill);
+        write(&mut c, 0, MASK_4K, 0x0040_0000, lo(1, VALID), lo(2, VALID));
+        for vaddr in [0x8000_0000, 0xBFFF_FFFC, 0x0040_0000, 0x0040_1FFC] {
+            assert!(!c.tlb_miss(vaddr), "{vaddr:#x}");
+        }
+        assert_eq!(c.calls, 0);
+        assert_eq!(c.cop0[BAD_VADDR], 0);
+    }
+
+    #[test]
+    fn tlb_miss_runs_the_refill_for_kseg2_and_the_top_of_kuseg() {
+        // KSEG2 and KUSEG go through the TLB, so a miss there runs the refill.
+        for vaddr in [0xC000_0000, 0xFFFF_FFFC, 0x7FFF_F000] {
+            let mut c = ctx_with_refill(refill);
+            assert!(c.tlb_miss(vaddr), "{vaddr:#x}");
+            assert_eq!((c.calls, c.cop0[BAD_VADDR]), (1, vaddr), "{vaddr:#x}");
+        }
+    }
+
+    #[test]
+    fn tlb_miss_does_nothing_without_a_refill_routine() {
+        let mut c = ctx();
+        assert!(!c.tlb_miss(0x0040_0000));
+        assert_eq!((c.calls, c.cop0[BAD_VADDR]), (0, 0));
+    }
+}

@@ -476,3 +476,100 @@ pub fn function(f: &Function) -> Result<String, TranslateError> {
     e.line(0, "}");
     Ok(e.out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{block_starts, function};
+    use crate::Function;
+
+    const BASE: u32 = 0x8000_1000;
+    const NOP: u32 = 0;
+    const JR_RA: u32 = 0x03E0_0008;
+
+    /// `beq $0, $0` at `pc` to `target` (always taken).
+    fn b(pc: u32, target: u32) -> u32 {
+        let off = (target.wrapping_sub(pc + 4) as i32) >> 2;
+        0x1000_0000 | (off as u32 & 0xFFFF)
+    }
+
+    /// `bne $a0, $0` at `pc` to `target` (taken only when $a0 is not zero).
+    fn bnez_a0(pc: u32, target: u32) -> u32 {
+        let off = (target.wrapping_sub(pc + 4) as i32) >> 2;
+        0x1480_0000 | (off as u32 & 0xFFFF)
+    }
+
+    /// `j target`.
+    fn j(target: u32) -> u32 {
+        0x0800_0000 | (target >> 2 & 0x03FF_FFFF)
+    }
+
+    fn end(f: &Function) -> u32 {
+        f.addr + 4 * f.words.len() as u32
+    }
+
+    fn starts(f: &Function) -> Vec<u32> {
+        block_starts(f, end(f)).into_iter().collect()
+    }
+
+    #[test]
+    fn a_jump_out_of_the_function_starts_no_block_there() {
+        const OUTSIDE: u32 = 0x8000_2000;
+        let f = Function::new(BASE, vec![j(OUTSIDE), NOP, JR_RA, NOP]);
+        assert_eq!(starts(&f), [BASE, BASE + 8]);
+        let src = function(&f).unwrap();
+        assert!(src.contains("ctx.call(0x80002000); return;"), "{src}");
+    }
+
+    #[test]
+    fn a_branch_out_of_the_function_starts_no_block_there() {
+        // A branch back to just before the entry, and one to the first word
+        // past the end.
+        let f = Function::new(
+            BASE,
+            vec![
+                b(BASE, BASE - 4),
+                NOP,
+                b(BASE + 8, BASE + 0x18),
+                NOP,
+                JR_RA,
+                NOP,
+            ],
+        );
+        assert_eq!(starts(&f), [BASE, BASE + 8, BASE + 0x10]);
+    }
+
+    #[test]
+    fn analysis_targets_outside_or_unaligned_start_no_block() {
+        let mut f = Function::new(BASE, vec![NOP, NOP, JR_RA, NOP]);
+        let past_end = end(&f);
+        f.jump_targets = vec![BASE - 4, past_end, BASE + 6, BASE + 4];
+        assert_eq!(starts(&f), [BASE, BASE + 4]);
+    }
+
+    #[test]
+    fn a_branch_whose_delay_slot_is_the_last_word_falls_through_by_a_call() {
+        // nop ; bne $a0, $0, BASE ; nop (delay slot, last word)
+        let f = Function::new(BASE, vec![NOP, bnez_a0(BASE + 4, BASE), NOP]);
+        assert_eq!(starts(&f), [BASE], "no block starts past the end");
+        let src = function(&f).unwrap();
+        // Not taken, control goes on in whatever follows the function.
+        assert!(src.contains("ctx.call(0x8000100c); return;"), "{src}");
+    }
+
+    #[test]
+    fn a_branch_in_the_last_word_is_refused_for_its_missing_delay_slot() {
+        let f = Function::new(BASE, vec![NOP, b(BASE + 4, BASE)]);
+        assert_eq!(starts(&f), [BASE]);
+        let e = function(&f).unwrap_err();
+        assert_eq!(e.addr, BASE + 8);
+        assert_eq!(e.msg, "delay slot is past the function end");
+    }
+
+    #[test]
+    fn a_jump_in_the_last_word_is_refused_for_its_missing_delay_slot() {
+        let f = Function::new(BASE, vec![NOP, j(BASE)]);
+        let e = function(&f).unwrap_err();
+        assert_eq!(e.addr, BASE + 8);
+        assert_eq!(e.msg, "delay slot is past the function end");
+    }
+}

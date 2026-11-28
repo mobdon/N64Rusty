@@ -743,4 +743,105 @@ mod tests {
     fn misaligned_word_panics() {
         ram().read_u32(0x8000_0002);
     }
+
+    /// Flash command words: chip erase select, erase start, status mode,
+    /// sector erase select (page in the low bits).
+    const FLASH_CHIP_ERASE: u32 = 0x3C00_0000;
+    const FLASH_ERASE_START: u32 = 0x7800_0000;
+    const FLASH_STATUS_MODE: u32 = 0xD200_0000;
+    const FLASH_SECTOR_ERASE: u32 = 0x4B00_0000;
+    /// Status byte once an erase is done (what libultra osFlashAllErase checks).
+    const FLASH_ERASE_DONE: u8 = 0x08;
+
+    fn io() -> Io {
+        rom_io(vec![])
+    }
+
+    #[test]
+    fn flash_chip_erase_clears_the_whole_chip() {
+        // libultra osFlashAllErase: chip erase, erase start, then poll status.
+        let mut m = ram();
+        m.set_io(io());
+        m.write_u32(0xA801_0000, FLASH_CHIP_ERASE);
+        m.write_u32(0xA801_0000, FLASH_ERASE_START);
+        m.write_u32(0xA801_0000, FLASH_STATUS_MODE);
+        assert_eq!(
+            m.read_u32(0xA800_0000),
+            0x1111_8000 | u32::from(FLASH_ERASE_DONE)
+        );
+        let f = &m.io_mut().unwrap().flash;
+        assert_eq!(
+            f.ops,
+            [FlashOp::Erase {
+                offset: 0,
+                len: Flash::SIZE
+            }]
+        );
+    }
+
+    #[test]
+    fn flash_chip_erase_replaces_an_earlier_sector_erase_select() {
+        let mut f = Flash::default();
+        f.command(FLASH_SECTOR_ERASE | 0x80);
+        f.command(FLASH_CHIP_ERASE);
+        f.command(FLASH_ERASE_START);
+        assert_eq!(f.status, FLASH_ERASE_DONE);
+        assert_eq!(
+            f.ops,
+            [FlashOp::Erase {
+                offset: 0,
+                len: Flash::SIZE
+            }]
+        );
+    }
+
+    #[test]
+    fn flash_chip_erase_ignores_the_page_bits() {
+        let mut f = Flash::default();
+        f.command(FLASH_CHIP_ERASE | 0xFFFF);
+        f.command(FLASH_ERASE_START);
+        assert_eq!(
+            f.ops,
+            [FlashOp::Erase {
+                offset: 0,
+                len: Flash::SIZE
+            }]
+        );
+    }
+
+    /// SP_STATUS through KSEG1, and its HALT bit (RCP manual / libultra rcp.h).
+    const SP_STATUS: u32 = 0xA404_0010;
+    const SP_STATUS_HALT: u32 = 0x1;
+    /// Written to SP_STATUS: clear HALT and BROKE, as osSpTaskStartGo does.
+    const SP_CLR_HALT_AND_BROKE: u32 = 0x1 | 0x4;
+
+    #[test]
+    fn sp_status_reads_halt_before_any_task() {
+        let mut m = ram();
+        m.set_io(io());
+        assert_ne!(m.read_u32(SP_STATUS) & SP_STATUS_HALT, 0);
+    }
+
+    #[test]
+    fn sp_status_reads_halt_again_once_a_started_task_is_done() {
+        // Tasks finish at once here, so the RSP is halted between tasks; the
+        // word the game wrote is a set/clear command, not the status.
+        let mut m = ram();
+        m.set_io(io());
+        m.write_u32(SP_STATUS, SP_CLR_HALT_AND_BROKE);
+        let status = m.read_u32(SP_STATUS);
+        assert_ne!(status & SP_STATUS_HALT, 0);
+        // Bit 2 of the written word is CLR_BROKE; as a status bit it would be
+        // SSTEP, which nothing set. BROKE itself is not checked: a task that
+        // ends with BREAK sets it on hardware.
+        assert_eq!(status & 0x4, 0, "{status:#x}");
+    }
+
+    #[test]
+    fn sp_status_halt_is_in_the_low_byte() {
+        let mut m = ram();
+        m.set_io(io());
+        assert_ne!(u32::from(m.read_u8(SP_STATUS + 3)) & SP_STATUS_HALT, 0);
+        assert_eq!(m.read_u8(SP_STATUS), 0);
+    }
 }

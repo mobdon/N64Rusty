@@ -281,4 +281,44 @@ mod tests {
             Some(RomError::TooSmall(8))
         );
     }
+
+    /// The fewest bytes a ROM can have: header and boot code, plus one word.
+    const MIN_LEN: usize = BOOT_SEGMENT_ROM + 4;
+
+    #[test]
+    fn rejects_a_length_that_is_not_a_whole_number_of_words() {
+        for extra in 1..4 {
+            let mut v = synthetic();
+            v.resize(v.len() + extra, 0);
+            let len = v.len();
+            assert_eq!(Rom::from_bytes(v).err(), Some(RomError::TooSmall(len)));
+        }
+    }
+
+    #[test]
+    fn rejects_a_byte_swapped_file_of_odd_halfword_count() {
+        // Swapping halfwords still leaves a partial last word.
+        let mut v: Vec<u8> = synthetic().chunks(2).flat_map(|c| [c[1], c[0]]).collect();
+        v.extend([0, 0]);
+        let len = v.len();
+        assert_eq!(Rom::from_bytes(v).err(), Some(RomError::TooSmall(len)));
+    }
+
+    #[test]
+    fn accepts_the_smallest_whole_word_length_and_rejects_one_word_less() {
+        let mut v = synthetic();
+        v.truncate(MIN_LEN);
+        assert!(Rom::from_bytes(v.clone()).is_ok());
+        v.truncate(MIN_LEN - 4);
+        assert_eq!(
+            Rom::from_bytes(v).err(),
+            Some(RomError::TooSmall(MIN_LEN - 4))
+        );
+    }
+
+    #[test]
+    fn length_error_names_the_byte_count() {
+        let msg = RomError::TooSmall(0x2001).to_string();
+        assert!(msg.contains("8193 bytes"), "{msg}");
+    }
 }
