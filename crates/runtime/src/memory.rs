@@ -59,11 +59,27 @@ impl Flash {
     /// Identity read back in id mode: the usual 1 Mbit part.
     pub const ID: [u8; 8] = [0x11, 0x11, 0x80, 0x01, 0x00, 0xC2, 0x00, 0x1E];
 
+    /// Bytes in one page, the unit of a program command.
+    const PAGE_LEN: usize = 128;
+    /// Bytes cleared by a sector erase: 128 pages.
+    const SECTOR_LEN: usize = 128 * Self::PAGE_LEN;
+    /// Bits of a command word that hold the page number.
+    const PAGE_MASK: u32 = 0xFFFF;
+
     fn command(&mut self, w: u32) {
         self.used = true;
-        let page = (w & 0xFFFF) as usize * 128;
+        let page = (w & Self::PAGE_MASK) as usize * Self::PAGE_LEN;
         match w >> 24 {
-            0x4B => self.erase = (page, 128 * 128),
+            0x4B => {
+                self.erase = if page < Self::SIZE {
+                    // The part (and libultra osFlashSectorErase) clears the whole sector holding the page.
+                    (page - page % Self::SECTOR_LEN, Self::SECTOR_LEN)
+                } else {
+                    // Nothing to erase, so the next 0x78 changes no bytes.
+                    flash_past_end("sector erase", page, Self::SECTOR_LEN);
+                    (0, 0)
+                }
+            }
             0x3C => self.erase = (0, Self::SIZE),
             0x78 => {
                 let (offset, len) = self.erase;
@@ -71,7 +87,12 @@ impl Flash {
                 self.status = 0x08;
             }
             0xA5 => {
-                self.ops.push(FlashOp::Program { offset: page });
+                if fits(page, Self::PAGE_LEN) {
+                    self.ops.push(FlashOp::Program { offset: page });
+                } else {
+                    flash_past_end("page program", page, Self::PAGE_LEN);
+                }
+                // Status still reads as done, so a game polling it does not hang.
                 self.status = 0x04;
             }
             m => self.mode = m as u8,
@@ -87,6 +108,21 @@ impl Flash {
         };
         u32::from_be_bytes(w[k % 2 * 4..k % 2 * 4 + 4].try_into().unwrap())
     }
+}
+
+/// Whether `len` bytes from `offset` lie inside the flash chip.
+fn fits(offset: usize, len: usize) -> bool {
+    offset + len <= Flash::SIZE
+}
+
+/// Warns about a flash command whose page lies past the chip; the command
+/// is ignored, since what the real part does with such a page is not known.
+#[cold]
+fn flash_past_end(what: &str, offset: usize, len: usize) {
+    eprintln!(
+        "warning: flash {what} at {offset:#x}+{len:#x} is past the {:#x}-byte chip, ignored",
+        Flash::SIZE
+    );
 }
 
 /// Guest RAM, stored big-endian as on the console.
@@ -245,13 +281,9 @@ impl Memory {
                 0x0460_000C => {
                     let reg = |a: u32| io.regs.get(&a).copied().unwrap_or(0) as usize;
                     let (ram, cart) = (reg(0x0460_0000) & 0xFF_FFFF, reg(0x0460_0004));
-                    let src = (cart & 0x1FFF_FFFF).wrapping_sub(0x1000_0000);
                     let n = (w as usize & 0xFF_FFFF) + 1;
-                    if let (Some(s), Some(d)) =
-                        (io.rom.get(src..src + n), self.bytes.get_mut(ram..ram + n))
-                    {
-                        d.copy_from_slice(s);
-                    }
+                    // Skipped copies already warned inside pi_dma.
+                    pi_dma(&io.rom, &mut self.bytes, cart & 0x1FFF_FFFF, ram, n);
                 }
                 FLASH_COMMAND => io.flash.command(w),
                 // Clearing the status.
@@ -426,6 +458,35 @@ impl Memory {
     }
 }
 
+/// Physical address of the cartridge ROM on the PI bus.
+const CART_ROM: usize = 0x1000_0000;
+
+/// A PI copy of `n` bytes from physical cartridge address `cart` to RAM
+/// offset `ram`. Only the cartridge ROM is modelled, so a copy from another
+/// PI domain or one that runs past the end of ROM or RAM is skipped with a
+/// warning instead of copying part of it. Returns whether the copy was made.
+fn pi_dma(rom: &[u8], bytes: &mut [u8], cart: usize, ram: usize, n: usize) -> bool {
+    let Some(src) = cart.checked_sub(CART_ROM) else {
+        eprintln!("warning: PI copy from {cart:#010x}, below the cartridge ROM, skipped");
+        return false;
+    };
+    match (rom.get(src..src + n), bytes.get_mut(ram..ram + n)) {
+        (Some(s), Some(d)) => {
+            d.copy_from_slice(s);
+            true
+        }
+        _ => {
+            eprintln!(
+                "warning: PI copy of {n:#x} bytes from ROM {src:#x} to RAM {ram:#x} is past the \
+                 end of ROM ({:#x}) or RAM ({:#x}), skipped",
+                rom.len(),
+                bytes.len()
+            );
+            false
+        }
+    }
+}
+
 #[cold]
 #[inline(never)]
 fn misaligned(vaddr: u32, len: usize) -> ! {
@@ -570,6 +631,88 @@ mod tests {
                 FlashOp::Program { offset: 0x4080 }
             ]
         );
+    }
+
+    #[test]
+    fn flash_pages_past_the_chip_are_ignored() {
+        let mut f = Flash::default();
+        // Last whole sector and last page: still inside the chip.
+        f.command(0x4B00_0380);
+        f.command(0x7800_0000);
+        f.command(0xA500_03FF);
+        // A page inside the last sector erases that whole sector.
+        f.command(0x4B00_03FF);
+        f.command(0x7800_0000);
+        // A sector and a page past the end.
+        f.command(0x4B00_0400);
+        f.command(0x7800_0000);
+        f.command(0xA500_FFFF);
+        assert_eq!(f.status, 0x04);
+        assert_eq!(
+            f.ops,
+            [
+                FlashOp::Erase {
+                    offset: 0x1_C000,
+                    len: 0x4000
+                },
+                FlashOp::Program { offset: 0x1_FF80 },
+                FlashOp::Erase {
+                    offset: 0x1_C000,
+                    len: 0x4000
+                },
+                FlashOp::Erase { offset: 0, len: 0 },
+            ]
+        );
+    }
+
+    fn rom_io(rom: Vec<u8>) -> Io {
+        Io {
+            sp_mem: vec![0; 0x2000],
+            rom: Arc::from(rom),
+            regs: HashMap::new(),
+            flash: Flash::default(),
+        }
+    }
+
+    /// Starts a PI copy of `n` bytes from physical `cart` to RAM `ram`.
+    fn pi_copy(m: &mut Memory, cart: u32, ram: u32, n: u32) {
+        m.write_u32(0xA460_0000, ram);
+        m.write_u32(0xA460_0004, cart);
+        m.write_u32(0xA460_000C, n - 1);
+    }
+
+    #[test]
+    fn pi_copy_from_rom() {
+        let mut m = ram();
+        m.set_io(rom_io(vec![1, 2, 3, 4, 5, 6, 7, 8]));
+        pi_copy(&mut m, 0x1000_0004, 0x10, 4);
+        assert_eq!(m.read_u32(0x8000_0010), 0x0506_0708);
+    }
+
+    #[test]
+    fn pi_copy_out_of_range_is_skipped() {
+        let mut m = ram();
+        m.set_io(rom_io(vec![1, 2, 3, 4, 5, 6, 7, 8]));
+        let before = m.bytes().to_vec();
+        // Below the cartridge ROM (the flash domain), past the end of ROM,
+        // and past the end of RAM.
+        pi_copy(&mut m, 0x0800_0000, 0, 4);
+        pi_copy(&mut m, 0x1000_0006, 0, 4);
+        pi_copy(&mut m, 0x1000_0000, 0x1E, 4);
+        assert_eq!(m.bytes(), &before[..]);
+    }
+
+    #[test]
+    fn pi_dma_reports_whether_it_copied() {
+        let rom = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let mut ram = [0u8; 0x20];
+        // Below the cartridge ROM, past the end of ROM, past the end of RAM.
+        assert!(!pi_dma(&rom, &mut ram, 0x0800_0000, 0, 4));
+        assert!(!pi_dma(&rom, &mut ram, 0x1000_0006, 0, 4));
+        assert!(!pi_dma(&rom, &mut ram, 0x1000_0000, 0x1E, 4));
+        assert_eq!(ram, [0; 0x20]);
+        assert!(pi_dma(&rom, &mut ram, 0x1000_0004, 0x10, 4));
+        assert_eq!(ram[0x10..0x14], [5, 6, 7, 8]);
     }
 
     #[test]
