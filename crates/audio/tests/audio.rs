@@ -546,7 +546,6 @@ fn third_set_duplicate_repeats_one_128_byte_block_count_times() {
 }
 
 #[test]
-#[ignore = "bug: DUPLICATE re-reads its source each copy, so a destination overlapping the source repeats overwritten data"]
 fn third_set_duplicate_onto_its_own_source_repeats_the_original_block() {
     let mut ram = ram();
     let block: Vec<i16> = (0..64).map(|i| i + 1).collect();

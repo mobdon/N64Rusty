@@ -19,6 +19,8 @@ use crate::synth::Streams;
 
 const DMEM: usize = 0x1000;
 const MASK: usize = DMEM - 1;
+/// Bytes the third command set's DUPLICATE copies per repeat.
+const DUPLICATE_BLOCK: u16 = 128;
 
 // Command flags as the audio library sets them.
 const A_INIT: u8 = 0x01;
@@ -305,8 +307,14 @@ impl AudioRsp {
             7 => {}
             8 => (self.inp, self.out, self.count) = (lo0, hi1, lo1),
             9 => {
+                // alist_repeat64: the block is read once, then stored count times.
+                let block: [u8; DUPLICATE_BLOCK as usize] =
+                    std::array::from_fn(|i| self.dmem[lo0.wrapping_add(i as u16) as usize & MASK]);
                 for k in 0..u16::from(flags) {
-                    self.dmem_move(lo0, hi1.wrapping_add(128 * k), 128);
+                    let to = hi1.wrapping_add(DUPLICATE_BLOCK * k) as usize;
+                    for (i, &b) in block.iter().enumerate() {
+                        self.dmem[(to + i) & MASK] = b;
+                    }
                 }
             }
             10 => self.dmem_move(lo0, hi1, round_up4(lo1)),
